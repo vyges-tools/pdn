@@ -3039,8 +3039,20 @@ fn generate(args: &[String]) -> ExitCode {
         connectable_pins.extend(pad_connectable.iter().cloned());
         let mut grid_pins: Vec<vyges_pdn::vias::Shape> = pad_connectable;
         if !grid.instance.is_empty() {
+            // ⛔ **Into THIS grid's search list, never into the accumulated one.** The reference
+            // reaches a macro's pins through the grid that claims it — `getIntersections` asks each
+            // of the grid's own components for `getConnectableShapes` — and `InstanceGrid`'s shape
+            // list, which is what later grids see as global shapes, does not carry them.
+            //
+            // ⚠️ **Put in the shared list they become via targets for every grid built after.** A
+            // core grid declared after a macro grid then drops stacks onto the macro's own supply
+            // pins: 76 of them on a design with one SRAM, three levels each, none of which the
+            // reference builds. ℹ️ Invisible in the shapes — a pin is never written — so the
+            // difference is 228 vias against an identical DEF.
             for (layer, net, rect) in instance_pin_shapes(&db, &grid.instance) {
-                emitted.push((net, layer, rect, "SWITCH"));
+                let pin = vyges_pdn::vias::Shape { layer, net, rect };
+                connectable_pins.push(pin.clone());
+                grid_pins.push(pin);
             }
         }
         // 🔑 **And a switched domain searches the power switches' always-on pins.** They are the
@@ -3919,6 +3931,20 @@ fn generate(args: &[String]) -> ExitCode {
                         .iter()
                         .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
                         .and_then(|(.., d)| d.as_ref());
+                    // 🔑 **`-cut_pitch` overrides the technology's, on EVERY generator.**
+                    // `generateDbVia` sets it before any candidate is built:
+                    // `if (hasCutPitch()) { via->setCutPitchX(...); via->setCutPitchY(...); }` —
+                    // and only the split-cut pitch, applied after, may displace it.
+                    //
+                    // ⚠️ **The pitch is stored as the cut SPACING and appears in the via's NAME**,
+                    // so a via built at the technology's pitch is a different object from the same
+                    // geometry built at the connect's. Read only on the tech-via path, one design
+                    // came out with 534 columns at a 300 pitch where the reference writes 161 at
+                    // 1000 — every via in the design different, and not one shape to show for it.
+                    let connect_cut_pitch: Option<(i32, i32)> = fixed
+                        .iter()
+                        .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
+                        .and_then(|(_, _, _, p, _)| *p);
                     // ⚠️ A shape constrains the via only at ITS OWN end of the stack; every level
                     // in between takes minimums however much room it has.
                     let at_bottom_end = level == 0;
@@ -4009,9 +4035,10 @@ fn generate(args: &[String]) -> ExitCode {
                             // nothing says so, because vias are not compared shape by shape. It
                             // shows only where the oversized metal has to be absorbed by a shape
                             // too narrow to hide it.
-                            let pitch = match split {
-                                Some((sp, _)) => (sp, sp),
-                                None => {
+                            let pitch = match (split, connect_cut_pitch) {
+                                (Some((sp, _)), _) => (sp, sp),
+                                (None, Some(p)) => p,
+                                (None, None) => {
                                     let cut_rect = (0, 0, cut.0, cut.1);
                                     let classes = via_cut_classes(&db, cut_layer);
                                     let cls = vyges_pdn::viagen::cut_class(&classes, cut)
@@ -4427,6 +4454,9 @@ fn generate(args: &[String]) -> ExitCode {
                                 vyges_pdn::techvia::class_cut_spacing(g.cut_extent, &table),
                             )
                         }) else {
+                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                                eprintln!("[via]   TECH NO PITCH {area:?} {lo}->{hi} {via_name}");
+                            }
                             continue; // no pitch stated anywhere, so no array can be laid out
                         };
                         // 🔑 The split pitch overrides the technology's, exactly as on the generate
@@ -5339,13 +5369,45 @@ fn generate(args: &[String]) -> ExitCode {
             drcfill.len()
         );
     }
+    // 🔑 **A via takes the shape TYPE of what it lands on, not `STRIPE` always.**
+    //
+    // `Via::writeToDb` opens with `type = lower_->getType()` and falls back to `STRIPE` only when
+    // the two shapes disagree — "If both shapes are not the same, use stripe". So a via joining
+    // two ring segments is written `+ SHAPE RING`, and one joining a ring to a strap is not.
+    //
+    // ⚠️ **Invisible to a gate that compares wire segments**, since it lives on the via line, and
+    // invisible to a via diff keyed on geometry and via name — which is how eight of these stood
+    // in a design that was otherwise exact in both shapes and via placements.
+    let mut by_layer: std::collections::HashMap<(&str, &str), Vec<(Rect, &str)>> =
+        std::collections::HashMap::new();
+    for (net, layer, rect, kind) in &emitted {
+        by_layer
+            .entry((net.as_str(), layer.as_str()))
+            .or_default()
+            .push((*rect, *kind));
+    }
+    let kind_at = |net: &str, layer: &str, area: Rect| -> Option<&'static str> {
+        by_layer.get(&(net, layer)).and_then(|v| {
+            v.iter()
+                .find(|(r, _)| overlaps(*r, area))
+                .map(|(_, k)| *k)
+        })
+    };
     let mut vias_placed = 0;
-    for (net, name, centre, ..) in &placements {
-        if db
-            .add_swire_via(net, name, *centre, false, "STRIPE")
-            .is_ok()
-        {
-            vias_placed += 1;
+    for (net, name, centre, lo, hi, area) in &placements {
+        // ⚠️ A `SWITCH` shape is the cell's own metal and is never written, so it cannot name the
+        // via's type either; anything unfound falls back with the mismatch case.
+        let ty = match (kind_at(net, lo, *area), kind_at(net, hi, *area)) {
+            (Some(a), Some(b)) if a == b && a != "SWITCH" => a,
+            _ => "STRIPE",
+        };
+        match db.add_swire_via(net, name, *centre, false, ty) {
+            Ok(()) => vias_placed += 1,
+            Err(e) => {
+                if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                    eprintln!("[viawrite] {net}|{name}|{centre:?}|{ty}: {e}");
+                }
+            }
         }
     }
     if !placements.is_empty() {
