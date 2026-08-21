@@ -148,6 +148,59 @@ pub fn centre(cut_extent: Rect) -> (i32, i32) {
 /// `{via}_{rows}_{columns}_{row pitch}_{column pitch}`, then one suffix per on-grid layer. The
 /// name is worth reproducing exactly: it encodes the array this module derived, so a DEF diff
 /// checks the derivation on every via without inspecting any geometry.
+/// **T9** — fold a tech via's OWN cut array into the array the generator asked for.
+///
+/// 🔑 **`DbTechVia`'s constructor does this before anything reads the via**, and it changes both
+/// the counts and the pitch:
+///
+/// ⚠️ ASAP7's `VIA23_OFFCENTER` declares **three** cut rects rather than one, so a generator asking
+/// for 8 columns at a pitch of 108 gets **24 at 36** — the same span, a different object, and a
+/// different name. Left unfolded, every via of that kind is built wrong and placed wrong.
+///
+/// The gate: each axis's centres must be evenly divisible into the asked-for pitch, tested as
+/// `(count * |x - x0|) % pitch == 0`. ⚠️ **If either axis fails, NOTHING is folded** — it is one
+/// decision over both axes, not two.
+///
+/// Returns the new `(rows, columns, row_pitch, col_pitch)`, or `None` where nothing is folded.
+pub fn fold_cut_array(
+    cut_centres: &[(i32, i32)],
+    rows: i32,
+    columns: i32,
+    row_pitch: i32,
+    col_pitch: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    // `isArray()` — the generator asked for more than one cut somewhere.
+    if rows <= 1 && columns <= 1 {
+        return None;
+    }
+    if cut_centres.len() <= 1 {
+        return None;
+    }
+    let mut xs: Vec<i32> = cut_centres.iter().map(|c| c.0).collect();
+    let mut ys: Vec<i32> = cut_centres.iter().map(|c| c.1).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    let (via_rows, via_cols) = (ys.len() as i32, xs.len() as i32);
+    let divides = |vals: &[i32], count: i32, pitch: i32| -> bool {
+        if pitch == 0 {
+            return false;
+        }
+        let first = vals[0];
+        vals.iter().all(|v| (count * (v - first).abs()) % pitch == 0)
+    };
+    if !divides(&xs, via_cols, col_pitch) || !divides(&ys, via_rows, row_pitch) {
+        return None;
+    }
+    Some((
+        rows * via_rows,
+        columns * via_cols,
+        row_pitch / via_rows,
+        col_pitch / via_cols,
+    ))
+}
+
 pub fn array_name(via: &str, rows: i32, columns: i32, row_pitch: i32, col_pitch: i32) -> String {
     format!("{via}_{rows}_{columns}_{row_pitch}_{col_pitch}")
 }
@@ -265,6 +318,37 @@ fn merge(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── folding a tech via's own cut array ───────────────────────────────────────────────────
+    //
+    // ASAP7 `VIA23_OFFCENTER` declares three V2 cuts at x = -36, 0, 36 on one row.
+
+    const OFFCENTER: [(i32, i32); 3] = [(-36, 0), (0, 0), (36, 0)];
+
+    #[test]
+    fn three_cuts_in_x_treble_the_columns_and_third_the_pitch() {
+        assert_eq!(fold_cut_array(&OFFCENTER, 2, 8, 36, 108), Some((2, 24, 36, 36)));
+    }
+
+    #[test]
+    fn a_single_cut_folds_nothing() {
+        assert_eq!(fold_cut_array(&[(0, 0)], 2, 8, 36, 108), None);
+    }
+
+    #[test]
+    fn a_via_the_generator_asked_one_cut_for_folds_nothing() {
+        // `isArray()` is false, so the constructor never reaches the simplification.
+        assert_eq!(fold_cut_array(&OFFCENTER, 1, 1, 36, 108), None);
+    }
+
+    #[test]
+    fn a_pitch_the_centres_do_not_divide_folds_nothing() {
+        // ⚠️ One decision over both axes: an x that divides cannot rescue a y that does not.
+        let two_axes = [(-36, -10), (0, -10), (36, -10), (-36, 10), (0, 10), (36, 10)];
+        assert_eq!(fold_cut_array(&two_axes, 2, 8, 36, 108), None);
+        // and the same centres against a row pitch they do divide
+        assert_eq!(fold_cut_array(&two_axes, 2, 8, 40, 108), Some((4, 24, 20, 36)));
+    }
 
     fn cutty(l: &str) -> bool {
         l.starts_with('V')

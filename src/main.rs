@@ -1928,6 +1928,8 @@ fn generate(args: &[String]) -> ExitCode {
             }
         }
     }
+    // Fixed block pins, as via targets. See the note where they are collected.
+    let mut bterm_via_shapes: Vec<vyges_pdn::vias::Shape> = Vec::new();
     for bterm in db.block_get_b_terms() {
         for pin in 0..db.num_bterm_get_b_pins(&bterm) {
             if !matches!(
@@ -1945,6 +1947,21 @@ fn generate(args: &[String]) -> ExitCode {
                 // tables, then by the end-of-line rules. Only the first is applied here, so a
                 // technology leaning on the other two cuts short of where the reference does.
                 let s = db.layer_get_spacing(&name);
+                // 🔑 **A fixed block pin is a via TARGET as well as an obstruction**, and it is
+                // the first thing `Shape::populateMapFromDb` collects — before the existing
+                // routing, and by the same rule: fixed placement, a routing layer, `kFixed`.
+                //
+                // ⚠️ **Its shape type is `NONE`**, not `STRIPE`. The reference builds it with
+                // `dbWireShapeType::NONE`, so a via landing on it writes no `+ SHAPE` clause.
+                //
+                // ℹ️ Read as an obstruction alone, a grid connects to every block pin it was
+                // asked to reach except the ones it can only reach by via: one metal3 terminal
+                // out of 485 vias in a design built for exactly that purpose.
+                bterm_via_shapes.push(vyges_pdn::vias::Shape {
+                    layer: name.clone(),
+                    net: db.bterm_get_net(&bterm),
+                    rect: (x0, y0, x1, y1),
+                });
                 blockages.push((
                     name,
                     (x0 - s, y0 - s, x1 + s, y1 + s),
@@ -1981,7 +1998,7 @@ fn generate(args: &[String]) -> ExitCode {
     //
     // ⚠️ **Never emitted.** They are already in the database, so they are a target and nothing
     // else — not written, not trimmed, and `isModifiable` is false for a `kFixed` shape anyway.
-    let mut fixed_via_shapes: Vec<vyges_pdn::vias::Shape> = Vec::new();
+    let mut fixed_via_shapes: Vec<vyges_pdn::vias::Shape> = bterm_via_shapes;
     for net in db.block_get_nets() {
         for (layer, x0, y0, x1, y1, _shape, octilinear) in
             db.net_swire_shapes(&net).unwrap_or_default()
@@ -4595,6 +4612,20 @@ fn generate(args: &[String]) -> ExitCode {
                         // the else arm hands `odb::dbSBox::create` the technology's via directly, so
                         // the DEF names `VIA23` and carries no `VIAS` entry for it at all. Naming a
                         // 1x1 the way an array is named invents a via the reference never wrote.
+                        // 🔑 **A tech via's OWN cut array folds into the one asked for**, and it
+                        // changes the counts, the pitch, the name and where the via sits. See
+                        // `techvia::fold_cut_array` — `DbTechVia`'s constructor does this before
+                        // anything reads the via, so everything downstream sees the folded values.
+                        let (rows, columns, pitch) = match vyges_pdn::techvia::fold_cut_array(
+                            &g.cut_centres,
+                            rows,
+                            columns,
+                            pitch.1,
+                            pitch.0,
+                        ) {
+                            Some((r, c, rp, cp)) => (r, c, (cp, rp)),
+                            None => (rows, columns, pitch),
+                        };
                         let is_array = rows > 1 || columns > 1;
                         let name = if is_array {
                             vyges_pdn::techvia::array_name(&via_name, rows, columns, pitch.1, pitch.0)
@@ -5386,12 +5417,24 @@ fn generate(args: &[String]) -> ExitCode {
             .or_default()
             .push((*rect, *kind));
     }
+    // ⚠️ **A shape this engine does not emit still has a TYPE, and it is not `STRIPE`.** A macro's
+    // pin, a block terminal and the routing a design arrives with are all `Shape`s to the
+    // reference, so `lower_->getType()` answers for them — `NONE` for a pin built by
+    // `getInstancePins`, whose DEF form is a via line carrying no `+ SHAPE` clause at all.
+    //
+    // ℹ️ `dbWireShapeType("NONE")` parses to `NONE`, and the DEF writer omits the clause for it.
     let kind_at = |net: &str, layer: &str, area: Rect| -> Option<&'static str> {
-        by_layer.get(&(net, layer)).and_then(|v| {
+        if let Some(k) = by_layer.get(&(net, layer)).and_then(|v| {
             v.iter()
                 .find(|(r, _)| overlaps(*r, area))
                 .map(|(_, k)| *k)
-        })
+        }) {
+            return Some(k);
+        }
+        connectable_pins
+            .iter()
+            .any(|p| p.net == net && p.layer == layer && overlaps(p.rect, area))
+            .then_some("NONE")
     };
     let mut vias_placed = 0;
     for (net, name, centre, lo, hi, area) in &placements {
