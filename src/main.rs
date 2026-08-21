@@ -2078,6 +2078,22 @@ fn generate(args: &[String]) -> ExitCode {
     // then appears to grow enormously, the direction guard refuses it, and every via on it is
     // ripped up — and measurably so, on real designs.
     let mut via_faces: Vec<(usize, String, Rect, Rect)> = Vec::new();
+    // 🔑 **A via grows the shape it lands on BEFORE the next crossing is measured.**
+    // `Via::writeToDb` builds one via, merges its metal into the two shapes it touches, and only
+    // then moves to the next via — so a strap reached down by an early via is LONGER by the time a
+    // later connect intersects it, and that later crossing is measured against the longer strap.
+    //
+    // ⚠️ **Not the same thing as the absorb pass below.** That one runs once, after every via
+    // exists, and reproduces the final shapes correctly; what it cannot do is feed a growth back
+    // into a crossing that was measured before it. A rail via reaching an M5 strap 14 units past
+    // its end moves every M5-M6 crossing on that strap by 7, and picks a different via with it.
+    //
+    // ⚠️ Kept SEPARATE from `emitted` on purpose. The reference trims before any of this, so
+    // letting the growth into `emitted` here would hand trimming a strap the reference trims
+    // short and then extends -- see the absorb pass for why the order is the whole of the effect.
+    let mut grown_rects: std::collections::HashMap<(String, String, Rect), Rect> =
+        std::collections::HashMap::new();
+
     // Patch metal left on layers a via stack only passes through, written as DRCFILL.
     //
     // ⚠️ Carries the stack's identity for the same reason a placement does: the patch exists only
@@ -3664,6 +3680,13 @@ fn generate(args: &[String]) -> ExitCode {
             }
             let mut written = 0;
             for v in &placed {
+                // The two shapes AS THEY STAND, which is not as they started: an earlier via may
+                // have reached past the end of either and grown it. See `grown_rects`.
+                let faces_before = via_faces.len();
+                let lower_key = (v.net.clone(), v.lower.clone(), v.lower_rect);
+                let upper_key = (v.net.clone(), v.upper.clone(), v.upper_rect);
+                let lower_rect = *grown_rects.get(&lower_key).unwrap_or(&v.lower_rect);
+                let upper_rect = *grown_rects.get(&upper_key).unwrap_or(&v.upper_rect);
                 // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
                 // metal6 needs a cut at each of five levels, and the reference's own counts show it:
                 // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
@@ -3672,7 +3695,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // point comes from the plain intersection of the two shapes, SNAPPED — see
                 // `vias::placement_point`. Every level of a stack sits at the same point.
                 let Some(place_at) =
-                    vyges_pdn::vias::placement_point(v.lower_rect, v.upper_rect, grid_mfg)
+                    vyges_pdn::vias::placement_point(lower_rect, upper_rect, grid_mfg)
                 else {
                     continue; // off grid: the reference builds a dummy via, which places nothing
                 };
@@ -3716,8 +3739,8 @@ fn generate(args: &[String]) -> ExitCode {
                     .map(|l| via_min_width(&db, l, &rules))
                     .collect();
                 let rects = vyges_pdn::vias::stack_rects_tapered(
-                    v.lower_rect,
-                    v.upper_rect,
+                    lower_rect,
+                    upper_rect,
                     &raw_min_widths,
                     &via_min_widths,
                     grid_mfg,
@@ -4895,6 +4918,57 @@ fn generate(args: &[String]) -> ExitCode {
                         }
                     }
                     previous_top = Some((hi.to_string(), tops, needs_patch));
+                }
+
+                // ── this via's metal, merged back into the two shapes it landed on ────────────
+                // 🔑 **Only the two ENDS.** `check_shapes` is called on `shapes.bottom` against
+                // `lower_` and on `shapes.top` against `upper_`; a stack's intermediate metal is
+                // `shapes.middle` and is never merged into anything — it only decides which vias a
+                // ripup takes with it.
+                // ⚠️ Growth only. A refusal here is a RIPUP, and that is decided after trimming,
+                // against the trimmed shape — see the absorb pass. Ripping up here would judge a
+                // via against a strap that has not been pulled back yet.
+                for (key, layer, cur) in [
+                    (&lower_key, &v.lower, lower_rect),
+                    (&upper_key, &v.upper, upper_rect),
+                ] {
+                    let metals: Vec<Rect> = via_faces[faces_before..]
+                        .iter()
+                        .filter(|(_, l, _, _)| l == layer)
+                        .map(|(_, _, m, _)| *m)
+                        .collect();
+                    if metals.is_empty() {
+                        continue;
+                    }
+                    let Some(si) = emitted.iter().position(|(n, l, r, _)| {
+                        n == &v.net && l == layer && overlaps(*r, key.2)
+                    }) else {
+                        continue;
+                    };
+                    let dir = if emitted[si].3 == "FOLLOWPIN" {
+                        match vyges_pdn::viagen::rect_direction(emitted[si].2) {
+                            Direction::None => direction_of(&db, layer),
+                            d => d,
+                        }
+                    } else {
+                        direction_of(&db, layer)
+                    };
+                    let obstructions: Vec<Rect> = blockages
+                        .iter()
+                        .filter(|(l, ..)| l == layer)
+                        .map(|(_, r, ..)| *r)
+                        .collect();
+                    if let vyges_pdn::shapes::ViaCheck::Extend(g) =
+                        vyges_pdn::shapes::check_via_shapes(
+                            cur,
+                            &metals,
+                            dir,
+                            !(emitted[si].3 == "RING" && locked_layers.contains(layer)),
+                            &obstructions,
+                        )
+                    {
+                        grown_rects.insert(key.clone(), g);
+                    }
                 }
             }
             eprintln!(
