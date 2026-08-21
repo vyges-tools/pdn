@@ -201,8 +201,44 @@ pub fn fold_cut_array(
     ))
 }
 
-pub fn array_name(via: &str, rows: i32, columns: i32, row_pitch: i32, col_pitch: i32) -> String {
-    format!("{via}_{rows}_{columns}_{row_pitch}_{col_pitch}")
+pub fn array_name(
+    via: &str,
+    rows: i32,
+    columns: i32,
+    row_pitch: i32,
+    col_pitch: i32,
+    ongrid: &[String],
+) -> String {
+    let mut name = format!("{via}_{rows}_{columns}_{row_pitch}_{col_pitch}");
+    // 🔑 **Every on-grid layer the CONNECT names, not just this via's two.** `getViaName` walks the
+    // whole `ongrid` set and appends each layer's name, so a stack told to snap on one layer gives
+    // every level of itself that suffix — including levels that never touch the named layer.
+    // ⚠️ The suffix is not decoration: it is what keeps a snapped via from being cached and reused
+    // as the unsnapped via of the same array shape.
+    for layer in ongrid {
+        name.push('_');
+        name.push_str(layer);
+    }
+    name
+}
+
+/// **X10** — the pitch a via's cuts are actually BUILT on when its layer is on grid.
+///
+/// 🔑 **The name keeps the pitch that was asked for; the via gets a different one.**
+/// `DbTechVia::generate` snaps each axis' pitch to a whole number of that layer's track intervals
+/// — but only for an axis whose layer the connect named in `-ongrid`, and `getViaName` is computed
+/// from the UNSNAPPED pitch. So two vias can carry the same name and hold cuts at different
+/// spacings, and a DEF diff on names alone will not see it.
+///
+/// ⚠️ **Truncating division, floored at one interval.** A pitch of 200 on a 36-unit track grid
+/// gives five intervals, not six: 180. The array is then 1400 units narrower across 71 columns,
+/// which is the difference between via metal that sits inside its rail and metal that pushes the
+/// rail three units longer.
+pub fn pitch_on_grid_interval(pitch: i32, step: i32) -> i32 {
+    if step == 0 {
+        return pitch;
+    }
+    (pitch / step).max(1) * step
 }
 
 /// **X5** — the cut spacing a via array needs, given the pitch it is placed on.
@@ -429,6 +465,19 @@ mod tests {
     }
 
     #[test]
+    fn a_pitch_is_floored_to_whole_track_intervals_on_an_on_grid_layer() {
+        // 🔑 The case that found this: 200 on a 36-unit grid is FIVE intervals, not six.
+        assert_eq!(pitch_on_grid_interval(200, 36), 180);
+        // Exact multiples are untouched.
+        assert_eq!(pitch_on_grid_interval(180, 36), 180);
+        // ⚠️ Floored at one interval, never zero -- a pitch finer than the track grid still
+        // gets a whole interval.
+        assert_eq!(pitch_on_grid_interval(10, 36), 36);
+        // No grid pattern to read: the pitch stands.
+        assert_eq!(pitch_on_grid_interval(200, 0), 200);
+    }
+
+    #[test]
     fn the_centre_is_the_low_edge_plus_half_the_span() {
         assert_eq!(centre((-45, -9, 45, 9)), (0, 0));
         // ⚠️ An odd span lands low, as `xMin + dx / 2` does and `(xMin + xMax) / 2` would not.
@@ -443,7 +492,13 @@ mod tests {
     #[test]
     fn the_array_name_carries_the_array() {
         // The reference's own name for the ASAP7 M1-M2 via.
-        assert_eq!(array_name("VIA12", 1, 49, 288, 288), "VIA12_1_49_288_288");
+        assert_eq!(array_name("VIA12", 1, 49, 288, 288, &[]), "VIA12_1_49_288_288");
+        // 🔑 The suffix a connect's `-ongrid` adds, which is what tells a snapped via apart from
+        // the unsnapped via of the very same array shape.
+        assert_eq!(
+            array_name("VIA12", 1, 71, 200, 200, &["M1".to_string()]),
+            "VIA12_1_71_200_200_M1"
+        );
     }
 
     #[test]
@@ -470,7 +525,7 @@ mod tests {
         // The case states `-cut_pitch 0.288`, and the reference named the result
         // `VIA12_1_49_288_288`. Both fall out of the geometry above.
         assert_eq!(cut_spacing(g.single_cut, 288, 288), (270, 270));
-        assert_eq!(array_name("VIA12", 1, 49, 288, 288), "VIA12_1_49_288_288");
+        assert_eq!(array_name("VIA12", 1, 49, 288, 288, &[]), "VIA12_1_49_288_288");
     }
 
     #[test]

@@ -4660,12 +4660,57 @@ fn generate(args: &[String]) -> ExitCode {
                             None => (rows, columns, pitch),
                         };
                         let is_array = rows > 1 || columns > 1;
+                        // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
+                        // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
+                        // for a generate rule the snapping really does live only in the stacked via
+                        // — but `DbTechVia::generate` populates the grid of either of its own layers
+                        // the connect named and both snaps to it and RE-PITCHES its cut array on it.
+                        // ⚠️ It picks which layer serves which axis by a rule of its own: see
+                        // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
+                        // stacked via branches on the one below.
+                        let tv_grid = |layer: &str| {
+                            ongrid
+                                .iter()
+                                .any(|l| l == layer)
+                                .then(|| track_grids.get(layer))
+                                .flatten()
+                        };
+                        let (x_up, y_up) = vyges_pdn::vias::techvia_snap_sources(
+                            direction_of(&db, hi) == Direction::Vertical,
+                        );
+                        // ⚠️ **A layer's track interval is read off the axis its OWN direction
+                        // names**, not the axis being pitched — `snapToGridInterval` picks the X
+                        // pattern for a vertical layer and the Y pattern for a horizontal one.
+                        let step_of = |layer: &str| -> Option<i32> {
+                            let g = tv_grid(layer)?;
+                            let v = if direction_of(&db, layer) == Direction::Vertical {
+                                &g.0
+                            } else {
+                                &g.1
+                            };
+                            (v.len() >= 2).then(|| v[1] - v[0])
+                        };
+                        // 🔑 **The BUILT pitch, which the name does not carry.** See
+                        // `techvia::pitch_on_grid_interval`.
+                        let built_pitch = (
+                            match step_of(if x_up { hi } else { lo }) {
+                                Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.0, st),
+                                None => pitch.0,
+                            },
+                            match step_of(if y_up { hi } else { lo }) {
+                                Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.1, st),
+                                None => pitch.1,
+                            },
+                        );
                         let name = if is_array {
-                            vyges_pdn::techvia::array_name(&via_name, rows, columns, pitch.1, pitch.0)
+                            vyges_pdn::techvia::array_name(
+                                &via_name, rows, columns, pitch.1, pitch.0, ongrid,
+                            )
                         } else {
                             via_name.clone()
                         };
-                        let spacing = vyges_pdn::techvia::cut_spacing(g.single_cut, pitch.1, pitch.0);
+                        let spacing =
+                            vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
                         if is_array
                             && db
                                 .create_generated_via(
@@ -4698,11 +4743,40 @@ fn generate(args: &[String]) -> ExitCode {
                         // places 45 out of position with no other symptom -- same name, same count,
                         // same metal.
                         let origin = vyges_pdn::techvia::centre(g.cut_extent);
-                        for spot in &spots {
+                        // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
+                        // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
+                        // for a generate rule the snapping really does live only in the stacked via
+                        // — but `DbTechVia::generate` populates the grid of either of its own layers
+                        // that the connect named and snaps to it, however short the stack.
+                        // ⚠️ And it picks the layers by a rule of its own: see
+                        // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
+                        // stacked via branches on the one below.
+                        // ⚠️ **Snapped either side of the origin offset**, in that order — the
+                        // reference snaps the crossing point, subtracts the cut centre, and snaps
+                        // the result again.
+                        let tv_snap = |p: (i32, i32)| {
+                            let sx = match tv_grid(if x_up { hi } else { lo }) {
+                                Some((x, _)) => vyges_pdn::vias::snap_to_grid(p.0, x, 0),
+                                None => p.0,
+                            };
+                            let sy = match tv_grid(if y_up { hi } else { lo }) {
+                                Some((_, y)) => vyges_pdn::vias::snap_to_grid(p.1, y, 0),
+                                None => p.1,
+                            };
+                            (sx, sy)
+                        };
+                        let placed_at: Vec<(i32, i32)> = spots
+                            .iter()
+                            .map(|spot| {
+                                let at = tv_snap(*spot);
+                                tv_snap((at.0 - origin.0, at.1 - origin.1))
+                            })
+                            .collect();
+                        for at in &placed_at {
                             placements.push((
                                 v.net.clone(),
                                 name.clone(),
-                                (spot.0 - origin.0, spot.1 - origin.1),
+                                *at,
                                 v.lower.clone(),
                                 v.upper.clone(),
                                 v.area,
@@ -4716,18 +4790,22 @@ fn generate(args: &[String]) -> ExitCode {
                         // A tech via stack passes through layers just as a generated one does, and
                         // leaves the same DRCFILL patch on them — see `viagen::intermediate_patch`.
                         let bare = (
-                            (columns - 1) * pitch.0 + single.0,
-                            (rows - 1) * pitch.1 + single.1,
+                            (columns - 1) * built_pitch.0 + single.0,
+                            (rows - 1) * built_pitch.1 + single.1,
                         );
                         // ⚠️ **Per SPOT** — a split level leaves its own metal at every position.
                         let metal_at = |spot: (i32, i32), enc: (i32, i32)| {
                             let (hw, hh) = (bare.0 / 2 + enc.0, bare.1 / 2 + enc.1);
                             (spot.0 - hw, spot.1 - hh, spot.0 + hw, spot.1 + hh)
                         };
-                        let base_pi = placements.len() - spots.len();
-                        for (k, spot) in spots.iter().enumerate() {
-                            via_faces.push((base_pi + k, lo.to_string(), metal_at(*spot, bot), area));
-                            via_faces.push((base_pi + k, hi.to_string(), metal_at(*spot, top), area));
+                        // ⚠️ **The metal follows the via, not the crossing.** It is carried by the
+                        // via and offset by the same origin, so it sits at the PLACED point plus
+                        // that origin — which is the crossing centre only while nothing snapped.
+                        let base_pi = placements.len() - placed_at.len();
+                        for (k, at) in placed_at.iter().enumerate() {
+                            let centre = (at.0 + origin.0, at.1 + origin.1);
+                            via_faces.push((base_pi + k, lo.to_string(), metal_at(centre, bot), area));
+                            via_faces.push((base_pi + k, hi.to_string(), metal_at(centre, top), area));
                         }
                         // ⚠️ **A split-cut array does NOT require a patch** — `DbSplitCutVia` leaves
                         // `requiresPatch()` at its default however many cuts it places.

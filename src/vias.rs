@@ -571,9 +571,45 @@ pub fn snap_sources(lower_is_horizontal: bool) -> (bool, bool) {
     }
 }
 
+/// **V19** — the same question for a TECH via, which answers it differently.
+///
+/// `DbTechVia::generate` starts from `row_snap = top`, `col_snap = bottom` and swaps the pair only
+/// when the **TOP** layer is vertical:
+///
+/// ```text
+/// if top is VERTICAL:  x <- upper's grid,  y <- lower's grid
+/// else:                x <- lower's grid,  y <- upper's grid
+/// ```
+///
+/// ⚠️ **It branches on the TOP layer where [`snap_sources`] branches on the lower**, and the two
+/// agree only while routing layers alternate. Give both levels the same direction — two follow-pin
+/// layers, say — and they choose opposite layers for both axes.
+///
+/// Returns `(layer supplying x, layer supplying y)` as `false` for lower and `true` for upper.
+pub fn techvia_snap_sources(upper_is_vertical: bool) -> (bool, bool) {
+    if upper_is_vertical {
+        (true, false)
+    } else {
+        (false, true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tech_via_and_a_stack_choose_snap_layers_by_different_layers() {
+        // Alternating layers: the two rules agree, which is why one stood in for the other.
+        // lower horizontal => upper vertical.
+        assert_eq!(snap_sources(true), techvia_snap_sources(true));
+        // lower vertical => upper horizontal.
+        assert_eq!(snap_sources(false), techvia_snap_sources(false));
+        // ⚠️ Two layers of the SAME direction, and they part company. Both horizontal: the stack
+        // rule takes x from the upper, the tech via rule takes x from the lower.
+        assert_eq!(snap_sources(true), (true, false));
+        assert_eq!(techvia_snap_sources(false), (false, true));
+    }
 
     #[test]
     fn a_rect_already_wide_enough_is_left_alone() {
