@@ -66,6 +66,49 @@ pub fn inner_outline(domain: Rect, offset: [i32; 4]) -> Rect {
 /// `extend_to_boundary` replaces the along-side extent with the grid boundary. ⚠️ It stops the
 /// *along* axis growing per net, but the across axis still steps by a pitch — the rings still nest,
 /// they just all reach the same distance.
+/// **R6** — the width every net's ring occupies on each axis, `Rings::getTotalWidth`.
+///
+/// `width * rings + spacing * (rings - 1)` per layer, and ⚠️ **the pair is swapped where the lower
+/// layer does not run horizontally** — the caller wants "how much a horizontal ring takes" and
+/// "how much a vertical one takes", which is not the same as "layer0's and layer1's".
+pub fn total_width(layer0: &Layer, layer1: &Layer, rings: usize) -> (i32, i32) {
+    let n = rings as i32;
+    let span = |l: &Layer| l.width * n + l.spacing * (n - 1);
+    let (hor, ver) = (span(layer0), span(layer1));
+    if layer0.direction == Direction::Horizontal {
+        (hor, ver)
+    } else {
+        (ver, hor)
+    }
+}
+
+/// **R7** — a PAD offset expressed as the core offset it is equivalent to, `Rings::setPadOffset`.
+///
+/// 🔑 **`-pad_offsets` is not a second placement rule.** The reference measures the gap from the
+/// core out to the inner edge of the pad ring, subtracts the offset asked for and the width the
+/// rings themselves will occupy, and hands the remainder to `setOffset` as an ordinary core
+/// offset. Everything downstream then behaves as though `-core_offsets` had been given.
+///
+/// ⚠️ **The ring's own width is subtracted**, so the offset names the gap between the pads and the
+/// OUTERMOST loop rather than the distance to where the innermost one starts.
+///
+/// ⚠️ Sides are ordered left, bottom, right, top, and each is measured against its own edge —
+/// a pad ring that is not centred on the core gives four different answers.
+pub fn pad_offset_as_core_offset(
+    core: Rect,
+    pads_inner: Rect,
+    pad_offset: [i32; 4],
+    hor_width: i32,
+    ver_width: i32,
+) -> [i32; 4] {
+    [
+        core.0 - pads_inner.0 - pad_offset[0] - ver_width,
+        core.1 - pads_inner.1 - pad_offset[1] - hor_width,
+        pads_inner.2 - core.2 - pad_offset[2] - ver_width,
+        pads_inner.3 - core.3 - pad_offset[3] - hor_width,
+    ]
+}
+
 pub fn make(
     layer0: &Layer,
     layer1: &Layer,
@@ -192,6 +235,60 @@ pub fn locked(layer0: &Layer, layer1: &Layer) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── the pad-offset conversion ────────────────────────────────────────────────────────────
+    //
+    // A 100 x 100 core inside a pad ring whose inner edge is 20 away on every side, two nets, both
+    // ring layers 4 wide with 2 of spacing: each axis takes 4*2 + 2*1 = 10.
+
+    const CORE: Rect = (100, 100, 200, 200);
+    const PADS_INNER: Rect = (80, 80, 220, 220);
+
+    fn ring_layers() -> (Layer, Layer) {
+        (
+            layer("m8", Direction::Horizontal, 4, 2),
+            layer("m9", Direction::Vertical, 4, 2),
+        )
+    }
+
+    #[test]
+    fn the_total_width_counts_every_nets_loop_and_the_gaps_between() {
+        let (h, v) = ring_layers();
+        assert_eq!(total_width(&h, &v, 2), (10, 10));
+        // One net has no gaps, three have two.
+        assert_eq!(total_width(&h, &v, 1), (4, 4));
+        assert_eq!(total_width(&h, &v, 3), (16, 16));
+    }
+
+    #[test]
+    fn the_total_width_is_swapped_when_the_lower_layer_runs_vertically() {
+        // The caller wants horizontal-then-vertical, not layer0-then-layer1.
+        let lower = layer("m8", Direction::Vertical, 4, 2);
+        let upper = layer("m9", Direction::Horizontal, 6, 2);
+        assert_eq!(total_width(&lower, &upper, 2), (14, 10));
+    }
+
+    #[test]
+    fn a_pad_offset_becomes_the_core_offset_that_leaves_the_gap_asked_for() {
+        // 20 of room per side, 10 of it taken by the rings, 5 asked for as clearance: 5 left.
+        let got = pad_offset_as_core_offset(CORE, PADS_INNER, [5; 4], 10, 10);
+        assert_eq!(got, [5, 5, 5, 5]);
+    }
+
+    #[test]
+    fn each_side_is_measured_against_its_own_edge() {
+        // A pad ring pushed right: 10 of room on the left, 30 on the right.
+        let pads = (90, 80, 230, 220);
+        let got = pad_offset_as_core_offset(CORE, pads, [0, 0, 0, 0], 10, 10);
+        assert_eq!(got, [0, 10, 20, 10]);
+    }
+
+    #[test]
+    fn asking_for_more_room_than_the_pads_leave_goes_negative_rather_than_clamping() {
+        // ⚠️ The reference does not clamp, so the ring lands inside the core and says nothing.
+        let got = pad_offset_as_core_offset(CORE, PADS_INNER, [15; 4], 10, 10);
+        assert_eq!(got, [-5, -5, -5, -5]);
+    }
 
     fn layer(name: &str, dir: Direction, width: i32, spacing: i32) -> Layer {
         Layer {

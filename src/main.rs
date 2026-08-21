@@ -1073,6 +1073,28 @@ fn make_ring(
         2 => [offs[0], offs[1], offs[0], offs[1]],
         _ => [offs[0], offs[1], offs[2], offs[3]],
     };
+    // 🔑 **`-pad_offsets` and `-core_offsets` are the same field, read differently.** The
+    // reference refuses both at once and converts the pad form into the core form before anything
+    // else looks at it — `Rings::setPadOffset` ends in `setOffset(core_offset)` — so only the
+    // reading differs and every rule downstream is untouched.
+    //
+    // ⚠️ **The offset is to the OUTERMOST loop.** The ring's own total width is subtracted, which
+    // is why the conversion needs the net count and both layers rather than the rectangle alone.
+    let off4 = if p.get(4).copied() == Some("pad") {
+        let (hor_width, ver_width) = rings::total_width(&mk(l0), &mk(l1), build_nets.len());
+        let pads_inner = pad_ring_inner(db, core, die);
+        let converted =
+            rings::pad_offset_as_core_offset(core, pads_inner, off4, hor_width, ver_width);
+        if std::env::var_os("PDN_TRACE").is_some() {
+            eprintln!(
+                "[padoffset] core {core:?} pads_inner {pads_inner:?} width h{hor_width} v{ver_width} \
+                 asked {off4:?} -> core offset {converted:?}"
+            );
+        }
+        converted
+    } else {
+        off4
+    };
     let outline = rings::inner_outline(core, off4);
     // ⚠️ A ring extended to the boundary reaches the DIE along each side, and stops growing per net
     // on that axis — the loops still nest, they just all reach the same distance.
@@ -3326,11 +3348,13 @@ fn generate(args: &[String]) -> ExitCode {
             )> = Vec::new();
             // The layers each connect snaps its stack to, by layer pair.
             let mut on_grid: Vec<((String, String), Vec<String>)> = Vec::new();
+            // `-max_rows` / `-max_columns`, by layer pair. Zero means unlimited.
+            let mut max_cuts: Vec<((String, String), (i32, i32))> = Vec::new();
             let connects: Vec<vyges_pdn::vias::Connect> = opts
                 .all("connect")
                 .iter()
                 .filter_map(|c| {
-                    let mut parts = c.splitn(5, ':');
+                    let mut parts = c.splitn(7, ':');
                     let pair = parts.next()?;
                     let vias: Vec<String> = parts
                         .next()
@@ -3364,11 +3388,35 @@ fn generate(args: &[String]) -> ExitCode {
                         .filter(|v| !v.is_empty())
                         .map(str::to_string)
                         .collect();
+                    // 🔑 **`-max_rows` and `-max_columns` cap the array, they do not size it.**
+                    // `generateDbVia` sets them on every generator before `build()`, and `getCuts`
+                    // ends in `if (max_cuts != 0) cuts = min(cuts, max_cuts)` — so a zero means
+                    // unlimited and an explicit zero is the same as saying nothing.
+                    //
+                    // ⚠️ **Per connect, like the rest of this line.** A design that limits one
+                    // stack and not another gets two different arrays out of the same technology.
+                    let cap = |v: Option<&str>| {
+                        v.filter(|s| !s.is_empty())
+                            .and_then(|s| s.parse::<i32>().ok())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(0)
+                    };
+                    let max_rows = cap(parts.next());
+                    let max_columns = cap(parts.next());
                     let (l, u) = pair.split_once(',')?;
-                    Some((l.to_string(), u.to_string(), vias, pitch, dont_use, ongrid))
+                    Some((
+                        l.to_string(),
+                        u.to_string(),
+                        vias,
+                        pitch,
+                        dont_use,
+                        ongrid,
+                        (max_rows, max_columns),
+                    ))
                 })
-                .map(|(l, u, vias, pitch, dont_use, ongrid)| {
+                .map(|(l, u, vias, pitch, dont_use, ongrid, caps)| {
                     on_grid.push(((l.clone(), u.clone()), ongrid));
+                    max_cuts.push(((l.clone(), u.clone()), caps));
                     let (lo, hi) = (layer_number(&all_layers, &l), layer_number(&all_layers, &u));
                     let c = vyges_pdn::vias::Connect {
                         lower: l.clone(),
@@ -3606,6 +3654,11 @@ fn generate(args: &[String]) -> ExitCode {
                     .find(|((l, u), _)| *l == v.lower && *u == v.upper)
                     .map(|(_, g)| g.as_slice())
                     .unwrap_or(&[]);
+                let (max_rows, max_columns) = max_cuts
+                    .iter()
+                    .find(|((l, u), _)| *l == v.lower && *u == v.upper)
+                    .map(|(_, c)| *c)
+                    .unwrap_or((0, 0));
                 // 🔑 **The two ENDS get their own shapes.** Passing `v.area` for both handed every
                 // level the intersection, which clips a strap that overhangs the core to the rail's
                 // edge — and a via built in the clipped rect lands 500 dbu off and can never widen
@@ -3811,8 +3864,8 @@ fn generate(args: &[String]) -> ExitCode {
                             let n = vyges_pdn::split::counts(
                                 (area.2 - area.0, area.3 - area.1),
                                 (sp, sp),
-                                0,
-                                0,
+                                max_columns,
+                                max_rows,
                             );
                             // ℹ️ Identity snapping: both call sites in the reference pass `false` for
                             // the snap flags, so the layer grids are never populated.
@@ -4033,7 +4086,7 @@ fn generate(args: &[String]) -> ExitCode {
                                         b.x,
                                         t.x,
                                         pitch.0,
-                                        0,
+                                        max_columns,
                                     )
                                     .max(1);
                                     let r = vyges_pdn::viagen::cuts_across(
@@ -4042,7 +4095,7 @@ fn generate(args: &[String]) -> ExitCode {
                                         b.y,
                                         t.y,
                                         pitch.1,
-                                        0,
+                                        max_rows,
                                     )
                                     .max(1);
                                     c * r
@@ -4073,11 +4126,11 @@ fn generate(args: &[String]) -> ExitCode {
                                         return false;
                                     }
                                     let cols = vyges_pdn::viagen::cuts_across(
-                                        area.2 - area.0, cut.0, b.x, t.x, pitch.0, 0,
+                                        area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns,
                                     )
                                     .max(1);
                                     let rws = vyges_pdn::viagen::cuts_across(
-                                        area.3 - area.1, cut.1, b.y, t.y, pitch.1, 0,
+                                        area.3 - area.1, cut.1, b.y, t.y, pitch.1, max_rows,
                                     )
                                     .max(1);
                                     let span =
@@ -4123,7 +4176,7 @@ fn generate(args: &[String]) -> ExitCode {
                                         chosen.bottom.x,
                                         chosen.top.x,
                                         pitch.0,
-                                        0,
+                                        max_columns,
                                     )
                                     .max(1),
                                     vyges_pdn::viagen::cuts_across(
@@ -4132,7 +4185,7 @@ fn generate(args: &[String]) -> ExitCode {
                                         chosen.bottom.y,
                                         chosen.top.y,
                                         pitch.1,
-                                        0,
+                                        max_rows,
                                     )
                                     .max(1),
                                 )
@@ -4166,7 +4219,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     pitch,
                                     (chosen.bottom.x, chosen.bottom.y),
                                     (chosen.top.x, chosen.top.y),
-                                    (0, 0),
+                                    (max_columns, max_rows),
                                     (columns, rows),
                                 )
                             };
@@ -4417,7 +4470,7 @@ fn generate(args: &[String]) -> ExitCode {
                         // under a stack built nothing at all, and the layer above it then lost the
                         // patch that a via on both sides of it would have required.
                         let fit = |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
-                            vyges_pdn::viagen::cuts_across(area.2 - area.0, cut.0, b.x, t.x, pitch.0, 0)
+                            vyges_pdn::viagen::cuts_across(area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns)
                                 .max(1)
                                 * vyges_pdn::viagen::cuts_across(
                                     area.3 - area.1,
@@ -4425,7 +4478,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     b.y,
                                     t.y,
                                     pitch.1,
-                                    0,
+                                    max_rows,
                                 )
                                 .max(1)
                         };
@@ -4450,7 +4503,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     chosen.bottom.x,
                                     chosen.top.x,
                                     pitch.0,
-                                    0,
+                                    max_columns,
                                 )
                                 .max(1),
                                 vyges_pdn::viagen::cuts_across(
@@ -4459,7 +4512,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     chosen.bottom.y,
                                     chosen.top.y,
                                     pitch.1,
-                                    0,
+                                    max_rows,
                                 )
                                 .max(1),
                             )
@@ -4857,6 +4910,20 @@ fn generate(args: &[String]) -> ExitCode {
             // one connection is enough to keep it where an ordinary shape needs two.
             // ⚠️ **A switch pin is the CELL's metal and is never touched** — not shrunk, not
             // removed. It is in this list only so that what lands on it counts as held.
+            //
+            // 🔑 **And neither is a LOCKED shape.** `trimShapes` opens with
+            // `if (!shape->isModifiable()) continue;`, and `isModifiable()` is
+            // `!is_locked_ && shape_type_ == kShape` — so a single-layer ring, the only thing this
+            // engine locks, is exempt from trimming entirely.
+            //
+            // ⚠️ **A single-layer ring has no vias of its own**, its two axes being the same metal,
+            // so trimming it removes the horizontal sides outright for want of connections and
+            // pulls the vertical ones back to whatever else touches them: four segments per net
+            // became two, and those two were shortened by a sixth at each end.
+            if shape == "RING" && locked_layers.contains(&layer) {
+                kept.push((net, layer, rect, shape));
+                continue;
+            }
             if shape == "SWITCH" {
                 kept.push((net, layer, rect, shape));
                 continue;

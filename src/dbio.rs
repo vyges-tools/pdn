@@ -563,6 +563,65 @@ fn may_run_over(
         .collect();
     vyges_pdn::pads::may_run_over_pad(at, ring, &obstructions, &geometry)
 }
+/// The inner edge of the pad ring, which is what `-pad_offsets` is measured from.
+///
+/// 🔑 **`Rings::setPadOffset` walks the placed pads and pulls the die area inward**, one side at a
+/// time, to the nearest pad edge facing the core:
+///
+/// - only masters whose type `isPad()` count, and ⚠️ **`PAD_AREAIO` is excluded** — an area-IO pad
+///   sits over the core rather than around it and would collapse the boundary onto nothing;
+/// - a pad belongs to a side only if it clears the core on that axis AND lies within the core's
+///   extent on the other, so a corner pad — outside the core on both axes — is claimed by neither
+///   and never sets a bound;
+/// - the result starts as the DIE and only ever shrinks, so a side with no pad keeps the die edge.
+///
+/// ⚠️ **A design with no pads at all answers the core**, and the reference treats that as a
+/// failure rather than a zero offset: `PDN-0105`, and the die is used instead.
+pub(crate) fn pad_ring_inner(db: &Db, core: Rect, die: Rect) -> Rect {
+    let mut inner = die;
+    for inst in db.block_get_insts() {
+        if !db.inst_is_placed(&inst) {
+            continue;
+        }
+        let master = db.inst_get_master(&inst);
+        if !db.master_is_pad(&master) {
+            continue;
+        }
+        // ⚠️ **The string is not the enum name.** `dbMasterType::PAD_AREAIO` prints as
+        // `"PAD AREAIO"` — `dbTypes.cpp` parses `"PAD AREAIO"` and returns the same with a space —
+        // so a comparison against the underscored spelling silently matches nothing. This design's
+        // 32 area-IO pads sit further in than the pad ring, so failing to exclude them pulls the
+        // boundary onto them and every `-pad_offsets` ring lands tens of microns off.
+        if db.master_get_type(&master).unwrap_or_default() == "PAD AREAIO" {
+            continue;
+        }
+        let b = db.inst_bbox(&inst).unwrap_or_default();
+        if b.len() != 4 {
+            continue;
+        }
+        let (x0, y0, x1, y1) = (b[0], b[1], b[2], b[3]);
+        let within_x = x0 >= core.0 && x1 <= core.2;
+        let within_y = y0 >= core.1 && y1 <= core.3;
+        if y0 > core.3 && within_x {
+            inner.3 = inner.3.min(y0);
+        } else if y1 < core.1 && within_x {
+            inner.1 = inner.1.max(y1);
+        } else if x1 < core.0 && within_y {
+            inner.0 = inner.0.max(x1);
+        } else if x0 > core.2 && within_y {
+            inner.2 = inner.2.min(x0);
+        }
+    }
+    if inner == core {
+        eprintln!(
+            "vyges-pdn: unable to determine the location of the pad offset, \
+             using the die boundary instead"
+        );
+        return die;
+    }
+    inner
+}
+
 
 /// Every pad direct connection the grids will hold — `setupDirectConnect`, without building
 /// anything.
@@ -1146,10 +1205,19 @@ pub(crate) fn instance_obstructions(
         if db.master_is_core(&master) {
             continue;
         }
+        // 🔑 **A pad CORNER is kept; a standard-cell endcap is not.** The reference switches on
+        // the four corner types and `continue`s on everything else — "Master is a pad corner"
+        // against "Master is a std cell endcap".
+        //
+        // ⚠️ **The strings carry a SPACE, not an underscore.** `dbMasterType::getString()` returns
+        // the LEF `CLASS` spelling — `"ENDCAP TOPLEFT"`, `"PAD AREAIO"`, `"CORE SPACER"` — and the
+        // underscore belongs to the C++ enum identifier alone. Compared against the enum spelling
+        // this matched nothing, so every endcap was skipped and a pad corner's obstructions were
+        // never collected. Found by making the same mistake a second time, on `PAD AREAIO`.
         if db.master_is_end_cap(&master)
             && !matches!(
                 db.master_get_type(&master).unwrap_or_default().as_str(),
-                "ENDCAP_TOPLEFT" | "ENDCAP_TOPRIGHT" | "ENDCAP_BOTTOMLEFT" | "ENDCAP_BOTTOMRIGHT"
+                "ENDCAP TOPLEFT" | "ENDCAP TOPRIGHT" | "ENDCAP BOTTOMLEFT" | "ENDCAP BOTTOMRIGHT"
             )
         {
             continue;
