@@ -3538,6 +3538,29 @@ fn generate(args: &[String]) -> ExitCode {
                 &fixed_via_shapes,
             )
             {
+                // 🔑 **The search area is recomputed on EVERY pass, not once per grid.**
+                // `Grid::makeVias` takes it from `getDomainBoundary()` merged with the grid's
+                // shapes AS THEY STAND, and the outer `makeVias` calls the inner one twice —
+                // before and after `repairVias`. A ring pulled out to meet the core ring reaches
+                // further on the second pass than it did on the first, so global shapes that were
+                // out of reach come into it and crossings appear that the first pass could not
+                // see. Reusing the first pass's area silently keeps them out: 44 vias on a
+                // flipchip design, every one of them a bump grid's second copy of a via the core
+                // grid had already made.
+                let via_area = {
+                    let mut a = boundary;
+                    for (_, _, r, _) in &emitted[grid_shapes_from..] {
+                        a = (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3));
+                    }
+                    a
+                };
+                let in_reach = |i: usize, r: Rect| {
+                    i >= grid_shapes_from
+                        || (r.0 <= via_area.2
+                            && via_area.0 <= r.2
+                            && r.1 <= via_area.3
+                            && via_area.1 <= r.3)
+                };
                 let via_shapes: Vec<vyges_pdn::vias::Shape> = emitted
                     .iter()
                     .enumerate()
@@ -3637,7 +3660,31 @@ fn generate(args: &[String]) -> ExitCode {
                 if repaired.is_empty() {
                     break;
                 }
-                // The straps changed, so every via has to be found again.
+                // The straps changed, so every via has to be found again -- and so has the area
+                // they are looked for in, for the reason above.
+                // 🔑 **The search area is recomputed on EVERY pass, not once per grid.**
+                // `Grid::makeVias` takes it from `getDomainBoundary()` merged with the grid's
+                // shapes AS THEY STAND, and the outer `makeVias` calls the inner one twice —
+                // before and after `repairVias`. A ring pulled out to meet the core ring reaches
+                // further on the second pass than it did on the first, so global shapes that were
+                // out of reach come into it and crossings appear that the first pass could not
+                // see. Reusing the first pass's area silently keeps them out: 44 vias on a
+                // flipchip design, every one of them a bump grid's second copy of a via the core
+                // grid had already made.
+                let via_area = {
+                    let mut a = boundary;
+                    for (_, _, r, _) in &emitted[grid_shapes_from..] {
+                        a = (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3));
+                    }
+                    a
+                };
+                let in_reach = |i: usize, r: Rect| {
+                    i >= grid_shapes_from
+                        || (r.0 <= via_area.2
+                            && via_area.0 <= r.2
+                            && r.1 <= via_area.3
+                            && via_area.1 <= r.3)
+                };
                 let via_shapes: Vec<vyges_pdn::vias::Shape> = emitted
                     .iter()
                     .enumerate()
