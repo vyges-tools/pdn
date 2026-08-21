@@ -3395,11 +3395,14 @@ fn generate(args: &[String]) -> ExitCode {
             let mut on_grid: Vec<((String, String), Vec<String>)> = Vec::new();
             // `-max_rows` / `-max_columns`, by layer pair. Zero means unlimited.
             let mut max_cuts: Vec<((String, String), (i32, i32))> = Vec::new();
+            // `-split_cuts`, by layer pair: the layers whose crossings are spread rather than
+            // packed, with the pitch and stagger each asks for.
+            let mut split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)> = Vec::new();
             let connects: Vec<vyges_pdn::vias::Connect> = opts
                 .all("connect")
                 .iter()
                 .filter_map(|c| {
-                    let mut parts = c.splitn(7, ':');
+                    let mut parts = c.splitn(8, ':');
                     let pair = parts.next()?;
                     let vias: Vec<String> = parts
                         .next()
@@ -3448,6 +3451,27 @@ fn generate(args: &[String]) -> ExitCode {
                     };
                     let max_rows = cap(parts.next());
                     let max_columns = cap(parts.next());
+                    // 🔑 **`-split_cuts` is a property of a CONNECT, not of the design.**
+                    // `Connect::setSplitCuts` stores the map on the connect it was given to, so a
+                    // design declaring it on one connect and not another gets two different arrays
+                    // out of the same technology and the same layer. Held globally, the metal1-to-
+                    // metal6 stack in such a design is scattered into single cuts by a
+                    // pitch the metal1-to-metal4 connect asked for: 912 vias where 228 belong.
+                    //
+                    // `layer,pitch[,stagger]`, joined by `+`.
+                    let splits: Vec<(String, i32, bool)> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split('+')
+                        .filter(|v| !v.is_empty())
+                        .filter_map(|e| {
+                            let mut f = e.splitn(3, ',');
+                            let layer = f.next()?.to_string();
+                            let pitch = dbu(f.next().unwrap_or("0"), per_micron);
+                            let stagger = f.next() == Some("stagger");
+                            (pitch > 0).then_some((layer, pitch, stagger))
+                        })
+                        .collect();
                     let (l, u) = pair.split_once(',')?;
                     Some((
                         l.to_string(),
@@ -3457,11 +3481,22 @@ fn generate(args: &[String]) -> ExitCode {
                         dont_use,
                         ongrid,
                         (max_rows, max_columns),
+                        splits,
                     ))
                 })
-                .map(|(l, u, vias, pitch, dont_use, ongrid, caps)| {
+                .map(|(l, u, vias, pitch, dont_use, ongrid, caps, splits)| {
                     on_grid.push(((l.clone(), u.clone()), ongrid));
                     max_cuts.push(((l.clone(), u.clone()), caps));
+                    // ⚠️ **The connect's own two ends are ERASED from the map.**
+                    // `setSplitCuts` does it on the way in, so naming an end layer does nothing
+                    // whatever -- only a layer the stack passes THROUGH can scatter its cuts.
+                    split_by_connect.push((
+                        (l.clone(), u.clone()),
+                        splits
+                            .into_iter()
+                            .filter(|(layer, ..)| *layer != l && *layer != u)
+                            .collect(),
+                    ));
                     let (lo, hi) = (layer_number(&all_layers, &l), layer_number(&all_layers, &u));
                     let c = vyges_pdn::vias::Connect {
                         lower: l.clone(),
@@ -3654,9 +3689,23 @@ fn generate(args: &[String]) -> ExitCode {
                     (pitch > 0).then_some((layer, pitch, stagger))
                 })
                 .collect();
-            let split_for = |layer: &str| {
-                split_cuts
+            // ⚠️ **The global `--split-cuts` is a FALLBACK**, used only by a connect that states
+            // none of its own. Upstream has no such thing: the flag predates the per-connect field
+            // and is kept so a caller driving the engine by hand can still reach the behaviour.
+            let split_for_connect = |lower: &str, upper: &str, layer: &str| {
+                let own = split_by_connect
                     .iter()
+                    .find(|((l, u), _)| l == lower && u == upper)
+                    .map(|(_, s)| s.as_slice())
+                    .unwrap_or(&[]);
+                let from = if own.is_empty() {
+                    split_cuts.as_slice()
+                } else {
+                    own
+                };
+                from.iter()
+                    // The end-layer erasure again, for the fallback list, which never saw it.
+                    .filter(|(l, ..)| l != lower && l != upper)
                     .find(|(l, ..)| l == layer)
                     .map(|(_, p, s)| (*p, *s))
             };
@@ -3854,6 +3903,7 @@ fn generate(args: &[String]) -> ExitCode {
                     // of a level's own layers asks for split cuts, `determineRowsAndColumns` forces
                     // `rows = cols = 1` and the spread is laid out separately — the pitch being the
                     // LARGER of the two layers' requests, applied to both axes.
+                    let split_for = |layer: &str| split_for_connect(&v.lower, &v.upper, layer);
                     let split = split_for(lo).or_else(|| split_for(hi)).map(|(p, s)| {
                         let other = split_for(if split_for(lo).is_some() { hi } else { lo });
                         (p.max(other.map(|(q, _)| q).unwrap_or(0)), s || other.is_some_and(|(_, t)| t))
