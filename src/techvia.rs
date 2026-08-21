@@ -433,6 +433,11 @@ mod tests {
         assert_eq!(centre((-45, -9, 45, 9)), (0, 0));
         // ⚠️ An odd span lands low, as `xMin + dx / 2` does and `(xMin + xMax) / 2` would not.
         assert_eq!(centre((0, 0, 3, 3)), (1, 1));
+        // 🔑 **A via whose cuts do not straddle the origin.** Three cuts at 0, 36 and 72 with an
+        // 18-wide cut give a merged extent running -9 to 81, so the array's centre is 36 to one
+        // side of the origin the via is placed by. Every placement of it is offset by that, and
+        // nothing else about the via changes -- same name, same count, same metal.
+        assert_eq!(centre((-9, -9, 81, 9)), (36, 0));
     }
 
     #[test]

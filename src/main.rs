@@ -4684,11 +4684,25 @@ fn generate(args: &[String]) -> ExitCode {
                         {
                             continue;
                         }
+                        // 🔑 **A tech via is placed by its ORIGIN, not by its cut array's centre**,
+                        // and for a via whose cuts do not straddle the origin those are different
+                        // points. `DbTechVia::generate` subtracts `via_center_` — the centre of the
+                        // merged cut extent — from the placement on BOTH of its branches, and the
+                        // same value is handed to the via as its origin, so the cuts land back on
+                        // the crossing centre.
+                        //
+                        // ⚠️ **Only the PLACEMENT moves; the metal does not.** The enclosure rects
+                        // are carried with the via and come out centred on the crossing either way,
+                        // so offsetting the metal too would move it off the shape it is measured
+                        // against. A via with three cuts running 90 units to one side of its origin
+                        // places 45 out of position with no other symptom -- same name, same count,
+                        // same metal.
+                        let origin = vyges_pdn::techvia::centre(g.cut_extent);
                         for spot in &spots {
                             placements.push((
                                 v.net.clone(),
                                 name.clone(),
-                                *spot,
+                                (spot.0 - origin.0, spot.1 - origin.1),
                                 v.lower.clone(),
                                 v.upper.clone(),
                                 v.area,
