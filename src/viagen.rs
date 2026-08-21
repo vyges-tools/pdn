@@ -385,6 +385,24 @@ pub fn built_enclosure(
     }
 }
 
+/// **E27** — the enclosure the via is finally built with sits on the MANUFACTURING GRID.
+///
+/// 🔑 **It is the last thing `determineRowsAndColumns` does**, after the array branch, the plain
+/// branch and the split-cut override alike — so nothing downstream ever sees an unsnapped
+/// enclosure, the candidate check included.
+///
+/// ⚠️ **Rounded DOWN, and that is the point.** The overlap enclosure is half of whatever room the
+/// shape has left, so on a grid of 10 a 90-unit remainder gives 45 and the metal comes out 370
+/// tall — five units past each end of a 360-tall opening. Snapping down gives 40, and the metal
+/// fits. Rounding up, or not snapping at all, puts metal outside the shape it lands on and the
+/// via is ripped up at write time for it.
+pub fn snap_enclosure(e: Enclosure, manufacturing_grid: i32) -> Enclosure {
+    Enclosure {
+        x: crate::straps::snap_to_manufacturing_grid(e.x, manufacturing_grid, false),
+        y: crate::straps::snap_to_manufacturing_grid(e.y, manufacturing_grid, false),
+    }
+}
+
 /// **E23** — the overlap enclosure: half the room the cut array leaves in the shape.
 ///
 /// ⚠️ Halved with integer division, and **not clamped**: a shape narrower than its own cut array
@@ -2561,6 +2579,34 @@ mod tests {
         assert_eq!(
             intermediate_patches(&[small], &[big], false, 0, Direction::Vertical, 1),
             Vec::<crate::Rect>::new()
+        );
+    }
+
+    #[test]
+    fn an_enclosure_is_snapped_down_onto_the_manufacturing_grid() {
+        // 🔑 The case that found this. A 370-tall opening over a 280 cut leaves 90, halved to 45,
+        // and 45 on a grid of 10 is metal 370 tall in a 360-tall opening — five units past each
+        // end. Snapped down to 40 the metal is 360 and fits exactly.
+        assert_eq!(
+            snap_enclosure(Enclosure { x: 0, y: 45 }, 10),
+            Enclosure { x: 0, y: 40 }
+        );
+        // Already on the grid: untouched.
+        assert_eq!(
+            snap_enclosure(Enclosure { x: 260, y: 40 }, 10),
+            Enclosure { x: 260, y: 40 }
+        );
+        // ⚠️ A negative enclosure — which `overlap_enclosure` produces for a shape narrower than
+        // its own cut array, and carries through — truncates toward zero, as the reference's
+        // integer division does.
+        assert_eq!(
+            snap_enclosure(Enclosure { x: -45, y: -5 }, 10),
+            Enclosure { x: -40, y: 0 }
+        );
+        // No grid declared: nothing moves.
+        assert_eq!(
+            snap_enclosure(Enclosure { x: 45, y: 45 }, 0),
+            Enclosure { x: 45, y: 45 }
         );
     }
 

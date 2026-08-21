@@ -4195,6 +4195,12 @@ fn generate(args: &[String]) -> ExitCode {
                                         overlap,
                                         top_c,
                                     );
+                                    // Snapped before the rule check: `checkConstraints` runs
+                                    // after `determineRowsAndColumns` has already snapped.
+                                    let built_b =
+                                        vyges_pdn::viagen::snap_enclosure(built_b, grid_mfg);
+                                    let built_t =
+                                        vyges_pdn::viagen::snap_enclosure(built_t, grid_mfg);
                                     vyges_pdn::viagen::enclosure_satisfies(built_b, &bot_rules)
                                         && vyges_pdn::viagen::enclosure_satisfies(
                                             built_t, &top_rules,
@@ -4317,14 +4323,18 @@ fn generate(args: &[String]) -> ExitCode {
                             // what tells us is that the intermediate layer then meets its minimum
                             // area on its own and the DRCFILL patch that should fill it never
                             // appears — hundreds of patches on a single design.
+                            // ⚠️ Snapped LAST, after the split-cut override, because
+                            // `determineRowsAndColumns` snaps on its way out and every branch
+                            // above it funnels through that one line.
                             let (bot_enc, top_enc) = if split.is_some() {
-                                (
-                                    (chosen.bottom.x, chosen.bottom.y),
-                                    (chosen.top.x, chosen.top.y),
-                                )
+                                (chosen.bottom, chosen.top)
                             } else {
-                                ((b.x, b.y), (t.x, t.y))
+                                (b, t)
                             };
+                            let bot_enc = vyges_pdn::viagen::snap_enclosure(bot_enc, grid_mfg);
+                            let top_enc = vyges_pdn::viagen::snap_enclosure(top_enc, grid_mfg);
+                            let (bot_enc, top_enc) =
+                                ((bot_enc.x, bot_enc.y), (top_enc.x, top_enc.y));
 
                             // 🔑 **What the sort reads.** `getCutArea` is the cut's own area times
                             // the CLAMPED cut count, and `getGeneratorWidth`/`Height` are
@@ -4598,15 +4608,15 @@ fn generate(args: &[String]) -> ExitCode {
                         let t =
                             vyges_pdn::viagen::built_enclosure(!at_top_end, chosen.top, overlap, top_c);
                         // 🔑 The minimum verbatim for a split array — see the same override on the
-                        // generate path.
+                        // generate path. Snapped after it, for the same reason.
                         let (bot, top) = if split.is_some() {
-                            (
-                                (chosen.bottom.x, chosen.bottom.y),
-                                (chosen.top.x, chosen.top.y),
-                            )
+                            (chosen.bottom, chosen.top)
                         } else {
-                            ((b.x, b.y), (t.x, t.y))
+                            (b, t)
                         };
+                        let bot = vyges_pdn::viagen::snap_enclosure(bot, grid_mfg);
+                        let top = vyges_pdn::viagen::snap_enclosure(top, grid_mfg);
+                        let (bot, top) = ((bot.x, bot.y), (top.x, top.y));
                         // 🔑 **A single-cut tech via is placed AS ITSELF.** `DbTechVia::generate`
                         // branches on `isArray()`, and only an array is given a `dbVia` of its own —
                         // the else arm hands `odb::dbSBox::create` the technology's via directly, so
