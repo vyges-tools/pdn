@@ -2406,6 +2406,33 @@ fn generate(args: &[String]) -> ExitCode {
     // statements, to whatever is standing at that moment.
     // Every fixed instance's outline, per layer it occupies — read once, used by `cleanupShapes`.
     let macro_boxes = macro_outlines(&db);
+    // 🔑 **A grid's via GEOMETRY is built AFTER trimming, so it is deferred.**
+    // `PdnGen::buildGrids` makes each grid's shapes and its crossing SET, then trims, and only
+    // `PdnGen::writeToDb` — which runs after all of that — calls `Connect::makeVia` to size and
+    // place anything. So a via is measured against the strap AS TRIMMED.
+    //
+    // ⚠️ **The two readings agree except where a strap ENDS inside the crossing**, and then they
+    // are far apart: an always-on switch pin sits at the end of its strap, and sizing the stack
+    // against the untrimmed strap leaves an intermediate rect 100 units too tall on every one of
+    // them. Trimming needs only the crossing AREAS, which are known before any via is built, so
+    // the dependency between the two is breakable in this direction and no other.
+    struct PendingVias<'a> {
+        opts: &'a Opts,
+        placed: Vec<vyges_pdn::vias::Via>,
+        dropped: Vec<(vyges_pdn::vias::Via, vyges_pdn::vias::Failed)>,
+        fixed: Vec<(
+            String,
+            String,
+            Vec<String>,
+            Option<(i32, i32)>,
+            Option<regex::Regex>,
+        )>,
+        on_grid: Vec<((String, String), Vec<String>)>,
+        max_cuts: Vec<((String, String), (i32, i32))>,
+        split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)>,
+        ground: String,
+    }
+    let mut pending: Vec<PendingVias> = Vec::new();
     for (grid_index, (grid, opts)) in grids.iter().enumerate() {
         // 🔑 **`-starts_with` belongs to the GRID that declared it**, and `define_pdn_grid`
         // defaults it to GROUND — `set start_with_power 0`. A grid that says nothing gets ground
@@ -3713,1469 +3740,48 @@ fn generate(args: &[String]) -> ExitCode {
                 }
             }
 
-            // ⚠️ One `dbVia` per distinct geometry, reused wherever it is needed — the reference looks
-            // the via up by name and creates it only when absent. One per location instead leaves the
-            // database carrying thousands of identical via definitions.
-            // ── the cut geometry, from the technology rather than the command line ──────────────
-            // ⚠️ The cut layer's own VIARULE GENERATE decides the cut size and the enclosures. The
-            // command-line values are kept only for a technology declaring no rule, and a via built
-            // from those is one this engine invented rather than one the technology describes.
-            // `--split-cuts <layer>:<pitch>[:stagger]` — cuts crossing this layer are spread out
-            // rather than packed into one array.
+            // ── what TRIMMING needs, which is only the crossing areas ────────────────────────
+            // 🔑 **A crossing holds its two shapes whether or not a via is ever built there.**
+            // `Grid::makeVias` creates a `Via` per intersection and `updateVias` attaches it to
+            // both shapes; nothing between here and trimming consults any geometry. So the holds
+            // can be recorded now and the geometry deferred until after the trim.
             //
-            // ⚠️ **Only INTERMEDIATE layers count.** `Connect::setSplitCuts` erases the connect's own
-            // two ends from the map, so naming an end layer does nothing.
-            let split_cuts: Vec<(String, i32, bool)> = opts
-                .all("split-cuts")
-                .iter()
-                .filter_map(|s| {
-                    let mut p = s.splitn(3, ':');
-                    let layer = p.next()?.to_string();
-                    let pitch = dbu(p.next().unwrap_or("0"), per_micron);
-                    let stagger = p.next() == Some("stagger");
-                    (pitch > 0).then_some((layer, pitch, stagger))
-                })
-                .collect();
-            // ⚠️ **The global `--split-cuts` is a FALLBACK**, used only by a connect that states
-            // none of its own. Upstream has no such thing: the flag predates the per-connect field
-            // and is kept so a caller driving the engine by hand can still reach the behaviour.
-            let split_for_connect = |lower: &str, upper: &str, layer: &str| {
-                let own = split_by_connect
-                    .iter()
-                    .find(|((l, u), _)| l == lower && u == upper)
-                    .map(|(_, s)| s.as_slice())
-                    .unwrap_or(&[]);
-                let from = if own.is_empty() {
-                    split_cuts.as_slice()
-                } else {
-                    own
-                };
-                from.iter()
-                    // The end-layer erasure again, for the fallback list, which never saw it.
-                    .filter(|(l, ..)| l != lower && l != upper)
-                    .find(|(l, ..)| l == layer)
-                    .map(|(_, p, s)| (*p, *s))
-            };
-            let rules = via_rules(&db);
-            let fallback_cut = (
-                dbu(opts.one("cut-width").unwrap_or("0"), per_micron),
-                dbu(opts.one("cut-height").unwrap_or("0"), per_micron),
-            );
-            let fallback_enc = dbu(opts.one("cut-enclosure").unwrap_or("0"), per_micron);
-            // The track grids of every layer any connect asked to snap to, read once.
-            // ⚠️ A layer NOT named here has no grid, and `snap_to_grid` then returns its argument — the
-            // reference relies on exactly that, calling the snap unconditionally at every level.
-            let mut track_grids: std::collections::HashMap<String, (Vec<i32>, Vec<i32>)> =
-                Default::default();
-            for (_, layers) in &on_grid {
-                for l in layers {
-                    track_grids
-                        .entry(l.clone())
-                        .or_insert_with(|| db.track_grid(l).unwrap_or_default());
-                }
-            }
-            let mut written = 0;
+            // ⚠️ **The two guards are the SAME two the build applies**, and they have to be: a
+            // crossing the build skips must not hold a strap open, and one it merely refuses to
+            // build must. See the note on a refused via at the build site.
             for v in &placed {
-                // The two shapes AS THEY STAND, which is not as they started: an earlier via may
-                // have reached past the end of either and grown it. See `grown_rects`.
-                let faces_before = via_faces.len();
-                let lower_key = (v.net.clone(), v.lower.clone(), v.lower_rect);
-                let upper_key = (v.net.clone(), v.upper.clone(), v.upper_rect);
-                let lower_rect = *grown_rects.get(&lower_key).unwrap_or(&v.lower_rect);
-                let upper_rect = *grown_rects.get(&upper_key).unwrap_or(&v.upper_rect);
-                // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
-                // metal6 needs a cut at each of five levels, and the reference's own counts show it:
-                // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
-                // four levels unconnected while looking complete at both ends.
-                // 🔑 **Where the via goes is not the centre of what it is sized from.** The placement
-                // point comes from the plain intersection of the two shapes, SNAPPED — see
-                // `vias::placement_point`. Every level of a stack sits at the same point.
-                let Some(place_at) =
-                    vyges_pdn::vias::placement_point(lower_rect, upper_rect, grid_mfg)
-                else {
-                    continue; // off grid: the reference builds a dummy via, which places nothing
-                };
-                let stack = stack_layers(&db, &v.lower, &v.upper);
-                // The layers THIS connect snaps to. Empty for every other connect, which is the point.
-                let ongrid: &[String] = on_grid
-                    .iter()
-                    .find(|((l, u), _)| *l == v.lower && *u == v.upper)
-                    .map(|(_, g)| g.as_slice())
-                    .unwrap_or(&[]);
-                let (max_rows, max_columns) = max_cuts
-                    .iter()
-                    .find(|((l, u), _)| *l == v.lower && *u == v.upper)
-                    .map(|(_, c)| *c)
-                    .unwrap_or((0, 0));
-                // 🔑 **The two ENDS get their own shapes.** Passing `v.area` for both handed every
-                // level the intersection, which clips a strap that overhangs the core to the rail's
-                // edge — and a via built in the clipped rect lands 500 dbu off and can never widen
-                // the shape it sits on.
-                let intermediate: Vec<&str> = if stack.len() > 2 {
-                    stack[1..stack.len() - 1].iter().map(String::as_str).collect()
-                } else {
-                    Vec::new()
-                };
-                // 🔑 **A stack that cannot hold the intersection TAPERS.** Where an intermediate
-                // routing layer's own minimum width is wider than the intersection is narrow, that
-                // level is grown to what a via needs there — the layer minimum plus twice the worst
-                // enclosure the cut layers either side ask for — instead of the stack failing.
-                //
-                // ⚠️ **The gate and the growth read different widths, and the gate is the smaller.**
-                // `isComplexStackedVia` asks the raw `getMinWidth()`; `generateComplexStackedViaRects`
-                // grows to `Connect::getMinWidth()`. A stack can pass the gate and still be narrower
-                // than the target, and the reference leaves those alone — applying the growth
-                // unconditionally widens stacks it never touches.
-                let raw_min_widths: Vec<i32> = intermediate
-                    .iter()
-                    .map(|l| db.layer_get_min_width(l) as i32)
-                    .collect();
-                let via_min_widths: Vec<i32> = intermediate
-                    .iter()
-                    .map(|l| via_min_width(&db, l, &rules))
-                    .collect();
-                // ⚠️ **`PDN_MINW_TRACE` prints the two END rects and each intermediate's target
-                // width.** It is the instrument that separates a wrong min-width from a right one
-                // measured against the wrong shape — the two produce the same symptom, an
-                // intermediate rect of the wrong height, and nothing else distinguishes them.
-                if std::env::var_os("PDN_MINW_TRACE").is_some() {
-                    eprintln!(
-                        "[minw] {}->{} lower {:?} upper {:?} intermediate {:?} raw {:?} via {:?}",
-                        v.lower, v.upper, lower_rect, upper_rect, intermediate, raw_min_widths,
-                        via_min_widths
-                    );
+                if vyges_pdn::vias::placement_point(v.lower_rect, v.upper_rect, grid_mfg).is_none()
+                {
+                    continue;
                 }
-                let rects = vyges_pdn::vias::stack_rects_tapered(
-                    lower_rect,
-                    upper_rect,
-                    &raw_min_widths,
-                    &via_min_widths,
-                    grid_mfg,
-                );
-
-                // 🔑 **A level holds a SET of candidate rects, not one.** `makeSingleLayerVia`
-                // takes `lower_rects` and `upper_rects`, crosses every pair with every rule, and
-                // lets `generateDbVia` build them all and keep the best — so an intermediate level
-                // gets two chances to find an enclosure that fits, and the ends get one because a
-                // shape has no second version of itself.
-                //
-                // ⚠️ **`generateMinEnclosureViaRects` runs on BOTH stack layouts**, not only the
-                // tapered one, so this is not taper support — it is a mechanism the plain path was
-                // missing too.
-                let mut rect_set: Vec<Vec<vyges_pdn::Rect>> =
-                    rects.iter().map(|r| vec![*r]).collect();
-                let widths: Vec<i32> = intermediate
-                    .iter()
-                    .map(|l| db.layer_get_width(l) as i32)
-                    .collect();
-                let horizontal: Vec<bool> = intermediate
-                    .iter()
-                    .map(|l| direction_of(&db, l) == Direction::Horizontal)
-                    .collect();
-                // ℹ️ `-min_width` on a connect is not translated by the harness, and no case in the
-                // suite states it, so every layer takes the union branch.
-                let min_width_only = vec![false; intermediate.len()];
-                vyges_pdn::vias::add_min_enclosure_rects(
-                    &mut rect_set,
-                    &widths,
-                    &horizontal,
-                    &min_width_only,
-                );
-
-                // The previous level's TOP metal, which the next level shares a layer with.
-                // ⚠️ **One entry per SPOT**, because a split-cut level places many vias and each
-                // leaves its own metal on the layer above.
-                // ⚠️ **And whether that via was an ARRAY**, because the patch on the layer between is
-                // decided by `requiresPatch()` on either of the two vias, not by the geometry.
-                let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
-                for (level, pair) in stack.windows(2).enumerate() {
+                for pair in stack_layers(&db, &v.lower, &v.upper).windows(2) {
                     let (lo, hi) = (pair[0].as_str(), pair[1].as_str());
-                    // An explicit `--cut-<lower>-<upper>` overrides; otherwise the technology decides.
                     let named = opts
                         .one(&format!("cut-{lo}-{hi}"))
                         .filter(|c| !c.is_empty());
-                    let Some(cut_layer) = named.map(str::to_string).or(cut_layer_between(&db, lo, hi))
-                    else {
-                        continue; // no cut layer between these two, so nothing can be built
-                    };
-                    let cut_layer = cut_layer.as_str();
-                    // 🔑 **The ARRAYSPACING rules belong to the CUT layer**, and are read once per
-                    // level rather than per candidate pair — they do not depend on the rects.
-                    let array_rules: Vec<vyges_pdn::viagen::ArrayRule> = db
-                        .layer_array_spacing_rules(cut_layer)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(|(cut_class, parallel_overlap, long_array, array_width, cut_spacing, cuts_spacing)| {
-                            vyges_pdn::viagen::ArrayRule {
-                                cut_class,
-                                parallel_overlap,
-                                long_array,
-                                array_width,
-                                cut_spacing,
-                                cuts_spacing,
-                            }
-                        })
-                        .collect();
-
-                    // ── the level's own placement point ─────────────────────────────────────────────
-                    // 🔑 **A stack does NOT sit on one point.** `DbGenerateStackedVia::generate` snaps
-                    // each level separately, so a stack crossing a layer the connect named bends: the
-                    // levels touching that layer move to its nearest track and the rest stay put.
-                    //
-                    // ⚠️ **That bend is the whole mechanism.** The levels either side of the named
-                    // layer then leave metal at DIFFERENT positions on the layer between, the union is
-                    // no longer a rectangle, and the bounding box that closes the notch is written as
-                    // DRCFILL — hundreds of patches on one design, none of which appear if every
-                    // level sits on the same point.
-                    //
-                    // ⚠️ **Only a STACK snaps.** A single-level connect goes through
-                    // `makeSingleLayerVia`, and `DbGenerateVia::generate` takes the `ongrid` set and
-                    // ignores it — the snapping lives in the stacked via, not in the via.
-                    let place_at = if stack.len() > 2 {
-                        let grid_of = |layer: &str| {
-                            ongrid
-                                .iter()
-                                .any(|l| l == layer)
-                                .then(|| track_grids.get(layer))
-                                .flatten()
-                        };
-                        let snap_x = |layer: &str, v: i32| match grid_of(layer) {
-                            Some((x, _)) => vyges_pdn::vias::snap_to_grid(v, x, 0),
-                            None => v,
-                        };
-                        let snap_y = |layer: &str, v: i32| match grid_of(layer) {
-                            Some((_, y)) => vyges_pdn::vias::snap_to_grid(v, y, 0),
-                            None => v,
-                        };
-                        let (x_from_upper, y_from_upper) = vyges_pdn::vias::snap_sources(
-                            direction_of(&db, lo) == Direction::Horizontal,
-                        );
-                        (
-                            snap_x(if x_from_upper { hi } else { lo }, place_at.0),
-                            snap_y(if y_from_upper { hi } else { lo }, place_at.1),
-                        )
-                    } else {
-                        place_at
-                    };
-                    // 🔑 **A split-cut level builds a 1x1 via and places it many times.** Where either
-                    // of a level's own layers asks for split cuts, `determineRowsAndColumns` forces
-                    // `rows = cols = 1` and the spread is laid out separately — the pitch being the
-                    // LARGER of the two layers' requests, applied to both axes.
-                    let split_for = |layer: &str| split_for_connect(&v.lower, &v.upper, layer);
-                    let split = split_for(lo).or_else(|| split_for(hi)).map(|(p, s)| {
-                        let other = split_for(if split_for(lo).is_some() { hi } else { lo });
-                        (p.max(other.map(|(q, _)| q).unwrap_or(0)), s || other.is_some_and(|(_, t)| t))
-                    });
-
-                    // 🔑 **The widths a generate rule is checked against, and they are the SHAPES'.**
-                    // `getLowerWidth`/`getUpperWidth` read `lower_rect_`/`upper_rect_` — the straps the
-                    // via lands on — not the intersection it is built in.
-                    // ⚠️ **Zero for a split array**, which is how a wide-metal rule is kept off a via
-                    // that will be scattered as single cuts. See `rule_valid_for_width`.
-                    let shape_width = |r: vyges_pdn::Rect| (r.2 - r.0).min(r.3 - r.1);
-                    let (width_lo, width_hi) = if split.is_some() {
-                        (0, 0)
-                    } else {
-                        (shape_width(rects[level]), shape_width(rects[level + 1]))
-                    };
-                    let rule_fits = |r: &ViaRule| {
-                        vyges_pdn::viagen::rule_valid_for_width(r.bottom_width, width_lo)
-                            && vyges_pdn::viagen::rule_valid_for_width(r.top_width, width_hi)
-                    };
-                    // Each axis from the shape that constrains it — see `vias::via_area`.
-                    let area = vyges_pdn::vias::via_area(rects[level], rects[level + 1]);
-
-                    // 🔑 **A crossing holds its two shapes whether or not any metal was built.**
-                    // `Grid::makeVias` creates a `Via` per intersection and `PdnGen::updateVias`
-                    // attaches it to both shapes; the only thing that takes one away is
-                    // `removeInvalidVias`, and `Via::isValid` asks solely whether the two shapes
-                    // still exist. A `DbVia` that could not be generated never enters that test —
-                    // `makeVia` reports `PDN-0110` and moves on, leaving the `Via` in place.
-                    //
-                    // ⚠️ **So a refused via still trims a strap, and that is not a quirk.** On a
-                    // design with a switched region domain, a met5 stripe crosses met4 twice and
-                    // only one crossing builds. Counting the built one alone leaves a single
-                    // connection, `isRemovable` takes the whole stripe away, and counting both
-                    // keeps it and sets its minimum rect to 63600..114370 — the reference's own
-                    // answer, spanning from the REFUSED crossing to the built one.
-                    //
-                    // 🔑 **The SHAPES' intersection, not this level's rect.** `getMinimumRect`
-                    // merges `via->getArea()`, and a `Via` is constructed once per crossing with
-                    // the two shapes' own intersection — every level of the stack reports the same
-                    // area. Reporting the level's rect is harmless while the levels all hold the
-                    // intersection, and wrong the moment a stack tapers: a grown intermediate rect
-                    // then holds the strap out past where the via metal reaches.
+                    if named
+                        .map(str::to_string)
+                        .or(cut_layer_between(&db, lo, hi))
+                        .is_none()
+                    {
+                        continue;
+                    }
                     via_areas.push((v.net.clone(), (lo.to_string(), hi.to_string()), v.area));
-
-                    // A split-cut level places its 1x1 via once per array position; every other level
-                    // places one via at the point itself.
-                    // ℹ️ Asked per area, because the generate path chooses among candidate rects and
-                    // the winner's area is what its array has to fill.
-                    let spots_in = |area: vyges_pdn::Rect| match split {
-                        None => vec![place_at],
-                        Some((sp, stagger)) => {
-                            // ⚠️ **The stagger offset is applied to the GROUND net only**, so the two
-                            // nets' arrays interleave by half a pitch rather than both shifting.
-                            let off = if stagger && v.net == ground {
-                                (sp / 2, sp / 2)
-                            } else {
-                                (0, 0)
-                            };
-                            let n = vyges_pdn::split::counts(
-                                (area.2 - area.0, area.3 - area.1),
-                                (sp, sp),
-                                max_columns,
-                                max_rows,
-                            );
-                            // ℹ️ Identity snapping: both call sites in the reference pass `false` for
-                            // the snap flags, so the layer grids are never populated.
-                            vyges_pdn::split::positions(place_at, n, (sp, sp), off, &|v| v, &|v| v)
-                        }
-                    };
-                    let spots = spots_in(area);
-
-                    // ── a via the technology already declares ────────────────────────────────────
-                    // 🔑 **Only the GEOMETRY is the technology's.** How many cuts fit, and what
-                    // enclosure the via is finally built with, are decided by the same machinery a
-                    // generated via uses — `TechViaGenerator` differs from `GenerateViaGenerator`
-                    // only in where its cut and its minimum enclosures come from, and hands rows,
-                    // columns and pitch to `DbTechVia` through the shared `makeBaseVia`.
-                    // ⚠️ Evaluated before the generate path so a NAMED via wins outright, but the
-                    // unnamed fallback inside is gated on there being no rule for this level — the
-                    // reference populates both lists and picks between them, and preferring a tech
-                    // via where a rule exists would rebuild every Nangate45 case differently.
-                    // ⚠️ **A tech via is a FALLBACK, not an alternative.** `makeSingleLayerVia` builds
-                    // every generate rule first and only reaches `populateTechVias` when none of them
-                    // was even set up validly — so a rule that exists but does not apply here leaves
-                    // the level to the technology's own via rather than to nothing.
-                    let has_rule = rules
-                        .iter()
-                        .any(|r| r.lower == lo && r.upper == hi && rule_fits(r));
-                    // 🔑 **`PDN_RULE_TRACE=1` says why a level fell through to the technology's own
-                    // via.** The reference's `Via` group prints `Generate via rules available: N
-                    // from M`; this prints the candidates for the pair and the width gate each was
-                    // judged by, so "no rule applies here" and "no rule exists for this pair" can
-                    // be told apart. ⚠️ They look identical from the output and mean opposite
-                    // things — a missing rule is a parse bug, an inapplicable one is the design.
-                    if std::env::var_os("PDN_RULE_TRACE").is_some() && !has_rule {
-                        for r in rules.iter().filter(|r| r.lower == lo && r.upper == hi) {
-                            eprintln!(
-                                "[rule] {lo}->{hi} {} bw {:?} vs {width_lo} | tw {:?} vs {width_hi}",
-                                r.name, r.bottom_width, r.top_width
-                            );
-                        }
-                        eprintln!("[rule] NO RULE {lo}->{hi} (candidates {})", rules.iter().filter(|r| r.lower == lo && r.upper == hi).count());
-                    }
-                    let named_here = fixed
-                        .iter()
-                        .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
-                        .is_some_and(|(_, _, n, _, _)| !n.is_empty());
-                    // The generate rule spanning exactly this level, where one is declared.
-                    //
-                    // ⚠️ **A rule this connect asked to keep out is not a rule.** `filterVias` erases
-                    // by name from the generate rules and the tech vias alike, so the filter belongs
-                    // on both paths — applied to only one, a via merely moves between them.
-                    let dont_use = fixed
-                        .iter()
-                        .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
-                        .and_then(|(.., d)| d.as_ref());
-                    // 🔑 **`-cut_pitch` overrides the technology's, on EVERY generator.**
-                    // `generateDbVia` sets it before any candidate is built:
-                    // `if (hasCutPitch()) { via->setCutPitchX(...); via->setCutPitchY(...); }` —
-                    // and only the split-cut pitch, applied after, may displace it.
-                    //
-                    // ⚠️ **The pitch is stored as the cut SPACING and appears in the via's NAME**,
-                    // so a via built at the technology's pitch is a different object from the same
-                    // geometry built at the connect's. Read only on the tech-via path, one design
-                    // came out with 534 columns at a 300 pitch where the reference writes 161 at
-                    // 1000 — every via in the design different, and not one shape to show for it.
-                    let connect_cut_pitch: Option<(i32, i32)> = fixed
-                        .iter()
-                        .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
-                        .and_then(|(_, _, _, p, _)| *p);
-                    // ⚠️ A shape constrains the via only at ITS OWN end of the stack; every level
-                    // in between takes minimums however much room it has.
-                    let at_bottom_end = level == 0;
-                    let at_top_end = level + 2 == stack.len();
-                    // ⚠️ The SHAPE's orientation, not the layer's — `Shape::isHorizontal` is its own
-                    // aspect ratio. A follow pin on a vertical layer still runs horizontally.
-                    // ℹ️ Read from the level's own rect rather than a candidate: an END of the stack
-                    // is a shape, and a shape has exactly one candidate.
-                    let bot_c = if at_bottom_end {
-                        let d = vyges_pdn::viagen::rect_direction(rects[level]);
-                        vyges_pdn::viagen::constraint_for(d, true, false)
-                    } else {
-                        Default::default()
-                    };
-                    let top_c = if at_top_end {
-                        let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
-                        vyges_pdn::viagen::constraint_for(d, true, false)
-                    } else {
-                        Default::default()
-                    };
-
-                    // ── every lower candidate against every upper one ───────────────────────────
-                    // 🔑 **`makeSingleLayerVia` crosses the two SETS.** A generator is made for each
-                    // (lower rect, upper rect, rule) triple, `generateDbVia` builds every one that
-                    // can be built, stable-sorts them by `isPreferredOver` and takes the first.
-                    //
-                    // ⚠️ **The pair is not a detail of the enclosure search — it changes the rule.**
-                    // `getLowerWidth`/`getUpperWidth` read the candidate rects, so a different pair
-                    // can pass a width gate the other fails, land in a different enclosure bucket,
-                    // and fit a different number of cuts. That is the whole reason a level carries
-                    // more than one rect.
-                    struct LevelVia<'r> {
-                        rule: Option<&'r ViaRule>,
-                        cut: (i32, i32),
-                        pitch: (i32, i32),
-                        area: vyges_pdn::Rect,
-                        rows: i32,
-                        columns: i32,
-                        /// Set where an `ARRAYSPACING` rule regrouped the cuts. `rows`/`columns`
-                        /// are then ONE group's, and this says how the groups are laid out.
-                        array: Option<vyges_pdn::viagen::ArrayFit>,
-                        bot_enc: (i32, i32),
-                        top_enc: (i32, i32),
-                        score: vyges_pdn::viagen::Generator,
-                    }
-                    let mut best: Option<LevelVia> = None;
-                    for &lower_rect in &rect_set[level] {
-                        for &upper_rect in &rect_set[level + 1] {
-                            // The widths the rule is gated on are THIS pair's, not the level's.
-                            let (w_lo, w_hi) = if split.is_some() {
-                                (0, 0)
-                            } else {
-                                (shape_width(lower_rect), shape_width(upper_rect))
-                            };
-                            let rule = rules
-                                .iter()
-                                .filter(|r| !dont_use.is_some_and(|d| d.is_match(&r.name)))
-                                .find(|r| {
-                                    r.lower == lo
-                                        && r.upper == hi
-                                        && vyges_pdn::viagen::rule_valid_for_width(
-                                            r.bottom_width,
-                                            w_lo,
-                                        )
-                                        && vyges_pdn::viagen::rule_valid_for_width(r.top_width, w_hi)
-                                });
-                            let cut = rule.map(|r| r.cut).unwrap_or(fallback_cut);
-                            if cut.0 <= 0 || cut.1 <= 0 {
-                                continue; // nothing to build from
-                            }
-                            // 🔑 **A split array's pitch is the SPLIT pitch, on both axes.**
-                            // `generateDbVia` calls `setCutPitchX(pitch)`/`setCutPitchY(pitch)` with
-                            // the larger of the two layers' requests before the generator is ever
-                            // built, overriding whatever spacing the rule declares. The via still
-                            // holds one cut, so nothing moves — but the pitch is stored as the cut
-                            // SPACING and appears in the via's name, so a via built at the rule's
-                            // pitch is a different object with a different name from the same
-                            // geometry.
-                            // 🔑 **The pitch comes from the CUT LAYER, and the rule's own
-                            // `SPACING` is only the fallback.** `determineCutSpacing` runs first
-                            // — the layer's spacing added to the cut, refined by the cut class's
-                            // spacing table — and the generate rule's value is taken **verbatim**
-                            // and only where that left an axis at zero.
-                            //
-                            // ⚠️ Reading the rule first inflates every via the rule covers. A
-                            // wide-power rule stating a deliberately large spacing then sets the
-                            // pitch for vias the layer would have packed far more tightly — and
-                            // nothing says so, because vias are not compared shape by shape. It
-                            // shows only where the oversized metal has to be absorbed by a shape
-                            // too narrow to hide it.
-                            let pitch = match (split, connect_cut_pitch) {
-                                (Some((sp, _)), _) => (sp, sp),
-                                (None, Some(p)) => p,
-                                (None, None) => {
-                                    let cut_rect = (0, 0, cut.0, cut.1);
-                                    let classes = via_cut_classes(&db, cut_layer);
-                                    let cls = vyges_pdn::viagen::cut_class(&classes, cut)
-                                        .map(|c| c.name.clone())
-                                        .unwrap_or_else(|| cut_layer.to_string());
-                                    let table = spacing_table_rules(&db, cut_layer, &cls);
-                                    vyges_pdn::techvia::base_cut_pitch(
-                                        cut_rect,
-                                        db.layer_get_spacing(cut_layer),
-                                        vyges_pdn::techvia::class_cut_spacing(cut_rect, &table),
-                                    )
-                                    .or_else(|| rule.map(|r| r.pitch))
-                                    .unwrap_or(cut)
-                                }
-                            };
-                            // Each axis from the shape that constrains it — see `vias::via_area`.
-                            let area = vyges_pdn::vias::via_area(lower_rect, upper_rect);
-
-                            // ── the enclosure pair, chosen the way the reference chooses it ─────
-                            // 🔑 Candidates from the rules, crossed, each scored by how many cuts
-                            // IT lets fit and kept only if the constraints pass. The leftover-fill
-                            // this replaced was derived from one case that agreed exactly and three
-                            // in the same run that did not.
-                            let (rule_bot, rule_top) = rule.map(|r| (r.bottom_enclosure, r.top_enclosure)).unwrap_or((
-                                (fallback_enc, fallback_enc),
-                                (fallback_enc, fallback_enc),
-                            ));
-                            let bottoms = enclosure_candidates(
-                                &db, cut_layer, cut, area, lo, false, Some(rule_bot), split.is_some(),
-                            );
-                            let tops = enclosure_candidates(
-                                &db, cut_layer, cut, area, hi, true, Some(rule_top), split.is_some(),
-                            );
-                            // 🔑 **What `checkMinEnclosure` is asked against** — the cut layer's
-                            // own rules, WITHOUT the generate rule's stated enclosure among them.
-                            let bot_rules = enclosure_candidates_with_swap(
-                                &db, cut_layer, cut, area, lo, false, None, split.is_some(),
-                            );
-                            let top_rules = enclosure_candidates_with_swap(
-                                &db, cut_layer, cut, area, hi, true, None, split.is_some(),
-                            );
-
-                            // 🔑 **`PDN_VIA_TRACE=1` prints what the reference's `Via` and
-                            // `ViaEnclosure` debug groups print**, in the same terms: the area, the
-                            // cut, the pitch, both rule sets, both candidate sets and both
-                            // constraints, then whether the pair was CHOSEN or REJECTED. The two
-                            // logs can be read side by side, which is how the 770-wide crossing was
-                            // settled — ours rejected the generate via exactly where the reference
-                            // did, and the difference was the tech-via fallback below.
-                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                                eprintln!(
-                                    "[via] {}|{lo}->{hi}|area {area:?}|cut {cut:?}|pitch {pitch:?}|bot_rules {bot_rules:?}|top_rules {top_rules:?}|bottoms {bottoms:?}|tops {tops:?}|bot_c {bot_c:?}|top_c {top_c:?}",
-                                    v.net
-                                );
-                            }
-                            // 🔑 **The score is `getTotalCuts()`, and that is the CLAMPED product.**
-                            // `determineRowsAndColumns` ends with `core_row_ = std::max(1, rows)`
-                            // and its sibling for columns, so a pair that fits no cut on an axis
-                            // still builds one row of them.
-                            //
-                            // ⚠️ **Which means the fit is not a gate at all.** `checkConstraints`'s
-                            // `getTotalCuts() == 0` test can never fire once the clamp has run;
-                            // what rejects a pair is the minimum-cut and minimum-enclosure check.
-                            // Treating a zero fit as a rejection refuses vias the reference builds
-                            // — every stack onto a power switch's pin, which is 280 tall against a
-                            // 150 cut and enclosures that want 170.
-                            let fit =
-                                |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
-                                    let c = vyges_pdn::viagen::cuts_across(
-                                        area.2 - area.0,
-                                        cut.0,
-                                        b.x,
-                                        t.x,
-                                        pitch.0,
-                                        max_columns,
-                                    )
-                                    .max(1);
-                                    let r = vyges_pdn::viagen::cuts_across(
-                                        area.3 - area.1,
-                                        cut.1,
-                                        b.y,
-                                        t.y,
-                                        pitch.1,
-                                        max_rows,
-                                    )
-                                    .max(1);
-                                    c * r
-                                };
-                            let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
-                                &bottoms,
-                                &tops,
-                                direction_of(&db, lo),
-                                direction_of(&db, hi),
-                                &fit,
-                                // 🔑 **`checkConstraints`: no cuts, then minimum enclosure.** The
-                                // enclosure judged is the one the via would be BUILT with, not the
-                                // candidate minimum — so the constrained axis carries the overlap,
-                                // and a cut taller than the rect it must sit in makes that overlap
-                                // NEGATIVE. Every rule then refuses it, however small the rule.
-                                //
-                                // ⚠️ This is what stops a via being built at all, and a level with
-                                // no buildable generate via is what sends the reference to the
-                                // technology's own via instead. Without the gate we build the
-                                // oversized via, its metal overhangs the shape it lands on, and
-                                // the shape grows to cover metal that is then ripped out.
-                                //
-                                // ℹ️ Minimum-cut rules are the third gate and are not fed here.
-                                &|b: vyges_pdn::viagen::Enclosure,
-                                  t: vyges_pdn::viagen::Enclosure,
-                                  cuts: i32| {
-                                    if cuts <= 0 {
-                                        return false;
-                                    }
-                                    let cols = vyges_pdn::viagen::cuts_across(
-                                        area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns,
-                                    )
-                                    .max(1);
-                                    let rws = vyges_pdn::viagen::cuts_across(
-                                        area.3 - area.1, cut.1, b.y, t.y, pitch.1, max_rows,
-                                    )
-                                    .max(1);
-                                    let span =
-                                        ((cols - 1) * pitch.0 + cut.0, (rws - 1) * pitch.1 + cut.1);
-                                    let overlap = vyges_pdn::viagen::overlap_enclosure(
-                                        (area.2 - area.0, area.3 - area.1),
-                                        span,
-                                    );
-                                    let built_b = vyges_pdn::viagen::built_enclosure(
-                                        !at_bottom_end,
-                                        b,
-                                        overlap,
-                                        bot_c,
-                                    );
-                                    let built_t = vyges_pdn::viagen::built_enclosure(
-                                        !at_top_end,
-                                        t,
-                                        overlap,
-                                        top_c,
-                                    );
-                                    // Snapped before the rule check: `checkConstraints` runs
-                                    // after `determineRowsAndColumns` has already snapped.
-                                    let built_b =
-                                        vyges_pdn::viagen::snap_enclosure(built_b, grid_mfg);
-                                    let built_t =
-                                        vyges_pdn::viagen::snap_enclosure(built_t, grid_mfg);
-                                    vyges_pdn::viagen::enclosure_satisfies(built_b, &bot_rules)
-                                        && vyges_pdn::viagen::enclosure_satisfies(
-                                            built_t, &top_rules,
-                                        )
-                                },
-                            ) else {
-                                if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                                    eprintln!("[via]   REJECTED {area:?} {lo}->{hi}");
-                                }
-                                continue; // this pair builds nothing; another may
-                            };
-                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                                eprintln!("[via]   CHOSE {area:?} {lo}->{hi} {chosen:?}");
-                            }
-
-                            let (columns, rows) = if split.is_some() {
-                                (1, 1)
-                            } else {
-                                (
-                                    vyges_pdn::viagen::cuts_across(
-                                        area.2 - area.0,
-                                        cut.0,
-                                        chosen.bottom.x,
-                                        chosen.top.x,
-                                        pitch.0,
-                                        max_columns,
-                                    )
-                                    .max(1),
-                                    vyges_pdn::viagen::cuts_across(
-                                        area.3 - area.1,
-                                        cut.1,
-                                        chosen.bottom.y,
-                                        chosen.top.y,
-                                        pitch.1,
-                                        max_rows,
-                                    )
-                                    .max(1),
-                                )
-                            };
-
-                            // 🔑 **An ARRAYSPACING rule may regroup the cuts before any of this.**
-                            // `determineRowsAndColumns` runs its array branch on the plain fit and,
-                            // where a rule applies, replaces the counts and the pitch outright —
-                            // the enclosure then comes from what the ARRAY leaves over rather than
-                            // from what a flat run of cuts does.
-                            //
-                            // ⚠️ **A split array is never an array in this sense**, and neither is
-                            // a fit of one group by one: `isCutArray()` is
-                            // `!isSplitCutArray() && (array_core_x_ != 1 || array_core_y_ != 1)`.
-                            let array = if split.is_some() {
-                                None
-                            } else {
-                                // ⚠️ **The via's own cut class, not the layer's list.** A rule
-                                // naming a class applies only to a via of that class, and a via
-                                // with none matches every rule.
-                                let my_cut_class = vyges_pdn::viagen::cut_class(
-                                    &via_cut_classes(&db, cut_layer),
-                                    cut,
-                                )
-                                .map(|c| c.name.clone());
-                                vyges_pdn::viagen::array_fit(
-                                    &array_rules,
-                                    my_cut_class.as_deref(),
-                                    (area.2 - area.0, area.3 - area.1),
-                                    cut,
-                                    pitch,
-                                    (chosen.bottom.x, chosen.bottom.y),
-                                    (chosen.top.x, chosen.top.y),
-                                    (max_columns, max_rows),
-                                    (columns, rows),
-                                )
-                            };
-                            let (columns, rows) = match &array {
-                                Some(f) => f.core,
-                                None => (columns, rows),
-                            };
-                            let pitch = match &array {
-                                Some(f) => f.cut_pitch,
-                                None => pitch,
-                            };
-                            // ⚠️ **The chosen pair is a MINIMUM.** What is built is the overlap on
-                            // any axis the via must fit and the minimum elsewhere — and a level
-                            // internal to the stack takes minimums on both axes however much room
-                            // it has, which is why a via in the middle of a stack carries no
-                            // overhang while the ends carry plenty.
-                            let span =
-                                ((columns - 1) * pitch.0 + cut.0, (rows - 1) * pitch.1 + cut.1);
-                            let extent = (area.2 - area.0, area.3 - area.1);
-                            // 🔑 **An array's leftover is the ARRAY's, not a flat run's** — the
-                            // reference hands `double_enc_x / 2` to the same chooser that otherwise
-                            // takes the overlap.
-                            let overlap = match &array {
-                                Some(f) => vyges_pdn::viagen::Enclosure {
-                                    x: f.double_enclosure.0 / 2,
-                                    y: f.double_enclosure.1 / 2,
-                                },
-                                None => vyges_pdn::viagen::overlap_enclosure(extent, span),
-                            };
-                            let b = vyges_pdn::viagen::built_enclosure(
-                                !at_bottom_end,
-                                chosen.bottom,
-                                overlap,
-                                bot_c,
-                            );
-                            let t = vyges_pdn::viagen::built_enclosure(
-                                !at_top_end,
-                                chosen.top,
-                                overlap,
-                                top_c,
-                            );
-                            // 🔑 **A split array takes the MINIMUM enclosure verbatim.** The growth
-                            // above fills whatever room the shapes leave, and
-                            // `determineRowsAndColumns` skips it outright for a split array —
-                            // `bottom_enclosure_->setX(bottom_min_enclosure.getX())` and its three
-                            // siblings, with no `determine_enclosure` and no constraint.
-                            // ⚠️ It is not a rounding difference. A followpin crossing is hundreds
-                            // of dbu wide, so a grown enclosure puts metal right across it; the
-                            // minimum leaves a stub barely wider than the cut. Every via still
-                            // lands in the same place, so nothing in the placement gives it away —
-                            // what tells us is that the intermediate layer then meets its minimum
-                            // area on its own and the DRCFILL patch that should fill it never
-                            // appears — hundreds of patches on a single design.
-                            // ⚠️ Snapped LAST, after the split-cut override, because
-                            // `determineRowsAndColumns` snaps on its way out and every branch
-                            // above it funnels through that one line.
-                            let (bot_enc, top_enc) = if split.is_some() {
-                                (chosen.bottom, chosen.top)
-                            } else {
-                                (b, t)
-                            };
-                            let bot_enc = vyges_pdn::viagen::snap_enclosure(bot_enc, grid_mfg);
-                            let top_enc = vyges_pdn::viagen::snap_enclosure(top_enc, grid_mfg);
-                            let (bot_enc, top_enc) =
-                                ((bot_enc.x, bot_enc.y), (top_enc.x, top_enc.y));
-
-                            // 🔑 **What the sort reads.** `getCutArea` is the cut's own area times
-                            // the CLAMPED cut count, and `getGeneratorWidth`/`Height` are
-                            // `cut*n + spacing*(n-1) + 2*enclosure` — which is the span plus twice
-                            // the enclosure the via was finally built with, per axis.
-                            // 🔑 **`getCutArea` counts EVERY cut of the array**, which is
-                            // `array_core * core + end` per axis — so a regrouped via scores on
-                            // what it actually places, not on one group.
-                            let total = match &array {
-                                Some(f) => (
-                                    vyges_pdn::viagen::array_count(f.groups.0, f.core.0, f.end.0),
-                                    vyges_pdn::viagen::array_count(f.groups.1, f.core.1, f.end.1),
-                                ),
-                                None => (columns, rows),
-                            };
-                            let candidate = LevelVia {
-                                rule,
-                                cut,
-                                pitch,
-                                area,
-                                rows,
-                                columns,
-                                array,
-                                bot_enc,
-                                top_enc,
-                                score: vyges_pdn::viagen::Generator {
-                                    name: rule.map(|r| r.name.clone()).unwrap_or_default(),
-                                    cut_area: cut.0 * cut.1 * total.0 * total.1,
-                                    bottom: (span.0 + 2 * bot_enc.0, span.1 + 2 * bot_enc.1),
-                                    top: (span.0 + 2 * top_enc.0, span.1 + 2 * top_enc.1),
-                                    bottom_direction: direction_of(&db, lo),
-                                    top_direction: direction_of(&db, hi),
-                                },
-                            };
-                            // ⚠️ **Only a STRICT preference displaces the incumbent.** A tie returns
-                            // `false`, so the earlier candidate stays — which is what makes the
-                            // reference's stable sort stable, and why the sets are iterated in
-                            // their own sorted order rather than whatever order they were built in.
-                            if candidate
-                                .score
-                                .is_preferred_over(best.as_ref().map(|b| &b.score))
-                            {
-                                best = Some(candidate);
-                            }
-                        }
-                    }
-                    // 🔑 **A technology via is what a level falls back to when no GENERATE via
-                    // could be BUILT** — not merely when none was set up validly.
-                    //
-                    // ⚠️ `generateDbVia` returns null when every generator failed `build()`, so a
-                    // rule that applies here and yields nothing buildable still hands the level to
-                    // the technology. Gated on the setup test alone, such a level built nothing at
-                    // all.
-                    if let Some((via_name, g, connect_pitch)) =
-                        (named_here || !has_rule || best.is_none())
-                        .then(|| fixed_tech_via(&db, &fixed, (&v.lower, &v.upper), (lo, hi)))
-                        .flatten()
-                    {
-                        // 🔑 **`isSetupValid` runs BEFORE anything is built, and it is the only
-                        // thing that can refuse this.** `makeSingleLayerVia` filters its tech-via
-                        // candidates through it while collecting them, and
-                        // `TechViaGenerator::isSetupValid` ends in `fitsShapes()` — so a via that
-                        // does not fit never becomes a candidate and no enclosure arithmetic
-                        // downstream gets a chance to rescue it.
-                        //
-                        // ⚠️ **Judged on the TECHNOLOGY's own metal**, `DbTechVia(via, 1, 0, 1, 0)`
-                        // and `getViaRect(true, false, ...)`, translated to the centre of the
-                        // overlap — not on the enclosure this level would go on to build, which is
-                        // computed below and is a different number.
-                        //
-                        // ℹ️ Without it, a design with a switched region domain builds a via in 770 of overlap
-                        // where the reference reports `PDN-0110 No via inserted between met4 and
-                        // met5 at (63.6000, 12.8000) - (64.3700, 14.4000)`. The via was dropped
-                        // again later, but not before the write stage had grown the met5 stripe
-                        // 325 to the left to cover its metal — which is all that reached the DEF.
-                        //
-                        // ⚠️ A refusal skips THIS level. The reference discards the whole stack and
-                        // substitutes one dummy via, which is the same thing for a two-layer
-                        // connect and is what every other bail-out in this loop already does.
-                        {
-                            let (cx, cy) = ((area.0 + area.2) / 2, (area.1 + area.3) / 2);
-                            let shift =
-                                |r: Rect| (r.0 + cx, r.1 + cy, r.2 + cx, r.3 + cy);
-                            let fits = |metal: Rect, shape: Rect, at_end: bool, layer: &str| {
-                                let c = if at_end {
-                                    vyges_pdn::viagen::constraint_for(
-                                        vyges_pdn::viagen::rect_direction(shape),
-                                        true,
-                                        false,
-                                    )
-                                } else {
-                                    Default::default()
-                                };
-                                vyges_pdn::viagen::mostly_contains(
-                                    shape,
-                                    area,
-                                    shift(metal),
-                                    c,
-                                    direction_of(&db, layer),
-                                )
-                            };
-                            if !fits(g.bottom_metal, rects[level], level == 0, lo)
-                                || !fits(
-                                    g.top_metal,
-                                    rects[level + 1],
-                                    level + 2 == stack.len(),
-                                    hi,
-                                )
-                            {
-                                if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                                    eprintln!(
-                                        "[via]   TECH REFUSED {area:?} {lo}->{hi} {via_name}"
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                        // ⚠️ **Two different cut rects, and they are not interchangeable.** How many
-                        // fit is asked of the merged OUTLINE — `TechViaGenerator::getCut()` returns
-                        // `cut_outline_` — while the via's own parameters carry a SINGLE cut's size.
-                        // A one-cut tech via makes them equal, which is how using one for both went
-                        // unnoticed through ASAP7 entirely.
-                        let cut = (
-                            g.cut_extent.2 - g.cut_extent.0,
-                            g.cut_extent.3 - g.cut_extent.1,
-                        );
-                        let single = (
-                            g.single_cut.2 - g.single_cut.0,
-                            g.single_cut.3 - g.single_cut.1,
-                        );
-                        // The connect's own `-cut_pitch` wins; otherwise the technology decides.
-                        let Some(pitch) = connect_pitch.or_else(|| {
-                            // 🔑 The cut's class decides which column of the spacing table applies.
-                            // ASAP7 states every class at the same value, but the lookup is per class
-                            // and a technology that differentiates them would be built wrong without.
-                            let classes = via_cut_classes(&db, &g.cut_layer);
-                            let cls = vyges_pdn::viagen::cut_class(&classes, cut)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_else(|| g.cut_layer.clone());
-                            let table = spacing_table_rules(&db, &g.cut_layer, &cls);
-                            vyges_pdn::techvia::base_cut_pitch(
-                                g.cut_extent,
-                                db.layer_get_spacing(&g.cut_layer),
-                                vyges_pdn::techvia::class_cut_spacing(g.cut_extent, &table),
-                            )
-                        }) else {
-                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                                eprintln!("[via]   TECH NO PITCH {area:?} {lo}->{hi} {via_name}");
-                            }
-                            continue; // no pitch stated anywhere, so no array can be laid out
-                        };
-                        // 🔑 The split pitch overrides the technology's, exactly as on the generate
-                        // path — `generateDbVia` sets it on every generator before any is built.
-                        let pitch = match split {
-                            Some((sp, _)) => (sp, sp),
-                            None => pitch,
-                        };
-                        // 🔑 **A tech via is NOT built with its own metal margins.** Those are only a
-                        // floor: `getMinimumEnclosures` takes the layer's rules, erases any candidate
-                        // short on BOTH axes, and raises the rest to the floor per axis. What is then
-                        // chosen among them, and what is finally built, is the E-series selection the
-                        // generate path uses — anything less leaves VIA34 and VIA56 one axis short.
-                        let candidates = |metal: Rect, layer: &str, above: bool| {
-                            let floor = vyges_pdn::techvia::enclosure(g.cut_extent, metal);
-                            // ⚠️ **The rules alone, and the floor is NOT one of them.**
-                            // `getMinimumEnclosures` asks for the rule-derived set only
-                            // (`rules_only = true`) and adds the via's own margins solely when that
-                            // set comes back empty. `enclosure_candidates` seeds its list with the
-                            // rule value it is handed, so that seed is dropped here — left in, it is
-                            // a candidate that fits more cuts than any real rule and therefore always
-                            // wins, which is how VIA34's M4 face came out 1126 against 1148.
-                            let rules: Vec<(i32, i32)> =
-                                enclosure_candidates(&db, &g.cut_layer, cut, area, layer, above, None, split.is_some())
-                                    .into_iter()
-                                    .map(|e| (e.x, e.y))
-                                    .collect();
-                            vyges_pdn::techvia::reconcile_enclosures(&rules, floor)
-                                .into_iter()
-                                .map(|(x, y)| vyges_pdn::viagen::Enclosure { x, y })
-                                .collect::<Vec<_>>()
-                        };
-                        let bottoms = candidates(g.bottom_metal, lo, false);
-                        let tops = candidates(g.top_metal, hi, true);
-                        // 🔑 **Clamped per axis, as on the generate path.** Both paths end in the
-                        // shared `makeBaseVia`, and `determineRowsAndColumns` finishes with
-                        // `core_row_ = std::max(1, rows)` and its sibling for columns — so an axis
-                        // that fits no cut still builds one row of them, and the fit is never a
-                        // gate. Unclamped here, every pair scored zero on a rail too narrow to
-                        // hold a cut and the whole level was refused: a 0.018 wide M2 followpin
-                        // under a stack built nothing at all, and the layer above it then lost the
-                        // patch that a via on both sides of it would have required.
-                        let fit = |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
-                            vyges_pdn::viagen::cuts_across(area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns)
-                                .max(1)
-                                * vyges_pdn::viagen::cuts_across(
-                                    area.3 - area.1,
-                                    cut.1,
-                                    b.y,
-                                    t.y,
-                                    pitch.1,
-                                    max_rows,
-                                )
-                                .max(1)
-                        };
-                        let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
-                            &bottoms,
-                            &tops,
-                            direction_of(&db, lo),
-                            direction_of(&db, hi),
-                            &fit,
-                            &|_, _, cuts| cuts > 0,
-                        ) else {
-                            continue; // nothing buildable at this level
-                        };
-                        // A split array holds ONE cut and is placed repeatedly, so the fit is not asked.
-                        let (columns, rows) = if split.is_some() {
-                            (1, 1)
-                        } else {
-                            (
-                                vyges_pdn::viagen::cuts_across(
-                                    area.2 - area.0,
-                                    cut.0,
-                                    chosen.bottom.x,
-                                    chosen.top.x,
-                                    pitch.0,
-                                    max_columns,
-                                )
-                                .max(1),
-                                vyges_pdn::viagen::cuts_across(
-                                    area.3 - area.1,
-                                    cut.1,
-                                    chosen.bottom.y,
-                                    chosen.top.y,
-                                    pitch.1,
-                                    max_rows,
-                                )
-                                .max(1),
-                            )
-                        };
-                        // ⚠️ The chosen pair is a MINIMUM; what is built takes the overlap on any axis
-                        // the via must fit and the minimum elsewhere. A level inside the stack is
-                        // constrained by nothing and takes minimums on both.
-                        let at_bottom_end = level == 0;
-                        let at_top_end = level + 2 == stack.len();
-                        let bot_c = if at_bottom_end {
-                            let d = vyges_pdn::viagen::rect_direction(rects[level]);
-                            vyges_pdn::viagen::constraint_for(d, true, false)
-                        } else {
-                            Default::default()
-                        };
-                        let top_c = if at_top_end {
-                            let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
-                            vyges_pdn::viagen::constraint_for(d, true, false)
-                        } else {
-                            Default::default()
-                        };
-                        let span = (
-                            (columns - 1) * pitch.0 + cut.0,
-                            (rows - 1) * pitch.1 + cut.1,
-                        );
-                        let overlap = vyges_pdn::viagen::overlap_enclosure(
-                            (area.2 - area.0, area.3 - area.1),
-                            span,
-                        );
-                        let b = vyges_pdn::viagen::built_enclosure(
-                            !at_bottom_end,
-                            chosen.bottom,
-                            overlap,
-                            bot_c,
-                        );
-                        let t =
-                            vyges_pdn::viagen::built_enclosure(!at_top_end, chosen.top, overlap, top_c);
-                        // 🔑 The minimum verbatim for a split array — see the same override on the
-                        // generate path. Snapped after it, for the same reason.
-                        let (bot, top) = if split.is_some() {
-                            (chosen.bottom, chosen.top)
-                        } else {
-                            (b, t)
-                        };
-                        let bot = vyges_pdn::viagen::snap_enclosure(bot, grid_mfg);
-                        let top = vyges_pdn::viagen::snap_enclosure(top, grid_mfg);
-                        let (bot, top) = ((bot.x, bot.y), (top.x, top.y));
-                        // 🔑 **A single-cut tech via is placed AS ITSELF.** `DbTechVia::generate`
-                        // branches on `isArray()`, and only an array is given a `dbVia` of its own —
-                        // the else arm hands `odb::dbSBox::create` the technology's via directly, so
-                        // the DEF names `VIA23` and carries no `VIAS` entry for it at all. Naming a
-                        // 1x1 the way an array is named invents a via the reference never wrote.
-                        // 🔑 **A tech via's OWN cut array folds into the one asked for**, and it
-                        // changes the counts, the pitch, the name and where the via sits. See
-                        // `techvia::fold_cut_array` — `DbTechVia`'s constructor does this before
-                        // anything reads the via, so everything downstream sees the folded values.
-                        let (rows, columns, pitch) = match vyges_pdn::techvia::fold_cut_array(
-                            &g.cut_centres,
-                            rows,
-                            columns,
-                            pitch.1,
-                            pitch.0,
-                        ) {
-                            Some((r, c, rp, cp)) => (r, c, (cp, rp)),
-                            None => (rows, columns, pitch),
-                        };
-                        let is_array = rows > 1 || columns > 1;
-                        // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
-                        // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
-                        // for a generate rule the snapping really does live only in the stacked via
-                        // — but `DbTechVia::generate` populates the grid of either of its own layers
-                        // the connect named and both snaps to it and RE-PITCHES its cut array on it.
-                        // ⚠️ It picks which layer serves which axis by a rule of its own: see
-                        // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
-                        // stacked via branches on the one below.
-                        let tv_grid = |layer: &str| {
-                            ongrid
-                                .iter()
-                                .any(|l| l == layer)
-                                .then(|| track_grids.get(layer))
-                                .flatten()
-                        };
-                        let (x_up, y_up) = vyges_pdn::vias::techvia_snap_sources(
-                            direction_of(&db, hi) == Direction::Vertical,
-                        );
-                        // ⚠️ **A layer's track interval is read off the axis its OWN direction
-                        // names**, not the axis being pitched — `snapToGridInterval` picks the X
-                        // pattern for a vertical layer and the Y pattern for a horizontal one.
-                        let step_of = |layer: &str| -> Option<i32> {
-                            let g = tv_grid(layer)?;
-                            let v = if direction_of(&db, layer) == Direction::Vertical {
-                                &g.0
-                            } else {
-                                &g.1
-                            };
-                            (v.len() >= 2).then(|| v[1] - v[0])
-                        };
-                        // 🔑 **The BUILT pitch, which the name does not carry.** See
-                        // `techvia::pitch_on_grid_interval`.
-                        let built_pitch = (
-                            match step_of(if x_up { hi } else { lo }) {
-                                Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.0, st),
-                                None => pitch.0,
-                            },
-                            match step_of(if y_up { hi } else { lo }) {
-                                Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.1, st),
-                                None => pitch.1,
-                            },
-                        );
-                        let name = if is_array {
-                            vyges_pdn::techvia::array_name(
-                                &via_name, rows, columns, pitch.1, pitch.0, ongrid,
-                            )
-                        } else {
-                            via_name.clone()
-                        };
-                        let spacing =
-                            vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
-                        if is_array
-                            && db
-                                .create_generated_via(
-                                    &name,
-                                    "", // a tech via answers to no generate rule
-                                    (lo, g.cut_layer.as_str(), hi),
-                                    single,
-                                    spacing,
-                                    bot,
-                                    top,
-                                    rows,
-                                    columns,
-                                    vyges_pdn::techvia::centre(g.cut_extent),
-                                )
-                                .is_err()
-                        {
-                            continue;
-                        }
-                        // 🔑 **A tech via is placed by its ORIGIN, not by its cut array's centre**,
-                        // and for a via whose cuts do not straddle the origin those are different
-                        // points. `DbTechVia::generate` subtracts `via_center_` — the centre of the
-                        // merged cut extent — from the placement on BOTH of its branches, and the
-                        // same value is handed to the via as its origin, so the cuts land back on
-                        // the crossing centre.
-                        //
-                        // ⚠️ **Only the PLACEMENT moves; the metal does not.** The enclosure rects
-                        // are carried with the via and come out centred on the crossing either way,
-                        // so offsetting the metal too would move it off the shape it is measured
-                        // against. A via with three cuts running 90 units to one side of its origin
-                        // places 45 out of position with no other symptom -- same name, same count,
-                        // same metal.
-                        let origin = vyges_pdn::techvia::centre(g.cut_extent);
-                        // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
-                        // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
-                        // for a generate rule the snapping really does live only in the stacked via
-                        // — but `DbTechVia::generate` populates the grid of either of its own layers
-                        // that the connect named and snaps to it, however short the stack.
-                        // ⚠️ And it picks the layers by a rule of its own: see
-                        // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
-                        // stacked via branches on the one below.
-                        // ⚠️ **Snapped either side of the origin offset**, in that order — the
-                        // reference snaps the crossing point, subtracts the cut centre, and snaps
-                        // the result again.
-                        let tv_snap = |p: (i32, i32)| {
-                            let sx = match tv_grid(if x_up { hi } else { lo }) {
-                                Some((x, _)) => vyges_pdn::vias::snap_to_grid(p.0, x, 0),
-                                None => p.0,
-                            };
-                            let sy = match tv_grid(if y_up { hi } else { lo }) {
-                                Some((_, y)) => vyges_pdn::vias::snap_to_grid(p.1, y, 0),
-                                None => p.1,
-                            };
-                            (sx, sy)
-                        };
-                        let placed_at: Vec<(i32, i32)> = spots
-                            .iter()
-                            .map(|spot| {
-                                let at = tv_snap(*spot);
-                                tv_snap((at.0 - origin.0, at.1 - origin.1))
-                            })
-                            .collect();
-                        for at in &placed_at {
-                            placements.push((
-                                v.net.clone(),
-                                name.clone(),
-                                *at,
-                                v.lower.clone(),
-                                v.upper.clone(),
-                                v.area,
-                            ));
-                        }
-                        written += spots.len();
-                        if !spots.is_empty() {
-                            via_ok.push((v.net.clone(), (lo.to_string(), hi.to_string()), v.area));
-                        }
-
-                        // A tech via stack passes through layers just as a generated one does, and
-                        // leaves the same DRCFILL patch on them — see `viagen::intermediate_patch`.
-                        let bare = (
-                            (columns - 1) * built_pitch.0 + single.0,
-                            (rows - 1) * built_pitch.1 + single.1,
-                        );
-                        // ⚠️ **Per SPOT** — a split level leaves its own metal at every position.
-                        let metal_at = |spot: (i32, i32), enc: (i32, i32)| {
-                            let (hw, hh) = (bare.0 / 2 + enc.0, bare.1 / 2 + enc.1);
-                            (spot.0 - hw, spot.1 - hh, spot.0 + hw, spot.1 + hh)
-                        };
-                        // ⚠️ **The metal follows the via, not the crossing.** It is carried by the
-                        // via and offset by the same origin, so it sits at the PLACED point plus
-                        // that origin — which is the crossing centre only while nothing snapped.
-                        let base_pi = placements.len() - placed_at.len();
-                        for (k, at) in placed_at.iter().enumerate() {
-                            let centre = (at.0 + origin.0, at.1 + origin.1);
-                            via_faces.push((base_pi + k, lo.to_string(), metal_at(centre, bot), area));
-                            via_faces.push((base_pi + k, hi.to_string(), metal_at(centre, top), area));
-                        }
-                        // ⚠️ **A split-cut array does NOT require a patch** — `DbSplitCutVia` leaves
-                        // `requiresPatch()` at its default however many cuts it places.
-                        let needs_patch = split.is_none() && is_array;
-                        if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
-                            if shared == lo && prev_tops.len() == spots.len() {
-                                for (k, spot) in spots.iter().enumerate() {
-                                    for patch in vyges_pdn::viagen::intermediate_patches(
-                                        &[prev_tops[k]],
-                                        &[metal_at(*spot, bot)],
-                                        prev_array || needs_patch,
-                                        db.layer_min_area(lo).unwrap_or(0),
-                                        direction_of(&db, lo),
-                                        grid_mfg,
-                                    ) {
-                                        drcfill.push((
-                                            v.net.clone(),
-                                            lo.to_string(),
-                                            patch,
-                                            v.lower.clone(),
-                                            v.upper.clone(),
-                                            v.area,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        previous_top = Some((
-                            hi.to_string(),
-                            spots.iter().map(|s| metal_at(*s, top)).collect(),
-                            needs_patch,
-                        ));
-                        continue;
-                    }
-
-                    let Some(best) = best else {
-                        continue; // nothing buildable at this level, on any pair
-                    };
-                    let (rule, cut, pitch, area) = (best.rule, best.cut, best.pitch, best.area);
-                    let (rows, columns) = (best.rows, best.columns);
-                    let (bot_enc, top_enc) = (best.bot_enc, best.top_enc);
-                    // The array the winner's own area lays out, which is not the level's.
-                    let spots = spots_in(area);
-                    // 🔑 **An ARRAYSPACING via is several base vias on a grid**, so one spot becomes
-                    // several placements and the definitions differ by cut count alone. Without a
-                    // rule this is the single via at the spot itself, which is the same shape of
-                    // answer and needs no branch below.
-                    let grid: Vec<vyges_pdn::viagen::ArrayPlacement> = match &best.array {
-                        Some(f) => vyges_pdn::viagen::array_placements(f, cut),
-                        None => vec![vyges_pdn::viagen::ArrayPlacement {
-                            cuts: (columns, rows),
-                            at: (0, 0),
-                        }],
-                    };
-
-                    // ⚠️ **One definition per distinct CUT COUNT**, which for an array is up to
-                    // four and otherwise one. They differ in nothing else: the same rule, the same
-                    // pitch, the same enclosures, and the same rect — so the reference's own name,
-                    // which carries rows and columns, distinguishes them by itself.
-                    let mut names: Vec<((i32, i32), String)> = Vec::new();
-                    for p in &grid {
-                        if names.iter().any(|(c, _)| *c == p.cuts) {
-                            continue;
-                        }
-                        let (cols_p, rows_p) = p.cuts;
-                        let params = vyges_pdn::viagen::via_params(
-                            rows_p, cols_p, pitch, cut, bot_enc, top_enc,
-                        );
-                        // The reference's own naming, from `DbGenerateVia::getViaName`: the two
-                        // routing levels, the via's AREA, its rows and columns, then its cut pitch.
-                        // Worth matching exactly — the name is how a DEF diff tells two vias apart,
-                        // and the area in it is an independent check that the via was built in the
-                        // right rect.
-                        let name = format!(
-                            "via{}_{}_{}_{}_{rows_p}_{cols_p}_{}_{}",
-                            routing_level(&db, lo),
-                            routing_level(&db, hi),
-                            area.2 - area.0,
-                            area.3 - area.1,
-                            pitch.0,
-                            pitch.1,
-                        );
-                        // ⚠️ One `dbVia` per distinct geometry, reused wherever needed — the
-                        // reference looks it up by name and creates it only when absent.
-                        if db
-                            .create_generated_via(
-                                &name,
-                                rule.map(|r| r.name.as_str()).unwrap_or(""),
-                                (lo, cut_layer, hi),
-                                params.cut,
-                                params.cut_spacing,
-                                params.bottom_enclosure,
-                                params.top_enclosure,
-                                params.rows,
-                                params.columns,
-                                (0, 0), // a generated via is centred on its own rect already
-                            )
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        names.push((p.cuts, name));
-                    }
-                    if names.is_empty() {
-                        continue;
-                    }
-                    // ⚠️ **Collected, not placed.** A via is a routed special wire, and the write
-                    // below clears each net's routed special wires before adding the boxes — so a
-                    // via placed here is put in the database and then deleted, leaving a via
-                    // DEFINITION with no placements, `add_swire_via` returning success, and nothing
-                    // anywhere saying so. The DEF simply comes out with no vias in it.
-                    //
-                    // 🔑 **The metal is the PLACEMENT's, not the level's.** Each base via of an
-                    // array carries its own cut count and therefore its own extent, so `via_faces`
-                    // — which is what absorbs via metal back into the shapes it lands on — is
-                    // computed per placement rather than once for the level.
-                    let mut tops: Vec<Rect> = Vec::new();
-                    let mut bots: Vec<Rect> = Vec::new();
-                    let mut here = 0;
-                    for spot in &spots {
-                        for p in &grid {
-                            let Some((_, name)) = names.iter().find(|(c, _)| *c == p.cuts) else {
-                                continue;
-                            };
-                            let at = (spot.0 + p.at.0, spot.1 + p.at.1);
-                            placements.push((
-                                v.net.clone(),
-                                name.clone(),
-                                at,
-                                v.lower.clone(),
-                                v.upper.clone(),
-                                v.area,
-                            ));
-                            let bare = (
-                                (p.cuts.0 - 1) * pitch.0 + cut.0,
-                                (p.cuts.1 - 1) * pitch.1 + cut.1,
-                            );
-                            let metal_at = |enc: (i32, i32)| {
-                                let (hw, hh) = (bare.0 / 2 + enc.0, bare.1 / 2 + enc.1);
-                                (at.0 - hw, at.1 - hh, at.0 + hw, at.1 + hh)
-                            };
-                            let pi = placements.len() - 1;
-                            via_faces.push((pi, lo.to_string(), metal_at(bot_enc), area));
-                            via_faces.push((pi, hi.to_string(), metal_at(top_enc), area));
-                            bots.push(metal_at(bot_enc));
-                            tops.push(metal_at(top_enc));
-                            here += 1;
-                        }
-                    }
-                    written += here;
-                    if here > 0 {
-                        via_ok.push((v.net.clone(), (lo.to_string(), hi.to_string()), v.area));
-                    }
-                    // `DbGenerateVia::requiresPatch()` is `rows_ > 1 || cols_ > 1`; a split-cut array
-                    // is wrapped in a `DbSplitCutVia`, which does not override the default of false.
-                    //
-                    // 🔑 **A `DbArrayVia` overrides it to `true` unconditionally** — `via.h:348` —
-                    // so an array asks for a patch even where one group holds a single cut.
-                    let needs_patch =
-                        split.is_none() && (best.array.is_some() || rows > 1 || columns > 1);
-                    if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
-                        if shared == lo && !prev_tops.is_empty() && !bots.is_empty() {
-                            // 🔑 **One patch for the whole level, not one per spot.** The reference
-                            // builds `combine_layer` as the union of EVERY top shape of the
-                            // previous via and EVERY bottom shape of this one, then takes
-                            // `extents()` — a single bounding box spanning them all.
-                            //
-                            // ⚠️ Paired spot by spot instead, each comparison is a face against a
-                            // face at the SAME position, so the box never extends past their union
-                            // and `adds_metal` discards every one. That is why a design whose
-                            // stacks are all arrays produced no patches at all while the reference
-                            // produced forty-eight.
-                            //
-                            // ⚠️ And the two levels need not have the same number of spots — an
-                            // array on one layer pair and a single via on the next is ordinary, and
-                            // requiring equal counts skipped those stacks outright.
-                            //
-                            // 🔑 **The metal goes in as a LIST, not as two bounding boxes.**
-                            // `combine_layer` is a polygon set, and the leftover the patch is
-                            // finally judged on is what that set does NOT cover. Reduced to two
-                            // boxes first the leftover is empty by construction, and an array —
-                            // whose groups leave real gaps — writes no patch at all.
-                            {
-                                for patch in vyges_pdn::viagen::intermediate_patches(
-                                    &prev_tops,
-                                    &bots,
-                                    prev_array || needs_patch,
-                                    db.layer_min_area(lo).unwrap_or(0),
-                                    direction_of(&db, lo),
-                                    grid_mfg,
-                                ) {
-                                    drcfill.push((
-                                        v.net.clone(),
-                                        lo.to_string(),
-                                        patch,
-                                        v.lower.clone(),
-                                        v.upper.clone(),
-                                        v.area,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    previous_top = Some((hi.to_string(), tops, needs_patch));
-                }
-
-                // ── this via's metal, merged back into the two shapes it landed on ────────────
-                // 🔑 **Only the two ENDS.** `check_shapes` is called on `shapes.bottom` against
-                // `lower_` and on `shapes.top` against `upper_`; a stack's intermediate metal is
-                // `shapes.middle` and is never merged into anything — it only decides which vias a
-                // ripup takes with it.
-                // ⚠️ Growth only. A refusal here is a RIPUP, and that is decided after trimming,
-                // against the trimmed shape — see the absorb pass. Ripping up here would judge a
-                // via against a strap that has not been pulled back yet.
-                for (key, layer, cur) in [
-                    (&lower_key, &v.lower, lower_rect),
-                    (&upper_key, &v.upper, upper_rect),
-                ] {
-                    let metals: Vec<Rect> = via_faces[faces_before..]
-                        .iter()
-                        .filter(|(_, l, _, _)| l == layer)
-                        .map(|(_, _, m, _)| *m)
-                        .collect();
-                    if metals.is_empty() {
-                        continue;
-                    }
-                    let Some(si) = emitted.iter().position(|(n, l, r, _)| {
-                        n == &v.net && l == layer && overlaps(*r, key.2)
-                    }) else {
-                        continue;
-                    };
-                    let dir = if emitted[si].3 == "FOLLOWPIN" {
-                        match vyges_pdn::viagen::rect_direction(emitted[si].2) {
-                            Direction::None => direction_of(&db, layer),
-                            d => d,
-                        }
-                    } else {
-                        direction_of(&db, layer)
-                    };
-                    let obstructions: Vec<Rect> = blockages
-                        .iter()
-                        .filter(|(l, ..)| l == layer)
-                        .map(|(_, r, ..)| *r)
-                        .collect();
-                    if let vyges_pdn::shapes::ViaCheck::Extend(g) =
-                        vyges_pdn::shapes::check_via_shapes(
-                            cur,
-                            &metals,
-                            dir,
-                            !(emitted[si].3 == "RING" && locked_layers.contains(layer)),
-                            &obstructions,
-                        )
-                    {
-                        grown_rects.insert(key.clone(), g);
-                    }
                 }
             }
-            eprintln!(
-                "vyges-pdn: {} via locations, {} dropped, {written} written",
-                placed.len(),
-                dropped.len()
-            );
+
+            // ⛔ **Deferred, not skipped.** Everything from here to the write is via GEOMETRY,
+            // and it runs after trimming — see `PendingVias`.
+            pending.push(PendingVias {
+                opts,
+                placed,
+                dropped,
+                on_grid,
+                max_cuts,
+                split_by_connect,
+                fixed,
+                ground: ground.to_string(),
+            });
         }
     }
 
@@ -5395,6 +4001,1589 @@ fn generate(args: &[String]) -> ExitCode {
                 before - placements.len()
             );
         }
+    }
+
+    // ── via geometry ─────────────────────────────────────────────────────────────────────────
+    // 🔑 **After trimming, because that is where `PdnGen::writeToDb` sits.** Each grid's crossings
+    // were found against the shapes as they stood; each grid's vias are SIZED against the shapes as
+    // they were left. See `PendingVias` for why the two can be separated at all.
+    for p in pending {
+        let PendingVias {
+            opts,
+            placed,
+            dropped,
+            on_grid,
+            max_cuts,
+            split_by_connect,
+            fixed,
+            ground,
+        } = p;
+        // 🔑 **The order vias are written in, which is not the order they were found in.**
+        // `Grid::writeToDb` sorts a grid's vias by `(lower layer number, upper layer number,
+        // area)` before writing any of them, and only then walks the list — its own comment says
+        // "write vias first so shapes can be adjusted if needed".
+        //
+        // ⚠️ **The order is load-bearing because each via GROWS the shapes it lands on.** A ring
+        // reached past its edge by an early via is wider by the time a later one is sized against
+        // it, so the later via's metal fits where it would otherwise have overhung. Walk the
+        // crossings in the order they were discovered instead and three ring segments come out 20
+        // units short — the vias identical, only the metal they sit on wrong.
+        //
+        // ℹ️ `odb::Rect` orders by `(xlo, ylo, xhi, yhi)`, its members in declaration order under a
+        // defaulted `operator<=>`, which is what a tuple of the same four does here.
+        let mut placed = placed;
+        placed.sort_by_key(|v| {
+            (
+                layer_number(&all_layers, &v.lower),
+                layer_number(&all_layers, &v.upper),
+                v.area,
+            )
+        });
+        // ⚠️ One `dbVia` per distinct geometry, reused wherever it is needed — the reference looks
+        // the via up by name and creates it only when absent. One per location instead leaves the
+        // database carrying thousands of identical via definitions.
+        // ── the cut geometry, from the technology rather than the command line ──────────────
+        // ⚠️ The cut layer's own VIARULE GENERATE decides the cut size and the enclosures. The
+        // command-line values are kept only for a technology declaring no rule, and a via built
+        // from those is one this engine invented rather than one the technology describes.
+        // `--split-cuts <layer>:<pitch>[:stagger]` — cuts crossing this layer are spread out
+        // rather than packed into one array.
+        //
+        // ⚠️ **Only INTERMEDIATE layers count.** `Connect::setSplitCuts` erases the connect's own
+        // two ends from the map, so naming an end layer does nothing.
+        let split_cuts: Vec<(String, i32, bool)> = opts
+            .all("split-cuts")
+            .iter()
+            .filter_map(|s| {
+                let mut p = s.splitn(3, ':');
+                let layer = p.next()?.to_string();
+                let pitch = dbu(p.next().unwrap_or("0"), per_micron);
+                let stagger = p.next() == Some("stagger");
+                (pitch > 0).then_some((layer, pitch, stagger))
+            })
+            .collect();
+        // ⚠️ **The global `--split-cuts` is a FALLBACK**, used only by a connect that states
+        // none of its own. Upstream has no such thing: the flag predates the per-connect field
+        // and is kept so a caller driving the engine by hand can still reach the behaviour.
+        let split_for_connect = |lower: &str, upper: &str, layer: &str| {
+            let own = split_by_connect
+                .iter()
+                .find(|((l, u), _)| l == lower && u == upper)
+                .map(|(_, s)| s.as_slice())
+                .unwrap_or(&[]);
+            let from = if own.is_empty() {
+                split_cuts.as_slice()
+            } else {
+                own
+            };
+            from.iter()
+                // The end-layer erasure again, for the fallback list, which never saw it.
+                .filter(|(l, ..)| l != lower && l != upper)
+                .find(|(l, ..)| l == layer)
+                .map(|(_, p, s)| (*p, *s))
+        };
+        let rules = via_rules(&db);
+        let fallback_cut = (
+            dbu(opts.one("cut-width").unwrap_or("0"), per_micron),
+            dbu(opts.one("cut-height").unwrap_or("0"), per_micron),
+        );
+        let fallback_enc = dbu(opts.one("cut-enclosure").unwrap_or("0"), per_micron);
+        // The track grids of every layer any connect asked to snap to, read once.
+        // ⚠️ A layer NOT named here has no grid, and `snap_to_grid` then returns its argument — the
+        // reference relies on exactly that, calling the snap unconditionally at every level.
+        let mut track_grids: std::collections::HashMap<String, (Vec<i32>, Vec<i32>)> =
+            Default::default();
+        for (_, layers) in &on_grid {
+            for l in layers {
+                track_grids
+                    .entry(l.clone())
+                    .or_insert_with(|| db.track_grid(l).unwrap_or_default());
+            }
+        }
+        let mut written = 0;
+        for v in &placed {
+            // The two shapes AS THEY STAND, which is not as they started.
+            //
+            // 🔑 **The reference holds SHAPE POINTERS, so it reads whatever the shape has become.**
+            // `Via` keeps `lower_` and `upper_` and `Connect::makeVia` asks them for their rects at
+            // write time — after `trimShapes` has pulled them back and after earlier vias in this
+            // same pass have grown them. Reading the rect the crossing was FOUND with instead
+            // measures the stack against a strap that no longer exists.
+            //
+            // ⚠️ **Not every end is a shape this engine emits.** A macro pin, a switch's always-on
+            // pin and existing routing are inputs and are never written, so there is nothing to
+            // look up and the crossing's own rect stands — which is right, since trimming cannot
+            // touch them either.
+            let faces_before = via_faces.len();
+            let lower_key = (v.net.clone(), v.lower.clone(), v.lower_rect);
+            let upper_key = (v.net.clone(), v.upper.clone(), v.upper_rect);
+            // ⚠️ **Matched on the CROSSING's area, not on the rect the shape used to have.** A
+            // trimmed shape still covers the vias that held it, so the crossing area finds it; the
+            // old rect is the shape at its longest and can reach across a neighbour the trim left
+            // standing, which picks up the wrong strap entirely.
+            // ⚠️ **The BEST match, not the first.** At a ring corner two segments meet, both
+            // cover the crossing and both overlap the rect the crossing was found with — and the
+            // perpendicular one reaches far along the other axis, so taking it hands the stack a
+            // rect large enough to fit a via the reference never builds. The shape this crossing
+            // actually sits on is the one that still agrees most with what it was found as.
+            let current = |net: &str, layer: &str, was: Rect| -> Rect {
+                if std::env::var_os("PDN_NO_CURRENT").is_some() {
+                    return was;
+                }
+                let area_of = |r: Rect| -> i64 {
+                    let w = (r.2.min(was.2) - r.0.max(was.0)).max(0) as i64;
+                    let h = (r.3.min(was.3) - r.1.max(was.1)).max(0) as i64;
+                    w * h
+                };
+                emitted
+                    .iter()
+                    .filter(|(n, l, r, _)| {
+                        n == net && l == layer && overlaps(*r, v.area) && overlaps(*r, was)
+                    })
+                    .max_by_key(|(_, _, r, _)| area_of(*r))
+                    .map(|(_, _, r, _)| *r)
+                    .unwrap_or(was)
+            };
+            // 🔑 **`cleanupVias` runs between the trim and the write, and it takes vias away.**
+            // `Grid::removeInvalidVias` drops any via whose `Via::isValid` fails, and that is no
+            // more than `lower_ != nullptr && upper_ != nullptr` — a shape the trim DELETED nulls
+            // that end on every via attached to it. So a crossing whose strap no longer exists is
+            // never offered to `makeVia` at all.
+            //
+            // ⚠️ **An end that was never a shape of ours is not a missing one.** A macro pin, a
+            // switch's always-on pin and existing routing are inputs, never written, and the
+            // reference holds Shape objects for them just the same — so they are looked for among
+            // the pins rather than among the straps, and their absence from `emitted` means
+            // nothing.
+            let still_there = |net: &str, layer: &str, was: Rect| -> bool {
+                emitted.iter().any(|(n, l, r, _)| {
+                    n == net && l == layer && overlaps(*r, v.area) && overlaps(*r, was)
+                }) || connectable_pins
+                    .iter()
+                    .any(|p| p.net == net && p.layer == layer && overlaps(p.rect, was))
+                    || fixed_via_shapes
+                        .iter()
+                        .any(|f| f.net == net && f.layer == layer && overlaps(f.rect, was))
+            };
+            if !still_there(&v.net, &v.lower, v.lower_rect)
+                || !still_there(&v.net, &v.upper, v.upper_rect)
+            {
+                continue;
+            }
+            let lower_rect = current(&v.net, &v.lower, v.lower_rect);
+            let upper_rect = current(&v.net, &v.upper, v.upper_rect);
+            // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
+            // metal6 needs a cut at each of five levels, and the reference's own counts show it:
+            // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
+            // four levels unconnected while looking complete at both ends.
+            // 🔑 **Where the via goes is not the centre of what it is sized from.** The placement
+            // point comes from the plain intersection of the two shapes, SNAPPED — see
+            // `vias::placement_point`. Every level of a stack sits at the same point.
+            let Some(place_at) =
+                vyges_pdn::vias::placement_point(lower_rect, upper_rect, grid_mfg)
+            else {
+                continue; // off grid: the reference builds a dummy via, which places nothing
+            };
+            let stack = stack_layers(&db, &v.lower, &v.upper);
+            // The layers THIS connect snaps to. Empty for every other connect, which is the point.
+            let ongrid: &[String] = on_grid
+                .iter()
+                .find(|((l, u), _)| *l == v.lower && *u == v.upper)
+                .map(|(_, g)| g.as_slice())
+                .unwrap_or(&[]);
+            let (max_rows, max_columns) = max_cuts
+                .iter()
+                .find(|((l, u), _)| *l == v.lower && *u == v.upper)
+                .map(|(_, c)| *c)
+                .unwrap_or((0, 0));
+            // 🔑 **The two ENDS get their own shapes.** Passing `v.area` for both handed every
+            // level the intersection, which clips a strap that overhangs the core to the rail's
+            // edge — and a via built in the clipped rect lands 500 dbu off and can never widen
+            // the shape it sits on.
+            let intermediate: Vec<&str> = if stack.len() > 2 {
+                stack[1..stack.len() - 1].iter().map(String::as_str).collect()
+            } else {
+                Vec::new()
+            };
+            // 🔑 **A stack that cannot hold the intersection TAPERS.** Where an intermediate
+            // routing layer's own minimum width is wider than the intersection is narrow, that
+            // level is grown to what a via needs there — the layer minimum plus twice the worst
+            // enclosure the cut layers either side ask for — instead of the stack failing.
+            //
+            // ⚠️ **The gate and the growth read different widths, and the gate is the smaller.**
+            // `isComplexStackedVia` asks the raw `getMinWidth()`; `generateComplexStackedViaRects`
+            // grows to `Connect::getMinWidth()`. A stack can pass the gate and still be narrower
+            // than the target, and the reference leaves those alone — applying the growth
+            // unconditionally widens stacks it never touches.
+            let raw_min_widths: Vec<i32> = intermediate
+                .iter()
+                .map(|l| db.layer_get_min_width(l) as i32)
+                .collect();
+            let via_min_widths: Vec<i32> = intermediate
+                .iter()
+                .map(|l| via_min_width(&db, l, &rules))
+                .collect();
+            // ⚠️ **`PDN_MINW_TRACE` prints the two END rects and each intermediate's target
+            // width.** It is the instrument that separates a wrong min-width from a right one
+            // measured against the wrong shape — the two produce the same symptom, an
+            // intermediate rect of the wrong height, and nothing else distinguishes them.
+            if std::env::var_os("PDN_MINW_TRACE").is_some() {
+                eprintln!(
+                    "[minw] {}->{} lower {:?} upper {:?} intermediate {:?} raw {:?} via {:?}",
+                    v.lower, v.upper, lower_rect, upper_rect, intermediate, raw_min_widths,
+                    via_min_widths
+                );
+            }
+            let rects = vyges_pdn::vias::stack_rects_tapered(
+                lower_rect,
+                upper_rect,
+                &raw_min_widths,
+                &via_min_widths,
+                grid_mfg,
+            );
+
+            // 🔑 **A level holds a SET of candidate rects, not one.** `makeSingleLayerVia`
+            // takes `lower_rects` and `upper_rects`, crosses every pair with every rule, and
+            // lets `generateDbVia` build them all and keep the best — so an intermediate level
+            // gets two chances to find an enclosure that fits, and the ends get one because a
+            // shape has no second version of itself.
+            //
+            // ⚠️ **`generateMinEnclosureViaRects` runs on BOTH stack layouts**, not only the
+            // tapered one, so this is not taper support — it is a mechanism the plain path was
+            // missing too.
+            let mut rect_set: Vec<Vec<vyges_pdn::Rect>> =
+                rects.iter().map(|r| vec![*r]).collect();
+            let widths: Vec<i32> = intermediate
+                .iter()
+                .map(|l| db.layer_get_width(l) as i32)
+                .collect();
+            let horizontal: Vec<bool> = intermediate
+                .iter()
+                .map(|l| direction_of(&db, l) == Direction::Horizontal)
+                .collect();
+            // ℹ️ `-min_width` on a connect is not translated by the harness, and no case in the
+            // suite states it, so every layer takes the union branch.
+            let min_width_only = vec![false; intermediate.len()];
+            vyges_pdn::vias::add_min_enclosure_rects(
+                &mut rect_set,
+                &widths,
+                &horizontal,
+                &min_width_only,
+            );
+
+            // The previous level's TOP metal, which the next level shares a layer with.
+            // ⚠️ **One entry per SPOT**, because a split-cut level places many vias and each
+            // leaves its own metal on the layer above.
+            // ⚠️ **And whether that via was an ARRAY**, because the patch on the layer between is
+            // decided by `requiresPatch()` on either of the two vias, not by the geometry.
+            let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
+            for (level, pair) in stack.windows(2).enumerate() {
+                let (lo, hi) = (pair[0].as_str(), pair[1].as_str());
+                // An explicit `--cut-<lower>-<upper>` overrides; otherwise the technology decides.
+                let named = opts
+                    .one(&format!("cut-{lo}-{hi}"))
+                    .filter(|c| !c.is_empty());
+                let Some(cut_layer) = named.map(str::to_string).or(cut_layer_between(&db, lo, hi))
+                else {
+                    continue; // no cut layer between these two, so nothing can be built
+                };
+                let cut_layer = cut_layer.as_str();
+                // 🔑 **The ARRAYSPACING rules belong to the CUT layer**, and are read once per
+                // level rather than per candidate pair — they do not depend on the rects.
+                let array_rules: Vec<vyges_pdn::viagen::ArrayRule> = db
+                    .layer_array_spacing_rules(cut_layer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(cut_class, parallel_overlap, long_array, array_width, cut_spacing, cuts_spacing)| {
+                        vyges_pdn::viagen::ArrayRule {
+                            cut_class,
+                            parallel_overlap,
+                            long_array,
+                            array_width,
+                            cut_spacing,
+                            cuts_spacing,
+                        }
+                    })
+                    .collect();
+
+                // ── the level's own placement point ─────────────────────────────────────────────
+                // 🔑 **A stack does NOT sit on one point.** `DbGenerateStackedVia::generate` snaps
+                // each level separately, so a stack crossing a layer the connect named bends: the
+                // levels touching that layer move to its nearest track and the rest stay put.
+                //
+                // ⚠️ **That bend is the whole mechanism.** The levels either side of the named
+                // layer then leave metal at DIFFERENT positions on the layer between, the union is
+                // no longer a rectangle, and the bounding box that closes the notch is written as
+                // DRCFILL — hundreds of patches on one design, none of which appear if every
+                // level sits on the same point.
+                //
+                // ⚠️ **Only a STACK snaps.** A single-level connect goes through
+                // `makeSingleLayerVia`, and `DbGenerateVia::generate` takes the `ongrid` set and
+                // ignores it — the snapping lives in the stacked via, not in the via.
+                let place_at = if stack.len() > 2 {
+                    let grid_of = |layer: &str| {
+                        ongrid
+                            .iter()
+                            .any(|l| l == layer)
+                            .then(|| track_grids.get(layer))
+                            .flatten()
+                    };
+                    let snap_x = |layer: &str, v: i32| match grid_of(layer) {
+                        Some((x, _)) => vyges_pdn::vias::snap_to_grid(v, x, 0),
+                        None => v,
+                    };
+                    let snap_y = |layer: &str, v: i32| match grid_of(layer) {
+                        Some((_, y)) => vyges_pdn::vias::snap_to_grid(v, y, 0),
+                        None => v,
+                    };
+                    let (x_from_upper, y_from_upper) = vyges_pdn::vias::snap_sources(
+                        direction_of(&db, lo) == Direction::Horizontal,
+                    );
+                    (
+                        snap_x(if x_from_upper { hi } else { lo }, place_at.0),
+                        snap_y(if y_from_upper { hi } else { lo }, place_at.1),
+                    )
+                } else {
+                    place_at
+                };
+                // 🔑 **A split-cut level builds a 1x1 via and places it many times.** Where either
+                // of a level's own layers asks for split cuts, `determineRowsAndColumns` forces
+                // `rows = cols = 1` and the spread is laid out separately — the pitch being the
+                // LARGER of the two layers' requests, applied to both axes.
+                let split_for = |layer: &str| split_for_connect(&v.lower, &v.upper, layer);
+                let split = split_for(lo).or_else(|| split_for(hi)).map(|(p, s)| {
+                    let other = split_for(if split_for(lo).is_some() { hi } else { lo });
+                    (p.max(other.map(|(q, _)| q).unwrap_or(0)), s || other.is_some_and(|(_, t)| t))
+                });
+
+                // 🔑 **The widths a generate rule is checked against, and they are the SHAPES'.**
+                // `getLowerWidth`/`getUpperWidth` read `lower_rect_`/`upper_rect_` — the straps the
+                // via lands on — not the intersection it is built in.
+                // ⚠️ **Zero for a split array**, which is how a wide-metal rule is kept off a via
+                // that will be scattered as single cuts. See `rule_valid_for_width`.
+                let shape_width = |r: vyges_pdn::Rect| (r.2 - r.0).min(r.3 - r.1);
+                let (width_lo, width_hi) = if split.is_some() {
+                    (0, 0)
+                } else {
+                    (shape_width(rects[level]), shape_width(rects[level + 1]))
+                };
+                let rule_fits = |r: &ViaRule| {
+                    vyges_pdn::viagen::rule_valid_for_width(r.bottom_width, width_lo)
+                        && vyges_pdn::viagen::rule_valid_for_width(r.top_width, width_hi)
+                };
+                // Each axis from the shape that constrains it — see `vias::via_area`.
+                let area = vyges_pdn::vias::via_area(rects[level], rects[level + 1]);
+
+                // 🔑 **A crossing holds its two shapes whether or not any metal was built.**
+                // `Grid::makeVias` creates a `Via` per intersection and `PdnGen::updateVias`
+                // attaches it to both shapes; the only thing that takes one away is
+                // `removeInvalidVias`, and `Via::isValid` asks solely whether the two shapes
+                // still exist. A `DbVia` that could not be generated never enters that test —
+                // `makeVia` reports `PDN-0110` and moves on, leaving the `Via` in place.
+                //
+                // ⚠️ **So a refused via still trims a strap, and that is not a quirk.** On a
+                // design with a switched region domain, a met5 stripe crosses met4 twice and
+                // only one crossing builds. Counting the built one alone leaves a single
+                // connection, `isRemovable` takes the whole stripe away, and counting both
+                // keeps it and sets its minimum rect to 63600..114370 — the reference's own
+                // answer, spanning from the REFUSED crossing to the built one.
+                //
+                // 🔑 **The SHAPES' intersection, not this level's rect.** `getMinimumRect`
+                // merges `via->getArea()`, and a `Via` is constructed once per crossing with
+                // the two shapes' own intersection — every level of the stack reports the same
+                // area. Reporting the level's rect is harmless while the levels all hold the
+                // intersection, and wrong the moment a stack tapers: a grown intermediate rect
+                // then holds the strap out past where the via metal reaches.
+                // ℹ️ The hold itself is recorded before trimming — see the pre-pass above.
+
+                // A split-cut level places its 1x1 via once per array position; every other level
+                // places one via at the point itself.
+                // ℹ️ Asked per area, because the generate path chooses among candidate rects and
+                // the winner's area is what its array has to fill.
+                let spots_in = |area: vyges_pdn::Rect| match split {
+                    None => vec![place_at],
+                    Some((sp, stagger)) => {
+                        // ⚠️ **The stagger offset is applied to the GROUND net only**, so the two
+                        // nets' arrays interleave by half a pitch rather than both shifting.
+                        let off = if stagger && v.net == ground {
+                            (sp / 2, sp / 2)
+                        } else {
+                            (0, 0)
+                        };
+                        let n = vyges_pdn::split::counts(
+                            (area.2 - area.0, area.3 - area.1),
+                            (sp, sp),
+                            max_columns,
+                            max_rows,
+                        );
+                        // ℹ️ Identity snapping: both call sites in the reference pass `false` for
+                        // the snap flags, so the layer grids are never populated.
+                        vyges_pdn::split::positions(place_at, n, (sp, sp), off, &|v| v, &|v| v)
+                    }
+                };
+                let spots = spots_in(area);
+
+                // ── a via the technology already declares ────────────────────────────────────
+                // 🔑 **Only the GEOMETRY is the technology's.** How many cuts fit, and what
+                // enclosure the via is finally built with, are decided by the same machinery a
+                // generated via uses — `TechViaGenerator` differs from `GenerateViaGenerator`
+                // only in where its cut and its minimum enclosures come from, and hands rows,
+                // columns and pitch to `DbTechVia` through the shared `makeBaseVia`.
+                // ⚠️ Evaluated before the generate path so a NAMED via wins outright, but the
+                // unnamed fallback inside is gated on there being no rule for this level — the
+                // reference populates both lists and picks between them, and preferring a tech
+                // via where a rule exists would rebuild every Nangate45 case differently.
+                // ⚠️ **A tech via is a FALLBACK, not an alternative.** `makeSingleLayerVia` builds
+                // every generate rule first and only reaches `populateTechVias` when none of them
+                // was even set up validly — so a rule that exists but does not apply here leaves
+                // the level to the technology's own via rather than to nothing.
+                let has_rule = rules
+                    .iter()
+                    .any(|r| r.lower == lo && r.upper == hi && rule_fits(r));
+                // 🔑 **`PDN_RULE_TRACE=1` says why a level fell through to the technology's own
+                // via.** The reference's `Via` group prints `Generate via rules available: N
+                // from M`; this prints the candidates for the pair and the width gate each was
+                // judged by, so "no rule applies here" and "no rule exists for this pair" can
+                // be told apart. ⚠️ They look identical from the output and mean opposite
+                // things — a missing rule is a parse bug, an inapplicable one is the design.
+                if std::env::var_os("PDN_RULE_TRACE").is_some() && !has_rule {
+                    for r in rules.iter().filter(|r| r.lower == lo && r.upper == hi) {
+                        eprintln!(
+                            "[rule] {lo}->{hi} {} bw {:?} vs {width_lo} | tw {:?} vs {width_hi}",
+                            r.name, r.bottom_width, r.top_width
+                        );
+                    }
+                    eprintln!("[rule] NO RULE {lo}->{hi} (candidates {})", rules.iter().filter(|r| r.lower == lo && r.upper == hi).count());
+                }
+                let named_here = fixed
+                    .iter()
+                    .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
+                    .is_some_and(|(_, _, n, _, _)| !n.is_empty());
+                // The generate rule spanning exactly this level, where one is declared.
+                //
+                // ⚠️ **A rule this connect asked to keep out is not a rule.** `filterVias` erases
+                // by name from the generate rules and the tech vias alike, so the filter belongs
+                // on both paths — applied to only one, a via merely moves between them.
+                let dont_use = fixed
+                    .iter()
+                    .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
+                    .and_then(|(.., d)| d.as_ref());
+                // 🔑 **`-cut_pitch` overrides the technology's, on EVERY generator.**
+                // `generateDbVia` sets it before any candidate is built:
+                // `if (hasCutPitch()) { via->setCutPitchX(...); via->setCutPitchY(...); }` —
+                // and only the split-cut pitch, applied after, may displace it.
+                //
+                // ⚠️ **The pitch is stored as the cut SPACING and appears in the via's NAME**,
+                // so a via built at the technology's pitch is a different object from the same
+                // geometry built at the connect's. Read only on the tech-via path, one design
+                // came out with 534 columns at a 300 pitch where the reference writes 161 at
+                // 1000 — every via in the design different, and not one shape to show for it.
+                let connect_cut_pitch: Option<(i32, i32)> = fixed
+                    .iter()
+                    .find(|(l, u, ..)| *l == v.lower && *u == v.upper)
+                    .and_then(|(_, _, _, p, _)| *p);
+                // ⚠️ A shape constrains the via only at ITS OWN end of the stack; every level
+                // in between takes minimums however much room it has.
+                let at_bottom_end = level == 0;
+                let at_top_end = level + 2 == stack.len();
+                // ⚠️ The SHAPE's orientation, not the layer's — `Shape::isHorizontal` is its own
+                // aspect ratio. A follow pin on a vertical layer still runs horizontally.
+                // ℹ️ Read from the level's own rect rather than a candidate: an END of the stack
+                // is a shape, and a shape has exactly one candidate.
+                let bot_c = if at_bottom_end {
+                    let d = vyges_pdn::viagen::rect_direction(rects[level]);
+                    vyges_pdn::viagen::constraint_for(d, true, false)
+                } else {
+                    Default::default()
+                };
+                let top_c = if at_top_end {
+                    let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
+                    vyges_pdn::viagen::constraint_for(d, true, false)
+                } else {
+                    Default::default()
+                };
+
+                // ── every lower candidate against every upper one ───────────────────────────
+                // 🔑 **`makeSingleLayerVia` crosses the two SETS.** A generator is made for each
+                // (lower rect, upper rect, rule) triple, `generateDbVia` builds every one that
+                // can be built, stable-sorts them by `isPreferredOver` and takes the first.
+                //
+                // ⚠️ **The pair is not a detail of the enclosure search — it changes the rule.**
+                // `getLowerWidth`/`getUpperWidth` read the candidate rects, so a different pair
+                // can pass a width gate the other fails, land in a different enclosure bucket,
+                // and fit a different number of cuts. That is the whole reason a level carries
+                // more than one rect.
+                struct LevelVia<'r> {
+                    rule: Option<&'r ViaRule>,
+                    cut: (i32, i32),
+                    pitch: (i32, i32),
+                    area: vyges_pdn::Rect,
+                    rows: i32,
+                    columns: i32,
+                    /// Set where an `ARRAYSPACING` rule regrouped the cuts. `rows`/`columns`
+                    /// are then ONE group's, and this says how the groups are laid out.
+                    array: Option<vyges_pdn::viagen::ArrayFit>,
+                    bot_enc: (i32, i32),
+                    top_enc: (i32, i32),
+                    score: vyges_pdn::viagen::Generator,
+                }
+                let mut best: Option<LevelVia> = None;
+                for &lower_rect in &rect_set[level] {
+                    for &upper_rect in &rect_set[level + 1] {
+                        // The widths the rule is gated on are THIS pair's, not the level's.
+                        let (w_lo, w_hi) = if split.is_some() {
+                            (0, 0)
+                        } else {
+                            (shape_width(lower_rect), shape_width(upper_rect))
+                        };
+                        let rule = rules
+                            .iter()
+                            .filter(|r| !dont_use.is_some_and(|d| d.is_match(&r.name)))
+                            .find(|r| {
+                                r.lower == lo
+                                    && r.upper == hi
+                                    && vyges_pdn::viagen::rule_valid_for_width(
+                                        r.bottom_width,
+                                        w_lo,
+                                    )
+                                    && vyges_pdn::viagen::rule_valid_for_width(r.top_width, w_hi)
+                            });
+                        let cut = rule.map(|r| r.cut).unwrap_or(fallback_cut);
+                        if cut.0 <= 0 || cut.1 <= 0 {
+                            continue; // nothing to build from
+                        }
+                        // 🔑 **A split array's pitch is the SPLIT pitch, on both axes.**
+                        // `generateDbVia` calls `setCutPitchX(pitch)`/`setCutPitchY(pitch)` with
+                        // the larger of the two layers' requests before the generator is ever
+                        // built, overriding whatever spacing the rule declares. The via still
+                        // holds one cut, so nothing moves — but the pitch is stored as the cut
+                        // SPACING and appears in the via's name, so a via built at the rule's
+                        // pitch is a different object with a different name from the same
+                        // geometry.
+                        // 🔑 **The pitch comes from the CUT LAYER, and the rule's own
+                        // `SPACING` is only the fallback.** `determineCutSpacing` runs first
+                        // — the layer's spacing added to the cut, refined by the cut class's
+                        // spacing table — and the generate rule's value is taken **verbatim**
+                        // and only where that left an axis at zero.
+                        //
+                        // ⚠️ Reading the rule first inflates every via the rule covers. A
+                        // wide-power rule stating a deliberately large spacing then sets the
+                        // pitch for vias the layer would have packed far more tightly — and
+                        // nothing says so, because vias are not compared shape by shape. It
+                        // shows only where the oversized metal has to be absorbed by a shape
+                        // too narrow to hide it.
+                        let pitch = match (split, connect_cut_pitch) {
+                            (Some((sp, _)), _) => (sp, sp),
+                            (None, Some(p)) => p,
+                            (None, None) => {
+                                let cut_rect = (0, 0, cut.0, cut.1);
+                                let classes = via_cut_classes(&db, cut_layer);
+                                let cls = vyges_pdn::viagen::cut_class(&classes, cut)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_else(|| cut_layer.to_string());
+                                let table = spacing_table_rules(&db, cut_layer, &cls);
+                                vyges_pdn::techvia::base_cut_pitch(
+                                    cut_rect,
+                                    db.layer_get_spacing(cut_layer),
+                                    vyges_pdn::techvia::class_cut_spacing(cut_rect, &table),
+                                )
+                                .or_else(|| rule.map(|r| r.pitch))
+                                .unwrap_or(cut)
+                            }
+                        };
+                        // Each axis from the shape that constrains it — see `vias::via_area`.
+                        let area = vyges_pdn::vias::via_area(lower_rect, upper_rect);
+
+                        // ── the enclosure pair, chosen the way the reference chooses it ─────
+                        // 🔑 Candidates from the rules, crossed, each scored by how many cuts
+                        // IT lets fit and kept only if the constraints pass. The leftover-fill
+                        // this replaced was derived from one case that agreed exactly and three
+                        // in the same run that did not.
+                        let (rule_bot, rule_top) = rule.map(|r| (r.bottom_enclosure, r.top_enclosure)).unwrap_or((
+                            (fallback_enc, fallback_enc),
+                            (fallback_enc, fallback_enc),
+                        ));
+                        let bottoms = enclosure_candidates(
+                            &db, cut_layer, cut, area, lo, false, Some(rule_bot), split.is_some(),
+                        );
+                        let tops = enclosure_candidates(
+                            &db, cut_layer, cut, area, hi, true, Some(rule_top), split.is_some(),
+                        );
+                        // 🔑 **What `checkMinEnclosure` is asked against** — the cut layer's
+                        // own rules, WITHOUT the generate rule's stated enclosure among them.
+                        let bot_rules = enclosure_candidates_with_swap(
+                            &db, cut_layer, cut, area, lo, false, None, split.is_some(),
+                        );
+                        let top_rules = enclosure_candidates_with_swap(
+                            &db, cut_layer, cut, area, hi, true, None, split.is_some(),
+                        );
+
+                        // 🔑 **`PDN_VIA_TRACE=1` prints what the reference's `Via` and
+                        // `ViaEnclosure` debug groups print**, in the same terms: the area, the
+                        // cut, the pitch, both rule sets, both candidate sets and both
+                        // constraints, then whether the pair was CHOSEN or REJECTED. The two
+                        // logs can be read side by side, which is how the 770-wide crossing was
+                        // settled — ours rejected the generate via exactly where the reference
+                        // did, and the difference was the tech-via fallback below.
+                        if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                            eprintln!(
+                                "[via] {}|{lo}->{hi}|area {area:?}|cut {cut:?}|pitch {pitch:?}|bot_rules {bot_rules:?}|top_rules {top_rules:?}|bottoms {bottoms:?}|tops {tops:?}|bot_c {bot_c:?}|top_c {top_c:?}",
+                                v.net
+                            );
+                        }
+                        // 🔑 **The score is `getTotalCuts()`, and that is the CLAMPED product.**
+                        // `determineRowsAndColumns` ends with `core_row_ = std::max(1, rows)`
+                        // and its sibling for columns, so a pair that fits no cut on an axis
+                        // still builds one row of them.
+                        //
+                        // ⚠️ **Which means the fit is not a gate at all.** `checkConstraints`'s
+                        // `getTotalCuts() == 0` test can never fire once the clamp has run;
+                        // what rejects a pair is the minimum-cut and minimum-enclosure check.
+                        // Treating a zero fit as a rejection refuses vias the reference builds
+                        // — every stack onto a power switch's pin, which is 280 tall against a
+                        // 150 cut and enclosures that want 170.
+                        let fit =
+                            |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
+                                let c = vyges_pdn::viagen::cuts_across(
+                                    area.2 - area.0,
+                                    cut.0,
+                                    b.x,
+                                    t.x,
+                                    pitch.0,
+                                    max_columns,
+                                )
+                                .max(1);
+                                let r = vyges_pdn::viagen::cuts_across(
+                                    area.3 - area.1,
+                                    cut.1,
+                                    b.y,
+                                    t.y,
+                                    pitch.1,
+                                    max_rows,
+                                )
+                                .max(1);
+                                c * r
+                            };
+                        let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
+                            &bottoms,
+                            &tops,
+                            direction_of(&db, lo),
+                            direction_of(&db, hi),
+                            &fit,
+                            // 🔑 **`checkConstraints`: no cuts, then minimum enclosure.** The
+                            // enclosure judged is the one the via would be BUILT with, not the
+                            // candidate minimum — so the constrained axis carries the overlap,
+                            // and a cut taller than the rect it must sit in makes that overlap
+                            // NEGATIVE. Every rule then refuses it, however small the rule.
+                            //
+                            // ⚠️ This is what stops a via being built at all, and a level with
+                            // no buildable generate via is what sends the reference to the
+                            // technology's own via instead. Without the gate we build the
+                            // oversized via, its metal overhangs the shape it lands on, and
+                            // the shape grows to cover metal that is then ripped out.
+                            //
+                            // ℹ️ Minimum-cut rules are the third gate and are not fed here.
+                            &|b: vyges_pdn::viagen::Enclosure,
+                              t: vyges_pdn::viagen::Enclosure,
+                              cuts: i32| {
+                                if cuts <= 0 {
+                                    return false;
+                                }
+                                let cols = vyges_pdn::viagen::cuts_across(
+                                    area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns,
+                                )
+                                .max(1);
+                                let rws = vyges_pdn::viagen::cuts_across(
+                                    area.3 - area.1, cut.1, b.y, t.y, pitch.1, max_rows,
+                                )
+                                .max(1);
+                                let span =
+                                    ((cols - 1) * pitch.0 + cut.0, (rws - 1) * pitch.1 + cut.1);
+                                let overlap = vyges_pdn::viagen::overlap_enclosure(
+                                    (area.2 - area.0, area.3 - area.1),
+                                    span,
+                                );
+                                let built_b = vyges_pdn::viagen::built_enclosure(
+                                    !at_bottom_end,
+                                    b,
+                                    overlap,
+                                    bot_c,
+                                );
+                                let built_t = vyges_pdn::viagen::built_enclosure(
+                                    !at_top_end,
+                                    t,
+                                    overlap,
+                                    top_c,
+                                );
+                                // Snapped before the rule check: `checkConstraints` runs
+                                // after `determineRowsAndColumns` has already snapped.
+                                let built_b =
+                                    vyges_pdn::viagen::snap_enclosure(built_b, grid_mfg);
+                                let built_t =
+                                    vyges_pdn::viagen::snap_enclosure(built_t, grid_mfg);
+                                vyges_pdn::viagen::enclosure_satisfies(built_b, &bot_rules)
+                                    && vyges_pdn::viagen::enclosure_satisfies(
+                                        built_t, &top_rules,
+                                    )
+                            },
+                        ) else {
+                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                                eprintln!("[via]   REJECTED {area:?} {lo}->{hi}");
+                            }
+                            continue; // this pair builds nothing; another may
+                        };
+                        if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                            eprintln!("[via]   CHOSE {area:?} {lo}->{hi} {chosen:?}");
+                        }
+
+                        let (columns, rows) = if split.is_some() {
+                            (1, 1)
+                        } else {
+                            (
+                                vyges_pdn::viagen::cuts_across(
+                                    area.2 - area.0,
+                                    cut.0,
+                                    chosen.bottom.x,
+                                    chosen.top.x,
+                                    pitch.0,
+                                    max_columns,
+                                )
+                                .max(1),
+                                vyges_pdn::viagen::cuts_across(
+                                    area.3 - area.1,
+                                    cut.1,
+                                    chosen.bottom.y,
+                                    chosen.top.y,
+                                    pitch.1,
+                                    max_rows,
+                                )
+                                .max(1),
+                            )
+                        };
+
+                        // 🔑 **An ARRAYSPACING rule may regroup the cuts before any of this.**
+                        // `determineRowsAndColumns` runs its array branch on the plain fit and,
+                        // where a rule applies, replaces the counts and the pitch outright —
+                        // the enclosure then comes from what the ARRAY leaves over rather than
+                        // from what a flat run of cuts does.
+                        //
+                        // ⚠️ **A split array is never an array in this sense**, and neither is
+                        // a fit of one group by one: `isCutArray()` is
+                        // `!isSplitCutArray() && (array_core_x_ != 1 || array_core_y_ != 1)`.
+                        let array = if split.is_some() {
+                            None
+                        } else {
+                            // ⚠️ **The via's own cut class, not the layer's list.** A rule
+                            // naming a class applies only to a via of that class, and a via
+                            // with none matches every rule.
+                            let my_cut_class = vyges_pdn::viagen::cut_class(
+                                &via_cut_classes(&db, cut_layer),
+                                cut,
+                            )
+                            .map(|c| c.name.clone());
+                            vyges_pdn::viagen::array_fit(
+                                &array_rules,
+                                my_cut_class.as_deref(),
+                                (area.2 - area.0, area.3 - area.1),
+                                cut,
+                                pitch,
+                                (chosen.bottom.x, chosen.bottom.y),
+                                (chosen.top.x, chosen.top.y),
+                                (max_columns, max_rows),
+                                (columns, rows),
+                            )
+                        };
+                        let (columns, rows) = match &array {
+                            Some(f) => f.core,
+                            None => (columns, rows),
+                        };
+                        let pitch = match &array {
+                            Some(f) => f.cut_pitch,
+                            None => pitch,
+                        };
+                        // ⚠️ **The chosen pair is a MINIMUM.** What is built is the overlap on
+                        // any axis the via must fit and the minimum elsewhere — and a level
+                        // internal to the stack takes minimums on both axes however much room
+                        // it has, which is why a via in the middle of a stack carries no
+                        // overhang while the ends carry plenty.
+                        let span =
+                            ((columns - 1) * pitch.0 + cut.0, (rows - 1) * pitch.1 + cut.1);
+                        let extent = (area.2 - area.0, area.3 - area.1);
+                        // 🔑 **An array's leftover is the ARRAY's, not a flat run's** — the
+                        // reference hands `double_enc_x / 2` to the same chooser that otherwise
+                        // takes the overlap.
+                        let overlap = match &array {
+                            Some(f) => vyges_pdn::viagen::Enclosure {
+                                x: f.double_enclosure.0 / 2,
+                                y: f.double_enclosure.1 / 2,
+                            },
+                            None => vyges_pdn::viagen::overlap_enclosure(extent, span),
+                        };
+                        let b = vyges_pdn::viagen::built_enclosure(
+                            !at_bottom_end,
+                            chosen.bottom,
+                            overlap,
+                            bot_c,
+                        );
+                        let t = vyges_pdn::viagen::built_enclosure(
+                            !at_top_end,
+                            chosen.top,
+                            overlap,
+                            top_c,
+                        );
+                        // 🔑 **A split array takes the MINIMUM enclosure verbatim.** The growth
+                        // above fills whatever room the shapes leave, and
+                        // `determineRowsAndColumns` skips it outright for a split array —
+                        // `bottom_enclosure_->setX(bottom_min_enclosure.getX())` and its three
+                        // siblings, with no `determine_enclosure` and no constraint.
+                        // ⚠️ It is not a rounding difference. A followpin crossing is hundreds
+                        // of dbu wide, so a grown enclosure puts metal right across it; the
+                        // minimum leaves a stub barely wider than the cut. Every via still
+                        // lands in the same place, so nothing in the placement gives it away —
+                        // what tells us is that the intermediate layer then meets its minimum
+                        // area on its own and the DRCFILL patch that should fill it never
+                        // appears — hundreds of patches on a single design.
+                        // ⚠️ Snapped LAST, after the split-cut override, because
+                        // `determineRowsAndColumns` snaps on its way out and every branch
+                        // above it funnels through that one line.
+                        let (bot_enc, top_enc) = if split.is_some() {
+                            (chosen.bottom, chosen.top)
+                        } else {
+                            (b, t)
+                        };
+                        let bot_enc = vyges_pdn::viagen::snap_enclosure(bot_enc, grid_mfg);
+                        let top_enc = vyges_pdn::viagen::snap_enclosure(top_enc, grid_mfg);
+                        let (bot_enc, top_enc) =
+                            ((bot_enc.x, bot_enc.y), (top_enc.x, top_enc.y));
+
+                        // 🔑 **What the sort reads.** `getCutArea` is the cut's own area times
+                        // the CLAMPED cut count, and `getGeneratorWidth`/`Height` are
+                        // `cut*n + spacing*(n-1) + 2*enclosure` — which is the span plus twice
+                        // the enclosure the via was finally built with, per axis.
+                        // 🔑 **`getCutArea` counts EVERY cut of the array**, which is
+                        // `array_core * core + end` per axis — so a regrouped via scores on
+                        // what it actually places, not on one group.
+                        let total = match &array {
+                            Some(f) => (
+                                vyges_pdn::viagen::array_count(f.groups.0, f.core.0, f.end.0),
+                                vyges_pdn::viagen::array_count(f.groups.1, f.core.1, f.end.1),
+                            ),
+                            None => (columns, rows),
+                        };
+                        let candidate = LevelVia {
+                            rule,
+                            cut,
+                            pitch,
+                            area,
+                            rows,
+                            columns,
+                            array,
+                            bot_enc,
+                            top_enc,
+                            score: vyges_pdn::viagen::Generator {
+                                name: rule.map(|r| r.name.clone()).unwrap_or_default(),
+                                cut_area: cut.0 * cut.1 * total.0 * total.1,
+                                bottom: (span.0 + 2 * bot_enc.0, span.1 + 2 * bot_enc.1),
+                                top: (span.0 + 2 * top_enc.0, span.1 + 2 * top_enc.1),
+                                bottom_direction: direction_of(&db, lo),
+                                top_direction: direction_of(&db, hi),
+                            },
+                        };
+                        // ⚠️ **Only a STRICT preference displaces the incumbent.** A tie returns
+                        // `false`, so the earlier candidate stays — which is what makes the
+                        // reference's stable sort stable, and why the sets are iterated in
+                        // their own sorted order rather than whatever order they were built in.
+                        if candidate
+                            .score
+                            .is_preferred_over(best.as_ref().map(|b| &b.score))
+                        {
+                            best = Some(candidate);
+                        }
+                    }
+                }
+                // 🔑 **A technology via is what a level falls back to when no GENERATE via
+                // could be BUILT** — not merely when none was set up validly.
+                //
+                // ⚠️ `generateDbVia` returns null when every generator failed `build()`, so a
+                // rule that applies here and yields nothing buildable still hands the level to
+                // the technology. Gated on the setup test alone, such a level built nothing at
+                // all.
+                if let Some((via_name, g, connect_pitch)) =
+                    (named_here || !has_rule || best.is_none())
+                    .then(|| fixed_tech_via(&db, &fixed, (&v.lower, &v.upper), (lo, hi)))
+                    .flatten()
+                {
+                    // 🔑 **`isSetupValid` runs BEFORE anything is built, and it is the only
+                    // thing that can refuse this.** `makeSingleLayerVia` filters its tech-via
+                    // candidates through it while collecting them, and
+                    // `TechViaGenerator::isSetupValid` ends in `fitsShapes()` — so a via that
+                    // does not fit never becomes a candidate and no enclosure arithmetic
+                    // downstream gets a chance to rescue it.
+                    //
+                    // ⚠️ **Judged on the TECHNOLOGY's own metal**, `DbTechVia(via, 1, 0, 1, 0)`
+                    // and `getViaRect(true, false, ...)`, translated to the centre of the
+                    // overlap — not on the enclosure this level would go on to build, which is
+                    // computed below and is a different number.
+                    //
+                    // ℹ️ Without it, a design with a switched region domain builds a via in 770 of overlap
+                    // where the reference reports `PDN-0110 No via inserted between met4 and
+                    // met5 at (63.6000, 12.8000) - (64.3700, 14.4000)`. The via was dropped
+                    // again later, but not before the write stage had grown the met5 stripe
+                    // 325 to the left to cover its metal — which is all that reached the DEF.
+                    //
+                    // ⚠️ A refusal skips THIS level. The reference discards the whole stack and
+                    // substitutes one dummy via, which is the same thing for a two-layer
+                    // connect and is what every other bail-out in this loop already does.
+                    {
+                        let (cx, cy) = ((area.0 + area.2) / 2, (area.1 + area.3) / 2);
+                        let shift =
+                            |r: Rect| (r.0 + cx, r.1 + cy, r.2 + cx, r.3 + cy);
+                        let fits = |metal: Rect, shape: Rect, at_end: bool, layer: &str| {
+                            let c = if at_end {
+                                vyges_pdn::viagen::constraint_for(
+                                    vyges_pdn::viagen::rect_direction(shape),
+                                    true,
+                                    false,
+                                )
+                            } else {
+                                Default::default()
+                            };
+                            vyges_pdn::viagen::mostly_contains(
+                                shape,
+                                area,
+                                shift(metal),
+                                c,
+                                direction_of(&db, layer),
+                            )
+                        };
+                        if !fits(g.bottom_metal, rects[level], level == 0, lo)
+                            || !fits(
+                                g.top_metal,
+                                rects[level + 1],
+                                level + 2 == stack.len(),
+                                hi,
+                            )
+                        {
+                            if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                                eprintln!(
+                                    "[via]   TECH REFUSED {area:?} {lo}->{hi} {via_name}"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                    // ⚠️ **Two different cut rects, and they are not interchangeable.** How many
+                    // fit is asked of the merged OUTLINE — `TechViaGenerator::getCut()` returns
+                    // `cut_outline_` — while the via's own parameters carry a SINGLE cut's size.
+                    // A one-cut tech via makes them equal, which is how using one for both went
+                    // unnoticed through ASAP7 entirely.
+                    let cut = (
+                        g.cut_extent.2 - g.cut_extent.0,
+                        g.cut_extent.3 - g.cut_extent.1,
+                    );
+                    let single = (
+                        g.single_cut.2 - g.single_cut.0,
+                        g.single_cut.3 - g.single_cut.1,
+                    );
+                    // The connect's own `-cut_pitch` wins; otherwise the technology decides.
+                    let Some(pitch) = connect_pitch.or_else(|| {
+                        // 🔑 The cut's class decides which column of the spacing table applies.
+                        // ASAP7 states every class at the same value, but the lookup is per class
+                        // and a technology that differentiates them would be built wrong without.
+                        let classes = via_cut_classes(&db, &g.cut_layer);
+                        let cls = vyges_pdn::viagen::cut_class(&classes, cut)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| g.cut_layer.clone());
+                        let table = spacing_table_rules(&db, &g.cut_layer, &cls);
+                        vyges_pdn::techvia::base_cut_pitch(
+                            g.cut_extent,
+                            db.layer_get_spacing(&g.cut_layer),
+                            vyges_pdn::techvia::class_cut_spacing(g.cut_extent, &table),
+                        )
+                    }) else {
+                        if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                            eprintln!("[via]   TECH NO PITCH {area:?} {lo}->{hi} {via_name}");
+                        }
+                        continue; // no pitch stated anywhere, so no array can be laid out
+                    };
+                    // 🔑 The split pitch overrides the technology's, exactly as on the generate
+                    // path — `generateDbVia` sets it on every generator before any is built.
+                    let pitch = match split {
+                        Some((sp, _)) => (sp, sp),
+                        None => pitch,
+                    };
+                    // 🔑 **A tech via is NOT built with its own metal margins.** Those are only a
+                    // floor: `getMinimumEnclosures` takes the layer's rules, erases any candidate
+                    // short on BOTH axes, and raises the rest to the floor per axis. What is then
+                    // chosen among them, and what is finally built, is the E-series selection the
+                    // generate path uses — anything less leaves VIA34 and VIA56 one axis short.
+                    let candidates = |metal: Rect, layer: &str, above: bool| {
+                        let floor = vyges_pdn::techvia::enclosure(g.cut_extent, metal);
+                        // ⚠️ **The rules alone, and the floor is NOT one of them.**
+                        // `getMinimumEnclosures` asks for the rule-derived set only
+                        // (`rules_only = true`) and adds the via's own margins solely when that
+                        // set comes back empty. `enclosure_candidates` seeds its list with the
+                        // rule value it is handed, so that seed is dropped here — left in, it is
+                        // a candidate that fits more cuts than any real rule and therefore always
+                        // wins, which is how VIA34's M4 face came out 1126 against 1148.
+                        let rules: Vec<(i32, i32)> =
+                            enclosure_candidates(&db, &g.cut_layer, cut, area, layer, above, None, split.is_some())
+                                .into_iter()
+                                .map(|e| (e.x, e.y))
+                                .collect();
+                        vyges_pdn::techvia::reconcile_enclosures(&rules, floor)
+                            .into_iter()
+                            .map(|(x, y)| vyges_pdn::viagen::Enclosure { x, y })
+                            .collect::<Vec<_>>()
+                    };
+                    let bottoms = candidates(g.bottom_metal, lo, false);
+                    let tops = candidates(g.top_metal, hi, true);
+                    // 🔑 **Clamped per axis, as on the generate path.** Both paths end in the
+                    // shared `makeBaseVia`, and `determineRowsAndColumns` finishes with
+                    // `core_row_ = std::max(1, rows)` and its sibling for columns — so an axis
+                    // that fits no cut still builds one row of them, and the fit is never a
+                    // gate. Unclamped here, every pair scored zero on a rail too narrow to
+                    // hold a cut and the whole level was refused: a 0.018 wide M2 followpin
+                    // under a stack built nothing at all, and the layer above it then lost the
+                    // patch that a via on both sides of it would have required.
+                    let fit = |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
+                        vyges_pdn::viagen::cuts_across(area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns)
+                            .max(1)
+                            * vyges_pdn::viagen::cuts_across(
+                                area.3 - area.1,
+                                cut.1,
+                                b.y,
+                                t.y,
+                                pitch.1,
+                                max_rows,
+                            )
+                            .max(1)
+                    };
+                    let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
+                        &bottoms,
+                        &tops,
+                        direction_of(&db, lo),
+                        direction_of(&db, hi),
+                        &fit,
+                        &|_, _, cuts| cuts > 0,
+                    ) else {
+                        continue; // nothing buildable at this level
+                    };
+                    // A split array holds ONE cut and is placed repeatedly, so the fit is not asked.
+                    let (columns, rows) = if split.is_some() {
+                        (1, 1)
+                    } else {
+                        (
+                            vyges_pdn::viagen::cuts_across(
+                                area.2 - area.0,
+                                cut.0,
+                                chosen.bottom.x,
+                                chosen.top.x,
+                                pitch.0,
+                                max_columns,
+                            )
+                            .max(1),
+                            vyges_pdn::viagen::cuts_across(
+                                area.3 - area.1,
+                                cut.1,
+                                chosen.bottom.y,
+                                chosen.top.y,
+                                pitch.1,
+                                max_rows,
+                            )
+                            .max(1),
+                        )
+                    };
+                    // ⚠️ The chosen pair is a MINIMUM; what is built takes the overlap on any axis
+                    // the via must fit and the minimum elsewhere. A level inside the stack is
+                    // constrained by nothing and takes minimums on both.
+                    let at_bottom_end = level == 0;
+                    let at_top_end = level + 2 == stack.len();
+                    let bot_c = if at_bottom_end {
+                        let d = vyges_pdn::viagen::rect_direction(rects[level]);
+                        vyges_pdn::viagen::constraint_for(d, true, false)
+                    } else {
+                        Default::default()
+                    };
+                    let top_c = if at_top_end {
+                        let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
+                        vyges_pdn::viagen::constraint_for(d, true, false)
+                    } else {
+                        Default::default()
+                    };
+                    let span = (
+                        (columns - 1) * pitch.0 + cut.0,
+                        (rows - 1) * pitch.1 + cut.1,
+                    );
+                    let overlap = vyges_pdn::viagen::overlap_enclosure(
+                        (area.2 - area.0, area.3 - area.1),
+                        span,
+                    );
+                    let b = vyges_pdn::viagen::built_enclosure(
+                        !at_bottom_end,
+                        chosen.bottom,
+                        overlap,
+                        bot_c,
+                    );
+                    let t =
+                        vyges_pdn::viagen::built_enclosure(!at_top_end, chosen.top, overlap, top_c);
+                    // 🔑 The minimum verbatim for a split array — see the same override on the
+                    // generate path. Snapped after it, for the same reason.
+                    let (bot, top) = if split.is_some() {
+                        (chosen.bottom, chosen.top)
+                    } else {
+                        (b, t)
+                    };
+                    let bot = vyges_pdn::viagen::snap_enclosure(bot, grid_mfg);
+                    let top = vyges_pdn::viagen::snap_enclosure(top, grid_mfg);
+                    let (bot, top) = ((bot.x, bot.y), (top.x, top.y));
+                    // 🔑 **A single-cut tech via is placed AS ITSELF.** `DbTechVia::generate`
+                    // branches on `isArray()`, and only an array is given a `dbVia` of its own —
+                    // the else arm hands `odb::dbSBox::create` the technology's via directly, so
+                    // the DEF names `VIA23` and carries no `VIAS` entry for it at all. Naming a
+                    // 1x1 the way an array is named invents a via the reference never wrote.
+                    // 🔑 **A tech via's OWN cut array folds into the one asked for**, and it
+                    // changes the counts, the pitch, the name and where the via sits. See
+                    // `techvia::fold_cut_array` — `DbTechVia`'s constructor does this before
+                    // anything reads the via, so everything downstream sees the folded values.
+                    let (rows, columns, pitch) = match vyges_pdn::techvia::fold_cut_array(
+                        &g.cut_centres,
+                        rows,
+                        columns,
+                        pitch.1,
+                        pitch.0,
+                    ) {
+                        Some((r, c, rp, cp)) => (r, c, (cp, rp)),
+                        None => (rows, columns, pitch),
+                    };
+                    let is_array = rows > 1 || columns > 1;
+                    // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
+                    // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
+                    // for a generate rule the snapping really does live only in the stacked via
+                    // — but `DbTechVia::generate` populates the grid of either of its own layers
+                    // the connect named and both snaps to it and RE-PITCHES its cut array on it.
+                    // ⚠️ It picks which layer serves which axis by a rule of its own: see
+                    // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
+                    // stacked via branches on the one below.
+                    let tv_grid = |layer: &str| {
+                        ongrid
+                            .iter()
+                            .any(|l| l == layer)
+                            .then(|| track_grids.get(layer))
+                            .flatten()
+                    };
+                    let (x_up, y_up) = vyges_pdn::vias::techvia_snap_sources(
+                        direction_of(&db, hi) == Direction::Vertical,
+                    );
+                    // ⚠️ **A layer's track interval is read off the axis its OWN direction
+                    // names**, not the axis being pitched — `snapToGridInterval` picks the X
+                    // pattern for a vertical layer and the Y pattern for a horizontal one.
+                    let step_of = |layer: &str| -> Option<i32> {
+                        let g = tv_grid(layer)?;
+                        let v = if direction_of(&db, layer) == Direction::Vertical {
+                            &g.0
+                        } else {
+                            &g.1
+                        };
+                        (v.len() >= 2).then(|| v[1] - v[0])
+                    };
+                    // 🔑 **The BUILT pitch, which the name does not carry.** See
+                    // `techvia::pitch_on_grid_interval`.
+                    let built_pitch = (
+                        match step_of(if x_up { hi } else { lo }) {
+                            Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.0, st),
+                            None => pitch.0,
+                        },
+                        match step_of(if y_up { hi } else { lo }) {
+                            Some(st) => vyges_pdn::techvia::pitch_on_grid_interval(pitch.1, st),
+                            None => pitch.1,
+                        },
+                    );
+                    let name = if is_array {
+                        vyges_pdn::techvia::array_name(
+                            &via_name, rows, columns, pitch.1, pitch.0, ongrid,
+                        )
+                    } else {
+                        via_name.clone()
+                    };
+                    let spacing =
+                        vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
+                    if is_array
+                        && db
+                            .create_generated_via(
+                                &name,
+                                "", // a tech via answers to no generate rule
+                                (lo, g.cut_layer.as_str(), hi),
+                                single,
+                                spacing,
+                                bot,
+                                top,
+                                rows,
+                                columns,
+                                vyges_pdn::techvia::centre(g.cut_extent),
+                            )
+                            .is_err()
+                    {
+                        continue;
+                    }
+                    // 🔑 **A tech via is placed by its ORIGIN, not by its cut array's centre**,
+                    // and for a via whose cuts do not straddle the origin those are different
+                    // points. `DbTechVia::generate` subtracts `via_center_` — the centre of the
+                    // merged cut extent — from the placement on BOTH of its branches, and the
+                    // same value is handed to the via as its origin, so the cuts land back on
+                    // the crossing centre.
+                    //
+                    // ⚠️ **Only the PLACEMENT moves; the metal does not.** The enclosure rects
+                    // are carried with the via and come out centred on the crossing either way,
+                    // so offsetting the metal too would move it off the shape it is measured
+                    // against. A via with three cuts running 90 units to one side of its origin
+                    // places 45 out of position with no other symptom -- same name, same count,
+                    // same metal.
+                    let origin = vyges_pdn::techvia::centre(g.cut_extent);
+                    // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
+                    // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
+                    // for a generate rule the snapping really does live only in the stacked via
+                    // — but `DbTechVia::generate` populates the grid of either of its own layers
+                    // that the connect named and snaps to it, however short the stack.
+                    // ⚠️ And it picks the layers by a rule of its own: see
+                    // `vias::techvia_snap_sources`, which branches on the layer ABOVE where the
+                    // stacked via branches on the one below.
+                    // ⚠️ **Snapped either side of the origin offset**, in that order — the
+                    // reference snaps the crossing point, subtracts the cut centre, and snaps
+                    // the result again.
+                    let tv_snap = |p: (i32, i32)| {
+                        let sx = match tv_grid(if x_up { hi } else { lo }) {
+                            Some((x, _)) => vyges_pdn::vias::snap_to_grid(p.0, x, 0),
+                            None => p.0,
+                        };
+                        let sy = match tv_grid(if y_up { hi } else { lo }) {
+                            Some((_, y)) => vyges_pdn::vias::snap_to_grid(p.1, y, 0),
+                            None => p.1,
+                        };
+                        (sx, sy)
+                    };
+                    let placed_at: Vec<(i32, i32)> = spots
+                        .iter()
+                        .map(|spot| {
+                            let at = tv_snap(*spot);
+                            tv_snap((at.0 - origin.0, at.1 - origin.1))
+                        })
+                        .collect();
+                    for at in &placed_at {
+                        placements.push((
+                            v.net.clone(),
+                            name.clone(),
+                            *at,
+                            v.lower.clone(),
+                            v.upper.clone(),
+                            v.area,
+                        ));
+                    }
+                    written += spots.len();
+                    if !spots.is_empty() {
+                        via_ok.push((v.net.clone(), (lo.to_string(), hi.to_string()), v.area));
+                    }
+
+                    // A tech via stack passes through layers just as a generated one does, and
+                    // leaves the same DRCFILL patch on them — see `viagen::intermediate_patch`.
+                    let bare = (
+                        (columns - 1) * built_pitch.0 + single.0,
+                        (rows - 1) * built_pitch.1 + single.1,
+                    );
+                    // ⚠️ **Per SPOT** — a split level leaves its own metal at every position.
+                    let metal_at = |spot: (i32, i32), enc: (i32, i32)| {
+                        let (hw, hh) = (bare.0 / 2 + enc.0, bare.1 / 2 + enc.1);
+                        (spot.0 - hw, spot.1 - hh, spot.0 + hw, spot.1 + hh)
+                    };
+                    // ⚠️ **The metal follows the via, not the crossing.** It is carried by the
+                    // via and offset by the same origin, so it sits at the PLACED point plus
+                    // that origin — which is the crossing centre only while nothing snapped.
+                    let base_pi = placements.len() - placed_at.len();
+                    for (k, at) in placed_at.iter().enumerate() {
+                        let centre = (at.0 + origin.0, at.1 + origin.1);
+                        via_faces.push((base_pi + k, lo.to_string(), metal_at(centre, bot), area));
+                        via_faces.push((base_pi + k, hi.to_string(), metal_at(centre, top), area));
+                    }
+                    // ⚠️ **A split-cut array does NOT require a patch** — `DbSplitCutVia` leaves
+                    // `requiresPatch()` at its default however many cuts it places.
+                    let needs_patch = split.is_none() && is_array;
+                    if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
+                        if shared == lo && prev_tops.len() == spots.len() {
+                            for (k, spot) in spots.iter().enumerate() {
+                                for patch in vyges_pdn::viagen::intermediate_patches(
+                                    &[prev_tops[k]],
+                                    &[metal_at(*spot, bot)],
+                                    prev_array || needs_patch,
+                                    db.layer_min_area(lo).unwrap_or(0),
+                                    direction_of(&db, lo),
+                                    grid_mfg,
+                                ) {
+                                    drcfill.push((
+                                        v.net.clone(),
+                                        lo.to_string(),
+                                        patch,
+                                        v.lower.clone(),
+                                        v.upper.clone(),
+                                        v.area,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    previous_top = Some((
+                        hi.to_string(),
+                        spots.iter().map(|s| metal_at(*s, top)).collect(),
+                        needs_patch,
+                    ));
+                    continue;
+                }
+
+                let Some(best) = best else {
+                    continue; // nothing buildable at this level, on any pair
+                };
+                let (rule, cut, pitch, area) = (best.rule, best.cut, best.pitch, best.area);
+                let (rows, columns) = (best.rows, best.columns);
+                let (bot_enc, top_enc) = (best.bot_enc, best.top_enc);
+                // The array the winner's own area lays out, which is not the level's.
+                let spots = spots_in(area);
+                // 🔑 **An ARRAYSPACING via is several base vias on a grid**, so one spot becomes
+                // several placements and the definitions differ by cut count alone. Without a
+                // rule this is the single via at the spot itself, which is the same shape of
+                // answer and needs no branch below.
+                let grid: Vec<vyges_pdn::viagen::ArrayPlacement> = match &best.array {
+                    Some(f) => vyges_pdn::viagen::array_placements(f, cut),
+                    None => vec![vyges_pdn::viagen::ArrayPlacement {
+                        cuts: (columns, rows),
+                        at: (0, 0),
+                    }],
+                };
+
+                // ⚠️ **One definition per distinct CUT COUNT**, which for an array is up to
+                // four and otherwise one. They differ in nothing else: the same rule, the same
+                // pitch, the same enclosures, and the same rect — so the reference's own name,
+                // which carries rows and columns, distinguishes them by itself.
+                let mut names: Vec<((i32, i32), String)> = Vec::new();
+                for p in &grid {
+                    if names.iter().any(|(c, _)| *c == p.cuts) {
+                        continue;
+                    }
+                    let (cols_p, rows_p) = p.cuts;
+                    let params = vyges_pdn::viagen::via_params(
+                        rows_p, cols_p, pitch, cut, bot_enc, top_enc,
+                    );
+                    // The reference's own naming, from `DbGenerateVia::getViaName`: the two
+                    // routing levels, the via's AREA, its rows and columns, then its cut pitch.
+                    // Worth matching exactly — the name is how a DEF diff tells two vias apart,
+                    // and the area in it is an independent check that the via was built in the
+                    // right rect.
+                    let name = format!(
+                        "via{}_{}_{}_{}_{rows_p}_{cols_p}_{}_{}",
+                        routing_level(&db, lo),
+                        routing_level(&db, hi),
+                        area.2 - area.0,
+                        area.3 - area.1,
+                        pitch.0,
+                        pitch.1,
+                    );
+                    // ⚠️ One `dbVia` per distinct geometry, reused wherever needed — the
+                    // reference looks it up by name and creates it only when absent.
+                    if db
+                        .create_generated_via(
+                            &name,
+                            rule.map(|r| r.name.as_str()).unwrap_or(""),
+                            (lo, cut_layer, hi),
+                            params.cut,
+                            params.cut_spacing,
+                            params.bottom_enclosure,
+                            params.top_enclosure,
+                            params.rows,
+                            params.columns,
+                            (0, 0), // a generated via is centred on its own rect already
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    names.push((p.cuts, name));
+                }
+                if names.is_empty() {
+                    continue;
+                }
+                // ⚠️ **Collected, not placed.** A via is a routed special wire, and the write
+                // below clears each net's routed special wires before adding the boxes — so a
+                // via placed here is put in the database and then deleted, leaving a via
+                // DEFINITION with no placements, `add_swire_via` returning success, and nothing
+                // anywhere saying so. The DEF simply comes out with no vias in it.
+                //
+                // 🔑 **The metal is the PLACEMENT's, not the level's.** Each base via of an
+                // array carries its own cut count and therefore its own extent, so `via_faces`
+                // — which is what absorbs via metal back into the shapes it lands on — is
+                // computed per placement rather than once for the level.
+                let mut tops: Vec<Rect> = Vec::new();
+                let mut bots: Vec<Rect> = Vec::new();
+                let mut here = 0;
+                for spot in &spots {
+                    for p in &grid {
+                        let Some((_, name)) = names.iter().find(|(c, _)| *c == p.cuts) else {
+                            continue;
+                        };
+                        let at = (spot.0 + p.at.0, spot.1 + p.at.1);
+                        placements.push((
+                            v.net.clone(),
+                            name.clone(),
+                            at,
+                            v.lower.clone(),
+                            v.upper.clone(),
+                            v.area,
+                        ));
+                        let bare = (
+                            (p.cuts.0 - 1) * pitch.0 + cut.0,
+                            (p.cuts.1 - 1) * pitch.1 + cut.1,
+                        );
+                        let metal_at = |enc: (i32, i32)| {
+                            let (hw, hh) = (bare.0 / 2 + enc.0, bare.1 / 2 + enc.1);
+                            (at.0 - hw, at.1 - hh, at.0 + hw, at.1 + hh)
+                        };
+                        let pi = placements.len() - 1;
+                        via_faces.push((pi, lo.to_string(), metal_at(bot_enc), area));
+                        via_faces.push((pi, hi.to_string(), metal_at(top_enc), area));
+                        bots.push(metal_at(bot_enc));
+                        tops.push(metal_at(top_enc));
+                        here += 1;
+                    }
+                }
+                written += here;
+                if here > 0 {
+                    via_ok.push((v.net.clone(), (lo.to_string(), hi.to_string()), v.area));
+                }
+                // `DbGenerateVia::requiresPatch()` is `rows_ > 1 || cols_ > 1`; a split-cut array
+                // is wrapped in a `DbSplitCutVia`, which does not override the default of false.
+                //
+                // 🔑 **A `DbArrayVia` overrides it to `true` unconditionally** — `via.h:348` —
+                // so an array asks for a patch even where one group holds a single cut.
+                let needs_patch =
+                    split.is_none() && (best.array.is_some() || rows > 1 || columns > 1);
+                if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
+                    if shared == lo && !prev_tops.is_empty() && !bots.is_empty() {
+                        // 🔑 **One patch for the whole level, not one per spot.** The reference
+                        // builds `combine_layer` as the union of EVERY top shape of the
+                        // previous via and EVERY bottom shape of this one, then takes
+                        // `extents()` — a single bounding box spanning them all.
+                        //
+                        // ⚠️ Paired spot by spot instead, each comparison is a face against a
+                        // face at the SAME position, so the box never extends past their union
+                        // and `adds_metal` discards every one. That is why a design whose
+                        // stacks are all arrays produced no patches at all while the reference
+                        // produced forty-eight.
+                        //
+                        // ⚠️ And the two levels need not have the same number of spots — an
+                        // array on one layer pair and a single via on the next is ordinary, and
+                        // requiring equal counts skipped those stacks outright.
+                        //
+                        // 🔑 **The metal goes in as a LIST, not as two bounding boxes.**
+                        // `combine_layer` is a polygon set, and the leftover the patch is
+                        // finally judged on is what that set does NOT cover. Reduced to two
+                        // boxes first the leftover is empty by construction, and an array —
+                        // whose groups leave real gaps — writes no patch at all.
+                        {
+                            for patch in vyges_pdn::viagen::intermediate_patches(
+                                &prev_tops,
+                                &bots,
+                                prev_array || needs_patch,
+                                db.layer_min_area(lo).unwrap_or(0),
+                                direction_of(&db, lo),
+                                grid_mfg,
+                            ) {
+                                drcfill.push((
+                                    v.net.clone(),
+                                    lo.to_string(),
+                                    patch,
+                                    v.lower.clone(),
+                                    v.upper.clone(),
+                                    v.area,
+                                ));
+                            }
+                        }
+                    }
+                }
+                previous_top = Some((hi.to_string(), tops, needs_patch));
+            }
+
+            // ── this via's metal, merged back into the two shapes it landed on ────────────
+            // 🔑 **Only the two ENDS.** `check_shapes` is called on `shapes.bottom` against
+            // `lower_` and on `shapes.top` against `upper_`; a stack's intermediate metal is
+            // `shapes.middle` and is never merged into anything — it only decides which vias a
+            // ripup takes with it.
+            // ⚠️ Growth only. A refusal here is a RIPUP, and that is decided after trimming,
+            // against the trimmed shape — see the absorb pass. Ripping up here would judge a
+            // via against a strap that has not been pulled back yet.
+            for (key, layer) in [(&lower_key, &v.lower), (&upper_key, &v.upper)] {
+                let metals: Vec<Rect> = via_faces[faces_before..]
+                    .iter()
+                    .filter(|(_, l, _, _)| l == layer)
+                    .map(|(_, _, m, _)| *m)
+                    .collect();
+                if metals.is_empty() {
+                    continue;
+                }
+                let Some(si) = emitted.iter().position(|(n, l, r, _)| {
+                    n == &v.net && l == layer && overlaps(*r, key.2)
+                }) else {
+                    continue;
+                };
+                // ⚠️ **Measured against the shape being MODIFIED, not against the rect the stack
+                // was sized from.** `check_shapes` takes one `shape` and both merges into it and
+                // asks whether the merge is allowed. Sizing from one rect and growing another lets
+                // a ring corner answer for its neighbour: the metal already sits inside the
+                // neighbour, the check reports it fits, and the shape that actually carries the
+                // via is never grown — three ring segments 20 units short, and nothing else wrong.
+                let cur = emitted[si].2;
+                // ⚠️ **`PDN_GROW_TRACE` prints the shape a via is about to grow and the metal it
+                // is grown by.** A shape that comes out short says nothing about which of the two
+                // is wrong; seeing them together does.
+                if std::env::var_os("PDN_GROW_TRACE").is_some() {
+                    eprintln!(
+                        "[grow] {}|{layer}|shape {:?} type {} metals {:?}",
+                        v.net, cur, emitted[si].3, metals
+                    );
+                }
+                let dir = if emitted[si].3 == "FOLLOWPIN" {
+                    match vyges_pdn::viagen::rect_direction(emitted[si].2) {
+                        Direction::None => direction_of(&db, layer),
+                        d => d,
+                    }
+                } else {
+                    direction_of(&db, layer)
+                };
+                let obstructions: Vec<Rect> = blockages
+                    .iter()
+                    .filter(|(l, ..)| l == layer)
+                    .map(|(_, r, ..)| *r)
+                    .collect();
+                // ⚠️ **Into `emitted` itself, which is what `check_shapes` does.** It calls
+                // `shape->setRect(new_shape)`, so the grown shape IS the shape from that moment on
+                // — for the next via in this same pass, and for the write. Holding the growth to
+                // one side and applying it afterwards grows twice: once against the shape the
+                // crossing saw, and again against the shape the pass left behind.
+                let _ = &key;
+                if let vyges_pdn::shapes::ViaCheck::Extend(g) =
+                    vyges_pdn::shapes::check_via_shapes(
+                        cur,
+                        &metals,
+                        dir,
+                        !(emitted[si].3 == "RING" && locked_layers.contains(layer)),
+                        &obstructions,
+                    )
+                {
+                    emitted[si].2 = g;
+                }
+            }
+        }
+        eprintln!(
+            "vyges-pdn: {} via locations, {} dropped, {written} written",
+            placed.len(),
+            dropped.len()
+        );
     }
 
     // ── absorb via metal ─────────────────────────────────────────────────────────────────────
