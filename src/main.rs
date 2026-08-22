@@ -4105,10 +4105,26 @@ fn generate(args: &[String]) -> ExitCode {
             // connection — which is what holds an extended ring out to its full length.
             let vias_only = held.clone();
             let mut held = held;
+            // ⚠️ **The layer's MINIMUM width, not its default width.** `GridComponent::addShape`
+            // measures the sliver with `getLayer()->getMinWidth()`, and the same rects feed both
+            // the connection count here and the pin geometry written at the end — one rule, one
+            // depth. This read was `getWidth()`, which is the LEF `WIDTH` and only equals
+            // `MINWIDTH` when a layer declares no separate minimum.
+            //
+            // ℹ️ No routing layer in Nangate45, ASAP7 or sky130 declares them differently, so the
+            // suite cannot tell the two apart — the correction is from the source, not from a
+            // failing case.
+            //
+            // ⛔ **Computed in two places on purpose, and they are NOT the same rect.** This one is
+            // deliberately unclamped so that an offcut inherits a sliver sticking out of it and is
+            // removed; the one published as pin geometry is clamped to the shape, as the reference
+            // clamps it at the moment it first records it. Both approximate "compute once when the
+            // shape is added, inherit through every cut". Unifying them means modelling that
+            // inheritance properly, which is its own change.
             held.extend(vyges_pdn::trim::boundary_pins(
                 rect,
                 die,
-                (db.layer_get_width(&layer) as i32).max(1),
+                (db.layer_get_min_width(&layer) as i32).max(1),
             ));
             // ⚠️ The LAYER's direction here, and that is correct: base `Shape::getLayerDirection`
             // returns exactly that. Only `FollowPinShape` overrides it, and that path is below.
