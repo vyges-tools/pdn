@@ -9,7 +9,7 @@
 //! It belongs to the binary, not the library: `lib.rs` does not declare it.
 
 use vyges_opendb::Db;
-use vyges_pdn::{followpins, Direction, Rect};
+use vyges_pdn::{followpins, validate, Direction, Rect};
 
 /// Micron to database units. ⚠️ Rounded, not truncated: `0.93` at 2000 dbu is 1860 exactly, but a
 /// value like `2.0005` truncates to one unit less and every shape built from it is off by one.
@@ -467,6 +467,43 @@ pub(crate) fn obstruction_spacing(db: &Db, layer: &str, width: i32, length: i32)
     let db_spacing = db.layer_get_spacing_for(layer, width, length).unwrap_or(0);
     let two_widths = db.layer_find_tw_spacing(layer, width, width, length).unwrap_or(0);
     db_spacing.max(two_widths)
+}
+
+/// What a layer permits a grid component to state, for [`vyges_pdn::validate`].
+///
+/// ℹ️ Read once per layer per run. Every field is a plain technology fact; the rules that read them
+/// live in the library, where they can be tested without a LEF file.
+pub(crate) fn layer_rules(db: &Db, layer: &str) -> Option<validate::LayerRules> {
+    // ⚠️ **An unknown layer must answer `None`, never a rule set of zeroes.** Every generated
+    // accessor reports a missing layer as `0`, and a maximum width of zero refuses every shape —
+    // so a mistyped layer name would come back as a width violation on a layer that does not
+    // exist. Naming a layer the technology does not have is its own diagnostic, raised elsewhere.
+    if db.layer_get_type(layer).unwrap_or_default().is_empty() {
+        return None;
+    }
+    Some(validate::LayerRules {
+        name: layer.to_string(),
+        min_width: db.layer_get_min_width(layer) as i32,
+        // ⚠️ **An undeclared MAXWIDTH reads back as a very large number, not as zero** — odb's own
+        // default. Clamping it here would refuse every wide strap in a technology that states no
+        // maximum at all.
+        max_width: db.layer_get_max_width(layer).min(i32::MAX as u32) as i32,
+        direction: direction_of(db, layer),
+        width_tables: db.layer_width_tables(layer).unwrap_or_default(),
+        // ⚠️ The TECHNOLOGY's units, which is what the reference renders a diagnostic with
+        // (`TechLayer::getLefUnits`), not the block's DEF units. They usually agree and the
+        // message is wrong by a factor of the ratio when they do not.
+        units_per_micron: db.tech_get_db_units_per_micron(),
+        manufacturing_grid: db.manufacturing_grid().unwrap_or_default(),
+    })
+}
+
+/// The minimum spacing beside a shape of `width`, as `TechLayer::getSpacing(width)` answers it.
+///
+/// Same rule as [`obstruction_spacing`] with a zero run length, named separately because this one
+/// is a limit a stated spacing is CHECKED against rather than a keep-out geometry is built from.
+pub(crate) fn min_spacing_for(db: &Db, layer: &str, width: i32) -> i32 {
+    obstruction_spacing(db, layer, width, 0)
 }
 
 /// What a `kOverPads` connection needs in order to be REFINED after every component is built.

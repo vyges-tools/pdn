@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use vyges_opendb::Db;
-use vyges_pdn::{followpins, nets, rings, shapes, straps, Direction, Rect};
+use vyges_pdn::{followpins, nets, rings, shapes, straps, validate, Direction, Rect};
 
 /// Every read of the database lives here, so this file holds the pipeline and nothing else.
 mod components;
@@ -309,6 +309,192 @@ fn instance_pin_outline(db: &Db, inst: &str) -> Option<Rect> {
             (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)),
         )
     })
+}
+
+/// Every declared component's dimensions, checked before anything is built.
+///
+/// 🔑 **The reference checks these when the component is DECLARED, not when the grid is built** —
+/// `addRing` and `addStrap` validate and then push, so a refused component is never added and the
+/// `add_pdn_*` command itself is what fails. Running the whole pass up front here is the same
+/// thing: the first violation ends the run with the reference's own diagnostic, and no DEF is
+/// written.
+///
+/// ⚠️ **Order within a grid is rings, then straps** — `Grid::checkSetup`'s own order, and the order
+/// the commands are issued in. ℹ️ Across component KINDS this engine cannot reproduce declaration
+/// order exactly: follow pins and stripes reach it as two lists, so a design interleaving them and
+/// breaking a rule in both would report the follow pin's where the reference reports whichever came
+/// first. No upstream case does that; recorded here rather than assumed away.
+fn validate_grids(
+    db: &Db,
+    grids: &[(GridSpec, Opts)],
+    build_nets: &[String],
+    per_micron: f64,
+) -> Option<validate::Diag> {
+    // ⚠️ **A follow pin takes its direction from the ROWS, not from its layer** — and that is what
+    // decides whether a layer's width table governs it at all. With no rows the reference leaves
+    // the direction the strap constructor set, which is the layer's own.
+    let row_direction = match db.nth_row_direction(0).unwrap_or_default().as_str() {
+        "HORIZONTAL" => Some(Direction::Horizontal),
+        "VERTICAL" => Some(Direction::Vertical),
+        _ => None,
+    };
+
+    for (g, o) in grids {
+        let net_count = grid_net_count(db, o, g, build_nets);
+
+        for spec in o.all("ring") {
+            // `<layer0>,<layer1>:<w0>,<w1>:<s0>,<s1>:<offsets>[:boundary][:kind]`
+            let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
+            let mut names = layers.split(',');
+            let l0 = names.next().unwrap_or("");
+            let l1 = names.next().unwrap_or(l0);
+            let p: Vec<&str> = rest.split(':').collect();
+            // ⚠️ One value expands to two, one per layer — `pdn::get_one_to_two`.
+            let pair = |field: Option<&&str>| -> (i32, i32) {
+                let v: Vec<i32> = field
+                    .unwrap_or(&"0")
+                    .split(',')
+                    .map(|x| dbu(x, per_micron))
+                    .collect();
+                match v.len() {
+                    0 => (0, 0),
+                    1 => (v[0], v[0]),
+                    _ => (v[0], v[1]),
+                }
+            };
+            let (w0, w1) = pair(p.first());
+            let (s0, s1) = pair(p.get(1));
+            let offs: Vec<i32> = p
+                .get(2)
+                .unwrap_or(&"0")
+                .split(',')
+                .map(|v| dbu(v, per_micron))
+                .collect();
+            // One value expands to four and two to `{a b a b}` — `pdn::get_one_to_four`.
+            let off4 = match offs.len() {
+                0 => [0; 4],
+                1 => [offs[0]; 4],
+                2 => [offs[0], offs[1], offs[0], offs[1]],
+                _ => [offs[0], offs[1], offs[2], offs[3]],
+            };
+            for (layer, width, spacing) in [(l0, w0, s0), (l1, w1, s1)] {
+                if layer.is_empty() {
+                    continue;
+                }
+                let Some(rules) = layer_rules(db, layer) else {
+                    continue;
+                };
+                let min_spacing = min_spacing_for(db, layer, width);
+                if let Some(d) =
+                    validate::check_ring_layer(&rules, width, spacing, min_spacing, &off4)
+                {
+                    return Some(d);
+                }
+            }
+        }
+
+        for spec in o.all("followpins") {
+            // `<layer>[:<extend>[:<width>]]`
+            let mut f = spec.splitn(3, ':');
+            let layer = f.next().unwrap_or("");
+            let _extend = f.next();
+            if layer.is_empty() {
+                continue;
+            }
+            // ⚠️ A stated width REPLACES the cell-derived one; the cells are asked only when the
+            // command states none.
+            let width = f
+                .next()
+                .filter(|w| !w.is_empty())
+                .map(|w| dbu(w, per_micron))
+                .filter(|w| *w > 0)
+                .unwrap_or_else(|| followpin_width(db).unwrap_or(0));
+            let Some(rules) = layer_rules(db, layer) else {
+                continue;
+            };
+            let direction = row_direction.unwrap_or(rules.direction);
+            // ⚠️ **A follow pin is checked for its WIDTH and nothing else.** It has no stated
+            // spacing, pitch or offset — the rows give it all three — so the reference's
+            // `FollowPins::checkLayerSpecifications` calls `checkLayerWidth` alone.
+            if let Some(d) = validate::check_width(&rules, width, direction) {
+                return Some(d);
+            }
+        }
+
+        for spec in o.all("stripe") {
+            // `<layer>:<width>:<pitch>:<offset>[:<extend>[:<count>[:<snap>[:<spacing>...]]]]`
+            let (layer, rest) = spec.split_once(':').unwrap_or((spec, ""));
+            if layer.is_empty() {
+                continue;
+            }
+            let p: Vec<&str> = rest.split(':').collect();
+            let width = dbu(p.first().copied().unwrap_or("0"), per_micron);
+            let pitch = dbu(p.get(1).copied().unwrap_or("0"), per_micron);
+            let offset = dbu(p.get(2).copied().unwrap_or("0"), per_micron);
+            let Some(rules) = layer_rules(db, layer) else {
+                continue;
+            };
+            // A stated `-spacing` wins; only in its absence is one derived — the same rule the
+            // build uses, because the reference derives it in the strap's constructor and then
+            // checks the value it derived.
+            let spacing = p
+                .get(6)
+                .filter(|s| !s.is_empty())
+                .map(|s| dbu(s, per_micron))
+                .filter(|s| *s > 0)
+                .unwrap_or_else(|| {
+                    straps::default_spacing(
+                        pitch,
+                        net_count,
+                        width,
+                        rules.manufacturing_grid.unwrap_or(1),
+                    )
+                });
+            let dims = validate::StrapDims {
+                width,
+                spacing,
+                pitch,
+                offset,
+                min_spacing: min_spacing_for(db, layer, width),
+            };
+            if let Some(d) = validate::check_strap(&rules, dims, rules.direction) {
+                return Some(d);
+            }
+        }
+    }
+    None
+}
+
+/// **`GridComponent::getNetCount()`** — how many nets this grid builds for.
+///
+/// 🔑 A region domain's own supplies where the grid has a region, the instance's CONNECTED supplies
+/// where it grids one, and the block's otherwise.
+///
+/// ⚠️ **A switched domain has three, not two.** The count decides how far a ring keep-out reaches
+/// and what a strap set's derived spacing is, so one net too few moves geometry rather than just
+/// miscounting.
+fn grid_net_count(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> i32 {
+    if let Some(spec) = o.one("domain") {
+        let f: Vec<&str> = spec.split(':').collect();
+        let secondary = f
+            .get(3)
+            .map(|s| s.split(',').filter(|x| !x.is_empty()).count())
+            .unwrap_or(0);
+        let switched = usize::from(f.get(4).is_some_and(|s| !s.is_empty()));
+        return (2 + switched + secondary) as i32;
+    }
+    if !g.instance.is_empty() {
+        // The nets the INSTANCE is wired to, the same test the build loop makes.
+        let master = db.inst_get_master(&g.instance);
+        let connected: Vec<String> = db
+            .master_get_m_terms(&master)
+            .iter()
+            .map(|term| db.iterm_get_net(&g.instance, term))
+            .filter(|n| !n.is_empty())
+            .collect();
+        return build_nets.iter().filter(|n| connected.contains(n)).count() as i32;
+    }
+    build_nets.len() as i32
 }
 
 /// One declared grid: which instance it belongs to, if any, and how it is bounded.
@@ -2148,6 +2334,13 @@ fn generate(args: &[String]) -> ExitCode {
         })
         .collect();
 
+    // ── what the technology allows a component to state ─────────────────────────────────────
+    // 🔑 **Before anything is built, and the first violation ends the run.** See `validate_grids`.
+    if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron) {
+        eprintln!("{d}");
+        return ExitCode::from(1);
+    }
+
     // ── each grid's own keep-out, for every OTHER grid ───────────────────────────────────────
     // 🔑 **`Grid::getGridLevelObstructions` gives every grid a blanket over the area it occupies**,
     // on the layers it uses: its strap layers and the intermediate routing layers of its connects.
@@ -2201,32 +2394,9 @@ fn generate(args: &[String]) -> ExitCode {
                 }
                 (b[0], b[1], b[2], b[3])
             };
-            // 🔑 **How many rings nest, which is how far the keep-out reaches.**
-            // `Rings::getNetCount()` is the grid's net count: a region domain's own supplies where
-            // it has a region, the instance's connected nets where it grids one, and the block's
-            // otherwise. ⚠️ A switched domain has three, not two, and the third ring is what puts
-            // the keep-out a full pitch further out.
-            let ring_nets: i32 = if let Some(spec) = o.one("domain") {
-                let f: Vec<&str> = spec.split(':').collect();
-                let secondary = f
-                    .get(3)
-                    .map(|s| s.split(',').filter(|x| !x.is_empty()).count())
-                    .unwrap_or(0);
-                let switched = usize::from(f.get(4).is_some_and(|s| !s.is_empty()));
-                (2 + switched + secondary) as i32
-            } else if !g.instance.is_empty() {
-                // The nets the INSTANCE is wired to, the same test the build loop makes.
-                let master = db.inst_get_master(&g.instance);
-                let connected: Vec<String> = db
-                    .master_get_m_terms(&master)
-                    .iter()
-                    .map(|term| db.iterm_get_net(&g.instance, term))
-                    .filter(|n| !n.is_empty())
-                    .collect();
-                build_nets.iter().filter(|n| connected.contains(n)).count() as i32
-            } else {
-                build_nets.len() as i32
-            };
+            // 🔑 **How many rings nest, which is how far the keep-out reaches** — the grid's own
+            // net count, which is also what a strap set divides its pitch by.
+            let ring_nets: i32 = grid_net_count(&db, o, g, &build_nets);
             // Its strap layers, plus every routing layer its connects pass through.
             let mut layers: Vec<String> = Vec::new();
             for s in o.all("stripe") {

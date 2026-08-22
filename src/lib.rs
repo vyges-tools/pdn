@@ -23,6 +23,9 @@
 //!   the next test sees.
 //! - **[`viagen`]** — which via to build there. Two preference orders that look alike, are spelled
 //!   alike, and run in opposite directions: enclosures pick the smallest, generators the largest.
+//! - **[`validate`]** — the checks a component's stated dimensions must pass to be accepted at
+//!   all. Run when the component is declared rather than when the grid is built, and the FIRST
+//!   rule to fire is the whole answer.
 //! - **[`trim`]** — pulling each shape back to what actually connects to it, and removing what does
 //!   not. Runs after the vias and cannot be decided before them.
 //!
@@ -41,6 +44,7 @@ pub mod straps;
 pub mod switches;
 pub mod techvia;
 pub mod trim;
+pub mod validate;
 pub mod viagen;
 pub mod vias;
 
