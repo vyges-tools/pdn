@@ -543,6 +543,34 @@ mod tests {
     }
 
     #[test]
+    fn the_grid_is_the_TECHNOLOGYS_and_a_divisor_of_it_is_not_the_same_rule() {
+        // Upstream rule: `Straps::Straps` snaps the spacing it derives with
+        // `TechLayer::snapToManufacturingGrid(tech, spacing_, false)` — the technology's own grid,
+        // at multiplier 1. Nangate45 states 0.005 um at 2000 DBU per micron, which is 10.
+        //
+        // ⚠️ **The trap: a DIVISOR of the real grid agrees wherever the value is already on it.**
+        // The call site passed a literal 5 for years and matched on every comparable case, because
+        // `pitch / nets - width` happened to be even each time. It disagrees the moment it is not,
+        // and then lands the whole strap group half a grid step off.
+        assert_eq!(default_spacing(20000, 2, 1860, 10), 8140, "already on the grid");
+        assert_eq!(default_spacing(20000, 2, 1860, 5), 8140, "and a divisor agrees there");
+        // 20010/2 - 1860 = 8145, which is on a grid of 5 and not on a grid of 10.
+        assert_eq!(default_spacing(20010, 2, 1860, 10), 8140);
+        assert_eq!(
+            default_spacing(20010, 2, 1860, 5),
+            8145,
+            "a divisor of the grid keeps a position the technology cannot manufacture"
+        );
+    }
+
+    #[test]
+    fn a_technology_stating_no_grid_snaps_nothing() {
+        // Upstream rule: `snapToManufacturingGrid` returns the position unchanged when
+        // `hasManufacturingGrid()` is false. A grid of 1 is that, arithmetically.
+        assert_eq!(default_spacing(20011, 2, 1860, 1), 8145);
+    }
+
+    #[test]
     fn a_value_already_on_the_manufacturing_grid_is_left_alone() {
         assert_eq!(snap_to_manufacturing_grid(100, 5, false), 100);
         assert_eq!(

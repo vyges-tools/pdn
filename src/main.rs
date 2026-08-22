@@ -1619,7 +1619,25 @@ fn make_strap(
                         // ⚠️ The GRID's net count, not the strap's. This runs before the two
                         // `-nets`/`-starts_with` overrides below shadow the list, and the
                         // reference derives the default spacing the same way.
-                        straps::default_spacing(pitch, grid_nets.len() as i32, width, 5)
+                        //
+                        // ⚠️ **The TECHNOLOGY's manufacturing grid, read from the database.**
+                        // `Straps::Straps` snaps the value it derives with
+                        // `TechLayer::snapToManufacturingGrid(tech, spacing_, false)` — the
+                        // technology's own grid, at multiplier 1. A literal here was 5, which is
+                        // Nangate45's grid HALVED (0.005 um at 2000 DBU/um is 10) and five times
+                        // ASAP7's, so the derived spacing was snapped onto a lattice no technology
+                        // has. It survived because snapping to a divisor of the real grid is a
+                        // no-op whenever the value is already on it.
+                        //
+                        // ⚠️ A technology stating no grid must not snap at all, which `1` is:
+                        // `snapToManufacturingGrid` returns the position unchanged when
+                        // `hasManufacturingGrid()` is false.
+                        straps::default_spacing(
+                            pitch,
+                            grid_nets.len() as i32,
+                            width,
+                            db.manufacturing_grid().unwrap_or_default().unwrap_or(1),
+                        )
                     }),
                 pitch,
                 offset: dbu(p.get(2).copied().unwrap_or("0"), per_micron),
