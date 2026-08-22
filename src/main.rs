@@ -2313,6 +2313,28 @@ fn generate(args: &[String]) -> ExitCode {
     let mut ring_shapes: Vec<(String, Rect)> = Vec::new();
     // Layers whose ring shapes are locked, and so cannot be modified later.
     let mut locked_layers: Vec<String> = Vec::new();
+    // ── where a shape meets the die edge ─────────────────────────────────────────────────────
+    // 🔑 **Recorded per grid, on the shapes as BUILT** — `GridComponent::addShape` gives a shape
+    // whose edge lands exactly on the die boundary a connection one layer `minWidth` deep, and it
+    // does so the moment the shape is added: before `repairVias` reaches it, before trimming, and
+    // before any via metal is absorbed.
+    //
+    // ⚠️ **The moment is the whole of it, and it took three attempts to place.**
+    // `via_metal_overhangs_shape` builds its metal4 strap at `y = 0`, which earns a connection;
+    // `repairVias` then pulls the strap to `y = -170` to reach the rail below it, and a capture
+    // taken any later sees a shape that no longer touches the edge. The engine's own trace is what
+    // said so, after two readings of the source did not:
+    //
+    // ```text
+    // [repair] VSS|metal4|(3520, 0, 4480, 200780) -> (3520, -170, 4480, 200780)
+    // ```
+    //
+    // ⚠️ **All four edges, independently** — a shape reaching a corner earns two.
+    //
+    // Each entry is `(net, layer, on the x axis, the slice)`. The slice's CROSS extent is refreshed
+    // from the surviving shape at write time, which is what `Shape::writeToDb` does.
+    let mut edge_connections: Vec<(String, String, bool, Rect)> = Vec::new();
+
     // Every grid this run declares, in the order `buildGrids` would build them.
     // ⚠️ **One `-macro` declaration can name several instances, and each is its own grid** with
     // the same components. Expanded here so the loop below never has to know.
@@ -3762,6 +3784,30 @@ fn generate(args: &[String]) -> ExitCode {
             //
             // ⚠️ **Once, not until nothing changes.** The reference tests the return value and rebuilds
             // a single time; looping would keep growing shapes past what it produces.
+            // The die edges this grid's shapes touch, taken before `repairVias` can move them.
+            for (net, layer, rect, shape) in &emitted[grid_shapes_from..] {
+                if *shape == "SWITCH" {
+                    continue;
+                }
+                let mw = db.layer_get_min_width(layer) as i32;
+                if rect.0 == die.0 {
+                    edge_connections.push((net.clone(), layer.clone(), true,
+                        (die.0, rect.1, (die.0 + mw).min(rect.2), rect.3)));
+                }
+                if rect.2 == die.2 {
+                    edge_connections.push((net.clone(), layer.clone(), true,
+                        ((die.2 - mw).max(rect.0), rect.1, die.2, rect.3)));
+                }
+                if rect.1 == die.1 {
+                    edge_connections.push((net.clone(), layer.clone(), false,
+                        (rect.0, die.1, rect.2, (die.1 + mw).min(rect.3))));
+                }
+                if rect.3 == die.3 {
+                    edge_connections.push((net.clone(), layer.clone(), false,
+                        (rect.0, (die.3 - mw).max(rect.1), rect.2, die.3)));
+                }
+            }
+
             let (placed, dropped) = if repair_vias(
                 &db,
                 &mut emitted,
@@ -4002,56 +4048,6 @@ fn generate(args: &[String]) -> ExitCode {
     // trimming just as loudly as `--trim 1` — so a run meant to reproduce `pdngen -skip_trim`
     // trimmed anyway, and every shape it should have kept was compared against a reference that
     // had kept its own.
-    // ── where a shape meets the die edge ─────────────────────────────────────────────────────
-    // 🔑 **Recorded HERE, on the shape as it was built** — `GridComponent::addShape` gives a shape
-    // whose edge lands exactly on the die boundary a connection rect one `minWidth` deep from that
-    // edge, and it does so as the shape is added: before trimming, and before via metal grows it.
-    //
-    // ⚠️ **Computing it from the final shape gets the wrong answer**, and `via_metal_overhangs_shape`
-    // is the case that shows it. Its metal4 stripe runs to `y = 0` when built, so it earns a
-    // connection; absorbing via metal then stretches it to `y = -170`, and a rule reading the
-    // final rect sees a shape that no longer touches the edge and publishes nothing. The reference
-    // keeps the connection it already had.
-    //
-    // ⚠️ **All four edges, independently** — a shape reaching a corner earns two.
-    //
-    // Each entry is `(net, layer, on the x axis, the slice)`. The slice's CROSS extent is
-    // refreshed from the surviving shape at write time, which is what `Shape::writeToDb` does.
-    //
-    // ⛔ **KNOWN GAP, and it is not this rule.** Two cases still differ here, and the cause is that
-    // our shapes reach this point already carrying via metal the reference absorbs only at the very
-    // end. On `via_metal_overhangs_shape` the die is `(0, 0, 200260, 201600)` and our VSS metal4
-    // straps are already `(3520, -170, 4480, 200780)` — grown past the die edge by the rail via
-    // below them — so none of the four tests fires, while the reference's shape still sits at
-    // `y = 0` and earns a connection. ⚠️ **The FINAL geometry is identical either way**, which is
-    // why shapes and vias never showed it; the terminal is what the ordering difference leaks into.
-    // Fixing it means moving that growth after the trim, not patching this rule.
-    let edge_connections: Vec<(String, String, bool, Rect)> = {
-        let mut out = Vec::new();
-        for (net, layer, rect, shape) in &emitted {
-            if *shape == "SWITCH" {
-                continue;
-            }
-            let mw = db.layer_get_min_width(layer) as i32;
-            if rect.0 == die.0 {
-                out.push((net.clone(), layer.clone(), true,
-                          (die.0, rect.1, (die.0 + mw).min(rect.2), rect.3)));
-            }
-            if rect.2 == die.2 {
-                out.push((net.clone(), layer.clone(), true,
-                          ((die.2 - mw).max(rect.0), rect.1, die.2, rect.3)));
-            }
-            if rect.1 == die.1 {
-                out.push((net.clone(), layer.clone(), false,
-                          (rect.0, die.1, rect.2, (die.1 + mw).min(rect.3))));
-            }
-            if rect.3 == die.3 {
-                out.push((net.clone(), layer.clone(), false,
-                          (rect.0, (die.3 - mw).max(rect.1), rect.2, die.3)));
-            }
-        }
-        out
-    };
     if opts.one("trim").is_some_and(|v| v != "0") {
         let pin_layers: Vec<String> = opts
             .all("pins")
