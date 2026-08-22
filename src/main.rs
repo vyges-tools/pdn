@@ -4002,6 +4002,56 @@ fn generate(args: &[String]) -> ExitCode {
     // trimming just as loudly as `--trim 1` — so a run meant to reproduce `pdngen -skip_trim`
     // trimmed anyway, and every shape it should have kept was compared against a reference that
     // had kept its own.
+    // ── where a shape meets the die edge ─────────────────────────────────────────────────────
+    // 🔑 **Recorded HERE, on the shape as it was built** — `GridComponent::addShape` gives a shape
+    // whose edge lands exactly on the die boundary a connection rect one `minWidth` deep from that
+    // edge, and it does so as the shape is added: before trimming, and before via metal grows it.
+    //
+    // ⚠️ **Computing it from the final shape gets the wrong answer**, and `via_metal_overhangs_shape`
+    // is the case that shows it. Its metal4 stripe runs to `y = 0` when built, so it earns a
+    // connection; absorbing via metal then stretches it to `y = -170`, and a rule reading the
+    // final rect sees a shape that no longer touches the edge and publishes nothing. The reference
+    // keeps the connection it already had.
+    //
+    // ⚠️ **All four edges, independently** — a shape reaching a corner earns two.
+    //
+    // Each entry is `(net, layer, on the x axis, the slice)`. The slice's CROSS extent is
+    // refreshed from the surviving shape at write time, which is what `Shape::writeToDb` does.
+    //
+    // ⛔ **KNOWN GAP, and it is not this rule.** Two cases still differ here, and the cause is that
+    // our shapes reach this point already carrying via metal the reference absorbs only at the very
+    // end. On `via_metal_overhangs_shape` the die is `(0, 0, 200260, 201600)` and our VSS metal4
+    // straps are already `(3520, -170, 4480, 200780)` — grown past the die edge by the rail via
+    // below them — so none of the four tests fires, while the reference's shape still sits at
+    // `y = 0` and earns a connection. ⚠️ **The FINAL geometry is identical either way**, which is
+    // why shapes and vias never showed it; the terminal is what the ordering difference leaks into.
+    // Fixing it means moving that growth after the trim, not patching this rule.
+    let edge_connections: Vec<(String, String, bool, Rect)> = {
+        let mut out = Vec::new();
+        for (net, layer, rect, shape) in &emitted {
+            if *shape == "SWITCH" {
+                continue;
+            }
+            let mw = db.layer_get_min_width(layer) as i32;
+            if rect.0 == die.0 {
+                out.push((net.clone(), layer.clone(), true,
+                          (die.0, rect.1, (die.0 + mw).min(rect.2), rect.3)));
+            }
+            if rect.2 == die.2 {
+                out.push((net.clone(), layer.clone(), true,
+                          ((die.2 - mw).max(rect.0), rect.1, die.2, rect.3)));
+            }
+            if rect.1 == die.1 {
+                out.push((net.clone(), layer.clone(), false,
+                          (rect.0, die.1, rect.2, (die.1 + mw).min(rect.3))));
+            }
+            if rect.3 == die.3 {
+                out.push((net.clone(), layer.clone(), false,
+                          (rect.0, (die.3 - mw).max(rect.1), rect.2, die.3)));
+            }
+        }
+        out
+    };
     if opts.one("trim").is_some_and(|v| v != "0") {
         let pin_layers: Vec<String> = opts
             .all("pins")
@@ -6332,21 +6382,57 @@ fn generate(args: &[String]) -> ExitCode {
     //
     // ⚠️ **After trimming, not before.** `emitted` here is what survived, and a shape trimmed away
     // is not a pin — publishing one would advertise metal the DEF does not contain.
-    if !pin_layers.is_empty() {
-        let mut pin_boxes = 0;
-        for (net, layer, rect, shape) in &emitted {
-            if *shape == "SWITCH" || !pin_layers.iter().any(|l| l == layer) {
-                continue;
-            }
-            if let Some(bterm) = bterm_of.get(net) {
-                match db.bterm_add_pin_box(bterm, layer, *rect) {
-                    Ok(true) => pin_boxes += 1,
-                    Ok(false) => {}
-                    Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
-                }
+    let mut pin_boxes = 0;
+    let mut edge_boxes = 0;
+    for (net, layer, rect, shape) in &emitted {
+        if *shape == "SWITCH" {
+            continue;
+        }
+        let Some(bterm) = bterm_of.get(net) else {
+            continue;
+        };
+        // A `-pins` layer publishes the WHOLE shape.
+        if pin_layers.iter().any(|l| l == layer) {
+            match db.bterm_add_pin_box(bterm, layer, *rect) {
+                Ok(true) => pin_boxes += 1,
+                Ok(false) => {}
+                Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
             }
         }
-        eprintln!("vyges-pdn: {pin_boxes} pin shapes on {}", pin_layers.join(","));
+    }
+
+    // The die-edge connections recorded before trimming, refreshed against what survived.
+    //
+    // ⚠️ **A connection whose shape is gone is gone with it** — `updateIBTermConnections` drops any
+    // that no longer overlaps its shape, so a strap trimmed away from the edge publishes nothing.
+    //
+    // ⚠️ **The CROSS extent comes from the surviving shape, the depth from the edge.** For a
+    // connection on the x axis the y span is refreshed and the x span is the slice; on the y axis
+    // it is the other way round. Keeping the recorded rect wholesale would publish the shape's
+    // extent as it was before trimming.
+    for (net, layer, on_x, slice) in &edge_connections {
+        let Some(bterm) = bterm_of.get(net) else {
+            continue;
+        };
+        let Some((_, _, live, _)) = emitted
+            .iter()
+            .find(|(n, l, r, s)| n == net && l == layer && *s != "SWITCH" && overlaps(*r, *slice))
+        else {
+            continue;
+        };
+        let r = if *on_x {
+            (slice.0, live.1, slice.2, live.3)
+        } else {
+            (live.0, slice.1, live.2, slice.3)
+        };
+        match db.bterm_add_pin_box(bterm, layer, r) {
+            Ok(true) => edge_boxes += 1,
+            Ok(false) => {}
+            Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
+        }
+    }
+    if pin_boxes + edge_boxes > 0 {
+        eprintln!("vyges-pdn: {pin_boxes} pin shapes, {edge_boxes} at the die edge");
     }
 
     // 🔑 **A terminal this run created and then left empty is destroyed.** `PdnGen::writeToDb`
