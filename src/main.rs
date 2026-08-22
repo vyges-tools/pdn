@@ -3834,6 +3834,17 @@ fn generate(args: &[String]) -> ExitCode {
                     .iter()
                     .map(|l| via_min_width(&db, l, &rules))
                     .collect();
+                // ⚠️ **`PDN_MINW_TRACE` prints the two END rects and each intermediate's target
+                // width.** It is the instrument that separates a wrong min-width from a right one
+                // measured against the wrong shape — the two produce the same symptom, an
+                // intermediate rect of the wrong height, and nothing else distinguishes them.
+                if std::env::var_os("PDN_MINW_TRACE").is_some() {
+                    eprintln!(
+                        "[minw] {}->{} lower {:?} upper {:?} intermediate {:?} raw {:?} via {:?}",
+                        v.lower, v.upper, lower_rect, upper_rect, intermediate, raw_min_widths,
+                        via_min_widths
+                    );
+                }
                 let rects = vyges_pdn::vias::stack_rects_tapered(
                     lower_rect,
                     upper_rect,
