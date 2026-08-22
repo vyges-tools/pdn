@@ -6156,6 +6156,88 @@ fn generate(args: &[String]) -> ExitCode {
     for (net, _, _, _) in &emitted {
         let _ = db.net_set_special(net);
     }
+
+    // ── block terminals for the supply nets ──────────────────────────────────────────────────
+    // 🔑 **A power grid republishes each supply as a BLOCK TERMINAL, and that is not bookkeeping**
+    // — a `-pins` layer's whole purpose is the terminal it creates, and the parent that
+    // instantiates this block connects to it. `PdnGen::writeToDb` resolves one terminal per supply
+    // net, retypes it, clears the pin geometry it owns, and only then lets the grids write.
+    //
+    // ⚠️ **Invisible to a gate reading SPECIALNETS alone.** This engine emitted no terminal at all
+    // and scored MATCH on every case that asks for one, because the shapes and vias were right.
+    let pin_layers: Vec<String> = opts
+        .all("pins")
+        .iter()
+        .flat_map(|s| s.split(','))
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    // ⚠️ **The GRID's pin layers, taken globally here.** `-pins` belongs to the grid that declared
+    // it, so a design whose two grids name different pin layers is served the union. Trimming
+    // already reads them the same way; when one is made per-grid the other must follow.
+    let mut supply_nets: Vec<String> = nets::build_order(&domain, starts_with_power);
+    for (net, ..) in &emitted {
+        if !supply_nets.iter().any(|n| n == net) {
+            supply_nets.push(net.clone());
+        }
+    }
+    let mut bterm_of: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // 🔑 **Only the terminals THIS run created are ours to take back.** See the cleanup after the
+    // pin geometry below.
+    let mut created_bterms: Vec<String> = Vec::new();
+    for net in &supply_nets {
+        let existing = db.net_get_b_terms(net);
+        let bterm = if existing.is_empty() {
+            // ⚠️ **A terminal of the net's own name may already exist unconnected**, and it is
+            // taken rather than duplicated.
+            //
+            // 🔑 **INOUT is set whenever the net arrived with NO terminal**, for the adopted one
+            // as much as the created one — it is the branch that decides, not the creation.
+            if db.bterm_names().iter().any(|b| b == net) {
+                // ⛔ **NOT CONNECTED to the net, and it should be.** The reference calls
+                // `bterm->connect(net)` here; no accessor for that is bridged yet, so an adopted
+                // terminal keeps whatever net it had. Stated rather than silently skipped — a
+                // design reaching this path gets a terminal on the wrong net.
+                eprintln!(
+                    "vyges-pdn: terminal {net} adopted but not connected -- no accessor for it"
+                );
+                let _ = db.bterm_set_io_type(net, "INOUT");
+                net.clone()
+            } else {
+                match db.create_bterm(net, net) {
+                    Ok(()) => {
+                        let _ = db.bterm_set_io_type(net, "INOUT");
+                        created_bterms.push(net.clone());
+                        net.clone()
+                    }
+                    Err(e) => {
+                        eprintln!("vyges-pdn: cannot create a terminal for {net}: {e}");
+                        continue;
+                    }
+                }
+            }
+        } else {
+            // The one named for the net, else the first — `get1stBTerm`.
+            existing
+                .iter()
+                .find(|b| *b == net)
+                .cloned()
+                .unwrap_or_else(|| existing[0].clone())
+        };
+        let _ = db.bterm_set_sig_type(&bterm, &db.net_get_sig_type(net));
+        let _ = db.bterm_set_special(&bterm);
+        bterm_of.insert(net.clone(), bterm);
+    }
+    // 🔑 **Clear the pin geometry BEFORE the shapes are written, and keep what is FIXED.** A run
+    // owns what its last run produced; a pin a person placed is not ours to remove. Done after the
+    // retyping above and before any box below, which is the reference's own order.
+    for net in &supply_nets {
+        for bterm in db.net_get_b_terms(net) {
+            let _ = db.bterm_clear_unfixed_bpins(&bterm);
+        }
+    }
+
     let mut written = 0;
     for (net, layer, rect, shape) in &emitted {
         if *shape == "SWITCH" {
@@ -6245,6 +6327,43 @@ fn generate(args: &[String]) -> ExitCode {
             placements.len()
         );
     }
+    // ── the pin geometry itself ──────────────────────────────────────────────────────────────
+    // Every shape that survived on a `-pins` layer becomes part of its net's terminal.
+    //
+    // ⚠️ **After trimming, not before.** `emitted` here is what survived, and a shape trimmed away
+    // is not a pin — publishing one would advertise metal the DEF does not contain.
+    if !pin_layers.is_empty() {
+        let mut pin_boxes = 0;
+        for (net, layer, rect, shape) in &emitted {
+            if *shape == "SWITCH" || !pin_layers.iter().any(|l| l == layer) {
+                continue;
+            }
+            if let Some(bterm) = bterm_of.get(net) {
+                match db.bterm_add_pin_box(bterm, layer, *rect) {
+                    Ok(true) => pin_boxes += 1,
+                    Ok(false) => {}
+                    Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
+                }
+            }
+        }
+        eprintln!("vyges-pdn: {pin_boxes} pin shapes on {}", pin_layers.join(","));
+    }
+
+    // 🔑 **A terminal this run created and then left empty is destroyed.** `PdnGen::writeToDb`
+    // ends by walking the terminals it made and dropping any that carry no pin geometry.
+    //
+    // ⚠️ **Without this the terminal creation above is a REGRESSION, not a fix.** A design naming
+    // no `-pins` layer gains a shapeless terminal per supply net — which is most of the suite, so
+    // the change would read as fixing the pin cases and breaking everything else.
+    //
+    // ⚠️ **Created only.** A terminal the design arrived with stays, empty or not; taking those
+    // would delete block ports the design declared for itself.
+    for bterm in &created_bterms {
+        if db.num_bterm_get_b_pins(bterm) == 0 {
+            let _ = db.bterm_destroy(bterm);
+        }
+    }
+
     if let Err(e) = db.write_def(out) {
         eprintln!("vyges-pdn: cannot write {out}: {e}");
         return ExitCode::from(2);
