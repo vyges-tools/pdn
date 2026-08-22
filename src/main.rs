@@ -2430,6 +2430,7 @@ fn generate(args: &[String]) -> ExitCode {
         on_grid: Vec<((String, String), Vec<String>)>,
         max_cuts: Vec<((String, String), (i32, i32))>,
         split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)>,
+        min_width_by_connect: Vec<((String, String), Vec<String>)>,
         ground: String,
     }
     let mut pending: Vec<PendingVias> = Vec::new();
@@ -3425,11 +3426,14 @@ fn generate(args: &[String]) -> ExitCode {
             // `-split_cuts`, by layer pair: the layers whose crossings are spread rather than
             // packed, with the pitch and stagger each asks for.
             let mut split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)> = Vec::new();
+            // `-min_width_layers`, by layer pair: the intermediate layers this connect must not
+            // widen past their own minimum.
+            let mut min_width_by_connect: Vec<((String, String), Vec<String>)> = Vec::new();
             let connects: Vec<vyges_pdn::vias::Connect> = opts
                 .all("connect")
                 .iter()
                 .filter_map(|c| {
-                    let mut parts = c.splitn(8, ':');
+                    let mut parts = c.splitn(9, ':');
                     let pair = parts.next()?;
                     let vias: Vec<String> = parts
                         .next()
@@ -3499,6 +3503,18 @@ fn generate(args: &[String]) -> ExitCode {
                             (pitch > 0).then_some((layer, pitch, stagger))
                         })
                         .collect();
+                    // 🔑 **`-min_width_layers` names INTERMEDIATE layers this stack may not fatten.**
+                    // `generateMinEnclosureViaRects` normally offers each intermediate level two
+                    // candidate rects — the full overlap and one narrowed to the layer's own width
+                    // — and lets the generator pick. Named here, the full-overlap rect is dropped
+                    // and only the narrow one is left.
+                    let min_width_layers: Vec<String> = parts
+                        .next()
+                        .unwrap_or("")
+                        .split('+')
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                        .collect();
                     let (l, u) = pair.split_once(',')?;
                     Some((
                         l.to_string(),
@@ -3509,14 +3525,16 @@ fn generate(args: &[String]) -> ExitCode {
                         ongrid,
                         (max_rows, max_columns),
                         splits,
+                        min_width_layers,
                     ))
                 })
-                .map(|(l, u, vias, pitch, dont_use, ongrid, caps, splits)| {
+                .map(|(l, u, vias, pitch, dont_use, ongrid, caps, splits, min_width_layers)| {
                     on_grid.push(((l.clone(), u.clone()), ongrid));
                     max_cuts.push(((l.clone(), u.clone()), caps));
                     // ⚠️ **The connect's own two ends are ERASED from the map.**
                     // `setSplitCuts` does it on the way in, so naming an end layer does nothing
                     // whatever -- only a layer the stack passes THROUGH can scatter its cuts.
+                    min_width_by_connect.push(((l.clone(), u.clone()), min_width_layers));
                     split_by_connect.push((
                         (l.clone(), u.clone()),
                         splits
@@ -3779,6 +3797,7 @@ fn generate(args: &[String]) -> ExitCode {
                 on_grid,
                 max_cuts,
                 split_by_connect,
+                min_width_by_connect,
                 fixed,
                 ground: ground.to_string(),
             });
@@ -4015,6 +4034,7 @@ fn generate(args: &[String]) -> ExitCode {
             on_grid,
             max_cuts,
             split_by_connect,
+            min_width_by_connect,
             fixed,
             ground,
         } = p;
@@ -4305,9 +4325,18 @@ fn generate(args: &[String]) -> ExitCode {
                 .iter()
                 .map(|l| direction_of(&db, l) == Direction::Horizontal)
                 .collect();
-            // ℹ️ `-min_width` on a connect is not translated by the harness, and no case in the
-            // suite states it, so every layer takes the union branch.
-            let min_width_only = vec![false; intermediate.len()];
+            // ⚠️ **Per connect and per intermediate LAYER**, which is how `min_width_layers_` is
+            // stored: the same layer may be held to its width by one connect and left free by
+            // another crossing it.
+            let held_narrow: &[String] = min_width_by_connect
+                .iter()
+                .find(|((l, u), _)| *l == v.lower && *u == v.upper)
+                .map(|(_, m)| m.as_slice())
+                .unwrap_or(&[]);
+            let min_width_only: Vec<bool> = intermediate
+                .iter()
+                .map(|l| held_narrow.iter().any(|h| h == l))
+                .collect();
             vyges_pdn::vias::add_min_enclosure_rects(
                 &mut rect_set,
                 &widths,
