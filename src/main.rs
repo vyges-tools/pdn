@@ -4031,6 +4031,23 @@ fn generate(args: &[String]) -> ExitCode {
         //
         // ℹ️ `odb::Rect` orders by `(xlo, ylo, xhi, yhi)`, its members in declaration order under a
         // defaulted `operator<=>`, which is what a tuple of the same four does here.
+        // 🔑 **A connect CACHES the via it built and reuses it for every crossing of the same
+        // size.** `Connect::makeVia` keys on `(net, intersection dx, intersection dy)` — the net
+        // only where split cuts are in play — and builds the stack once. Every later crossing of
+        // that size gets the FIRST one's geometry, enclosures and all.
+        //
+        // ⚠️ **So the enclosures can reflect a shape orientation the crossing no longer has.** The
+        // constraints come from the shapes' own aspect (`must_fit_x = !isHorizontal()`), and
+        // trimming a tall ring segment down to a stub flips that aspect — but a crossing that hits
+        // the cache never asks. Rebuilding per crossing instead gives three ring segments 20 units
+        // short, and nothing else different.
+        //
+        // ⚠️ Caching is SKIPPED where either shape is unmodifiable or carries terminal
+        // connections; the reference sets `skip_caching` and clears the entry after using it.
+        let mut via_cache: std::collections::HashMap<
+            (usize, Option<String>, i32, i32),
+            (Direction, Direction),
+        > = std::collections::HashMap::new();
         let mut placed = placed;
         placed.sort_by_key(|v| {
             (
@@ -4172,6 +4189,32 @@ fn generate(args: &[String]) -> ExitCode {
             }
             let lower_rect = current(&v.net, &v.lower, v.lower_rect);
             let upper_rect = current(&v.net, &v.upper, v.upper_rect);
+            if std::env::var_os("PDN_SHAPE_TRACE").is_some() {
+                eprintln!(
+                    "[shape] {}|{}->{}|area {:?}|lower was {:?} now {:?}|upper was {:?} now {:?}",
+                    v.net, v.lower, v.upper, v.area, v.lower_rect, lower_rect, v.upper_rect,
+                    upper_rect
+                );
+            }
+            // The two ends' orientations, which is all the cache actually decides — see above.
+            // ⚠️ **Consulted after the placement point**, which the reference takes from the real
+            // shapes; only the geometry comes from the first crossing of this size.
+            let inter = vyges_pdn::vias::via_area(lower_rect, upper_rect);
+            let split_here = !split_by_connect
+                .iter()
+                .find(|((l, u), _)| *l == v.lower && *u == v.upper)
+                .map(|(_, sp)| sp.is_empty())
+                .unwrap_or(true);
+            let cache_key = (
+                v.connect,
+                split_here.then(|| v.net.clone()),
+                inter.2 - inter.0,
+                inter.3 - inter.1,
+            );
+            let dirs = *via_cache.entry(cache_key).or_insert((
+                vyges_pdn::viagen::rect_direction(lower_rect),
+                vyges_pdn::viagen::rect_direction(upper_rect),
+            ));
             // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
             // metal6 needs a cut at each of five levels, and the reference's own counts show it:
             // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
@@ -4184,6 +4227,7 @@ fn generate(args: &[String]) -> ExitCode {
             else {
                 continue; // off grid: the reference builds a dummy via, which places nothing
             };
+
             let stack = stack_layers(&db, &v.lower, &v.upper);
             // The layers THIS connect snaps to. Empty for every other connect, which is the point.
             let ongrid: &[String] = on_grid
@@ -4490,15 +4534,15 @@ fn generate(args: &[String]) -> ExitCode {
                 // aspect ratio. A follow pin on a vertical layer still runs horizontally.
                 // ℹ️ Read from the level's own rect rather than a candidate: an END of the stack
                 // is a shape, and a shape has exactly one candidate.
+                // ℹ️ From the CACHED orientations, not from this crossing's own rects: where the
+                // connect has already built a via of this size, that via is reused whole.
                 let bot_c = if at_bottom_end {
-                    let d = vyges_pdn::viagen::rect_direction(rects[level]);
-                    vyges_pdn::viagen::constraint_for(d, true, false)
+                    vyges_pdn::viagen::constraint_for(dirs.0, true, false)
                 } else {
                     Default::default()
                 };
                 let top_c = if at_top_end {
-                    let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
-                    vyges_pdn::viagen::constraint_for(d, true, false)
+                    vyges_pdn::viagen::constraint_for(dirs.1, true, false)
                 } else {
                     Default::default()
                 };
@@ -4855,6 +4899,12 @@ fn generate(args: &[String]) -> ExitCode {
                         let top_enc = vyges_pdn::viagen::snap_enclosure(top_enc, grid_mfg);
                         let (bot_enc, top_enc) =
                             ((bot_enc.x, bot_enc.y), (top_enc.x, top_enc.y));
+                        if std::env::var_os("PDN_ENC_TRACE").is_some() {
+                            eprintln!(
+                                "[enc] {}|{lo}->{hi}|area {:?}|bot {:?}|top {:?}",
+                                v.net, area, bot_enc, top_enc
+                            );
+                        }
 
                         // 🔑 **What the sort reads.** `getCutArea` is the cut's own area times
                         // the CLAMPED cut count, and `getGeneratorWidth`/`Height` are
