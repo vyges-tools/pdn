@@ -414,6 +414,62 @@ pub fn overlap_enclosure(extent: (i32, i32), span: (i32, i32)) -> Enclosure {
     }
 }
 
+/// **E28** — how many cuts of an array count as ADJACENT, from its shape alone.
+///
+/// 🔑 **Not a distance test.** `ViaGenerator::updateCutSpacing` clamps both dimensions to `1..=4`
+/// and reads the answer off a table: a cut in the middle of a 3xN or wider array has four
+/// neighbours, and nothing narrower reaches four however long it runs.
+///
+/// ⚠️ **A 1xN array counts TWO**, not one — the cut in the middle of a row has a neighbour on each
+/// side. Only a 1x1 and a 1x2 fall below the two that every rule requires.
+pub fn adjacent_cuts(rows: i32, columns: i32) -> i32 {
+    let rows = rows.clamp(1, 4);
+    let columns = columns.clamp(1, 4);
+    let (min_dim, max_dim) = (rows.min(columns), rows.max(columns));
+    match min_dim {
+        1 if max_dim == 2 => 1,
+        1 if max_dim >= 3 => 2,
+        2 if max_dim == 2 => 2,
+        2 if max_dim >= 3 => 3,
+        3 | 4 => 4,
+        _ => 0,
+    }
+}
+
+/// **E29** — the cut pitch an ADJACENTCUTS rule imposes on an array of this shape.
+///
+/// 🔑 **A wide enough array stops using the cut layer's plain `SPACING`.** Every rule whose cut
+/// count the array reaches applies, and the LAST matching one wins — the reference assigns rather
+/// than accumulates.
+///
+/// ⚠️ **`EXCEPTSAMEPGNET` rules are skipped outright**, not applied conditionally: a power grid is
+/// exactly the same-net case those rules exempt.
+///
+/// ⚠️ **Below two adjacent cuts nothing applies at all**, whatever the rules say, so a 1x1 or 1x2
+/// array keeps its pitch.
+///
+/// Returns the new pitch for both axes, or `None` where no rule bites. `rules` is
+/// `(cuts, spacing, except_same_pgnet)`.
+pub fn adjacent_cut_pitch(
+    rows: i32,
+    columns: i32,
+    cut: (i32, i32),
+    rules: &[(u32, i32, bool)],
+) -> Option<(i32, i32)> {
+    let adj = adjacent_cuts(rows, columns);
+    if adj < 2 {
+        return None;
+    }
+    let mut out = None;
+    for (cuts, spacing, except_same_pgnet) in rules {
+        if *except_same_pgnet || *cuts as i32 > adj {
+            continue;
+        }
+        out = Some((cut.0 + spacing, cut.1 + spacing));
+    }
+    out
+}
+
 /// **E5** — how many cuts fit across a wire of this width.
 ///
 /// ⚠️ **The LARGER of the two enclosures is used on both sides.** Not each layer's own: a via has
@@ -2579,6 +2635,47 @@ mod tests {
         assert_eq!(
             intermediate_patches(&[small], &[big], false, 0, Direction::Vertical, 1),
             Vec::<crate::Rect>::new()
+        );
+    }
+
+    #[test]
+    fn adjacency_is_read_off_the_array_shape() {
+        // ⚠️ A 1x1 and a 1x2 fall below the two every rule requires.
+        assert_eq!(adjacent_cuts(1, 1), 0);
+        assert_eq!(adjacent_cuts(1, 2), 1);
+        // 🔑 A 1xN counts TWO: the middle cut has a neighbour on each side.
+        assert_eq!(adjacent_cuts(1, 3), 2);
+        assert_eq!(adjacent_cuts(1, 99), 2);
+        assert_eq!(adjacent_cuts(2, 2), 2);
+        assert_eq!(adjacent_cuts(2, 5), 3);
+        // Anything 3 or wider reaches four, and the clamp keeps it there.
+        assert_eq!(adjacent_cuts(3, 3), 4);
+        assert_eq!(adjacent_cuts(7, 7), 4);
+    }
+
+    #[test]
+    fn an_adjacentcuts_rule_widens_a_big_enough_array() {
+        // 🔑 The case that found this: a 7x7 array of 280 cuts on a layer stating
+        // `SPACING 0.32 ADJACENTCUTS 3` -- 4 adjacent cuts reaches the rule's 3, so the pitch
+        // goes from cut+320 to cut+640 and the array drops to what still fits.
+        let rules = [(3u32, 640, false)];
+        assert_eq!(
+            adjacent_cut_pitch(7, 7, (280, 280), &rules),
+            Some((920, 920))
+        );
+        // ⚠️ Too few adjacent cuts and the rule does not bite, however large its spacing.
+        assert_eq!(adjacent_cut_pitch(1, 2, (280, 280), &rules), None);
+        // A 1xN reaches two, which is still short of three.
+        assert_eq!(adjacent_cut_pitch(1, 9, (280, 280), &rules), None);
+        // ⚠️ An EXCEPTSAMEPGNET rule is skipped outright -- a power grid is that case.
+        assert_eq!(
+            adjacent_cut_pitch(7, 7, (280, 280), &[(3, 640, true)]),
+            None
+        );
+        // The LAST matching rule wins, as the reference assigns rather than accumulates.
+        assert_eq!(
+            adjacent_cut_pitch(7, 7, (280, 280), &[(3, 640, false), (2, 500, false)]),
+            Some((780, 780))
         );
     }
 

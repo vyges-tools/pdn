@@ -4334,6 +4334,14 @@ fn generate(args: &[String]) -> ExitCode {
                 let cut_layer = cut_layer.as_str();
                 // 🔑 **The ARRAYSPACING rules belong to the CUT layer**, and are read once per
                 // level rather than per candidate pair — they do not depend on the rects.
+                // 🔑 **The cut layer's ADJACENTCUTS rules**, read once per level like the array
+                // rules beside them — they do not depend on the rects either.
+                // ⚠️ **LEF 5.4 only.** `updateCutSpacing` tries the LEF58 `ADJACENTCUTS` rules
+                // first and falls back to these only when none applied, so a technology stating
+                // both would take the LEF58 spacing where this takes the 5.4 one. No technology in
+                // reach states a LEF58 one, and inventing the precedence untested is worse than
+                // recording that it is missing.
+                let adjacent_rules = db.layer_v54_adjacent_cut_rules(cut_layer).unwrap_or_default();
                 let array_rules: Vec<vyges_pdn::viagen::ArrayRule> = db
                     .layer_array_spacing_rules(cut_layer)
                     .unwrap_or_default()
@@ -4803,6 +4811,44 @@ fn generate(args: &[String]) -> ExitCode {
                                 )
                                 .max(1),
                             )
+                        };
+                        // 🔑 **A wide array stops using the cut layer's plain SPACING.**
+                        // `determineRowsAndColumns` fits the cuts, asks `updateCutSpacing` whether
+                        // that many adjacent cuts trips a rule, and where it does REFITS them once
+                        // on the wider pitch. Everything downstream — the enclosures, the name, the
+                        // metal — then uses the new pitch, because the generator's own field was
+                        // changed rather than a local copy.
+                        // ⚠️ **Refit ONCE, not to a fixed point.** A wider pitch means fewer cuts,
+                        // and fewer cuts could drop the array back below the rule's threshold; the
+                        // reference does not chase that and neither does this.
+                        let (pitch, columns, rows) = match vyges_pdn::viagen::adjacent_cut_pitch(
+                            rows,
+                            columns,
+                            cut,
+                            &adjacent_rules,
+                        ) {
+                            None => (pitch, columns, rows),
+                            Some(p) => (
+                                p,
+                                vyges_pdn::viagen::cuts_across(
+                                    area.2 - area.0,
+                                    cut.0,
+                                    chosen.bottom.x,
+                                    chosen.top.x,
+                                    p.0,
+                                    max_columns,
+                                )
+                                .max(1),
+                                vyges_pdn::viagen::cuts_across(
+                                    area.3 - area.1,
+                                    cut.1,
+                                    chosen.bottom.y,
+                                    chosen.top.y,
+                                    p.1,
+                                    max_rows,
+                                )
+                                .max(1),
+                            ),
                         };
 
                         // 🔑 **An ARRAYSPACING rule may regroup the cuts before any of this.**
