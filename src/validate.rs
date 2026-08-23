@@ -247,6 +247,34 @@ pub fn check_snap(l: &LayerRules, snap: bool, has_track_grid: bool) -> Option<Di
     )
 }
 
+/// **PDN-0003 / 0004 / 0005** — the two layers a connect rule names.
+///
+/// 🔑 **All three are raised by `Connect`'s CONSTRUCTOR, in this order**, so a rule that breaks
+/// more than one reports the first: same-layer, then layer0 not routing, then layer1 not routing.
+/// The reference raises through a logger that throws, so nothing after the first check runs — the
+/// order is behaviour, not an implementation detail. `core_grid_check_connect_layers` asserts all
+/// three, one per `catch` block, and `{via1 metal5}` against `{metal1 via2}` is what separates
+/// 0004 from 0005.
+///
+/// ⚠️ **"Routing layer" is `getRoutingLevel() != 0`, not the layer's LEF type.** A cut layer and a
+/// masterslice both answer 0; asking whether the name looks like a via would get `via1` right and
+/// an unnamed masterslice wrong.
+pub fn check_connect_layers(name0: &str, level0: i32, name1: &str, level1: i32) -> Option<Diag> {
+    if name0 == name1 {
+        return Diag::new(
+            3,
+            format!("Layers must be different in connect rule: {name0}"),
+        );
+    }
+    if level0 == 0 {
+        return Diag::new(4, format!("{name0} must be a routing layer"));
+    }
+    if level1 == 0 {
+        return Diag::new(5, format!("{name1} must be a routing layer"));
+    }
+    None
+}
+
 /// **PDN-0185** — the group of straps does not fit in the grid, once the offset is taken.
 ///
 /// The group is `net_count` straps and the gaps between them: `n*width + (n-1)*spacing`. It fails
@@ -330,6 +358,41 @@ pub fn check_ring_layer(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_connect_rule_names_two_different_routing_layers() {
+        // Upstream rule, `Connect::Connect`: layer0 == layer1 raises PDN-0003, then
+        // getRoutingLevel() == 0 raises PDN-0004 for the first layer and PDN-0005 for the second.
+        assert_eq!(
+            check_connect_layers("metal5", 5, "metal5", 5).unwrap().code,
+            3
+        );
+        assert_eq!(check_connect_layers("via1", 0, "metal5", 5).unwrap().code, 4);
+        assert_eq!(check_connect_layers("metal1", 1, "via2", 0).unwrap().code, 5);
+        assert!(check_connect_layers("metal1", 1, "metal5", 5).is_none());
+    }
+
+    #[test]
+    fn the_first_connect_rule_to_fire_is_the_whole_answer() {
+        // ⚠️ The reference's logger throws, so a rule breaking two checks reports only the first.
+        // Naming the SAME non-routing layer twice breaks both 0003 and 0004; 0003 is checked
+        // first, so that is the diagnostic — reordering the checks would silently change it.
+        let d = check_connect_layers("via1", 0, "via1", 0).unwrap();
+        assert_eq!(d.code, 3);
+        assert_eq!(d.message, "Layers must be different in connect rule: via1");
+    }
+
+    #[test]
+    fn the_two_routing_layer_checks_differ_only_in_which_layer_failed() {
+        // The message text is identical for 0004 and 0005; only the code and the layer name
+        // differ, so a test reading the words alone would pass with the two swapped.
+        let first = check_connect_layers("via1", 0, "via2", 0).unwrap();
+        assert_eq!(first.code, 4);
+        assert_eq!(first.message, "via1 must be a routing layer");
+        let second = check_connect_layers("metal1", 1, "via2", 0).unwrap();
+        assert_eq!(second.code, 5);
+        assert_eq!(second.message, "via2 must be a routing layer");
+    }
     use super::*;
 
     /// Nangate45: 2000 database units to the micron, a manufacturing grid of 0.005 um, and a

@@ -343,6 +343,21 @@ fn validate_grids(
     for (g, o) in grids {
         let net_count = grid_net_count(db, o, g, build_nets);
 
+        // 🔑 **Checked before anything is built, because `Connect`'s CONSTRUCTOR raises these** —
+        // `add_pdn_connect` refuses at declaration time, not when the vias are placed. A rule
+        // naming the same layer twice, or a cut layer where a routing layer belongs, never
+        // reaches via generation at all.
+        for spec in o.all("connect") {
+            let pair = spec.split(':').next().unwrap_or("");
+            let Some((l0, l1)) = pair.split_once(',') else {
+                continue;
+            };
+            let (r0, r1) = (routing_level(db, l0), routing_level(db, l1));
+            if let Some(d) = validate::check_connect_layers(l0, r0, l1, r1) {
+                return Some(d);
+            }
+        }
+
         for spec in o.all("ring") {
             // `<layer0>,<layer1>:<w0>,<w1>:<s0>,<s1>:<offsets>[:boundary][:kind]`
             let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
