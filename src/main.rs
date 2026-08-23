@@ -45,14 +45,36 @@ const REPORT_FIELDS: &[&str] = &[
     "def_written",
 ];
 
+
+/// The pin, inherited from the crate every engine already depends on.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// The pin this binary was built against, injected into the descriptor at print time.
+///
+/// 🔑 **One definition for the whole programme, inherited rather than typed.** The SHA lives in
+/// `openroad-pin.yaml` in `vyges-opendb-lib` and reaches here through `vyges-opendb`, which this
+/// engine already depends on. Before this, every engine spelled the pin out in its own
+/// `--describe` prose, and four of them were still quoting the previous one a day after it moved.
+///
+/// ⚠️ **It reports what this BINARY was built against — not that the binary is current.** A stale
+/// build reports its stale pin quite happily. That is the point: a harness compares this against
+/// the oracle image it is about to launch and refuses on a mismatch, which is the check that was
+/// missing when two engines ran a whole gate against the previous pin's oracle.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "vyges-pdn",
   "summary": "power distribution network generation: rings, straps, follow pins and the vias between them",
   "maturity": "correlated",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "MEASURED 2026-08-23 against the upstream pdn goldens at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c: 110 of 110 comparable cases exact on shapes, vias and block terminals, 0 failing, and 9 of 9 on the diagnostic a refused command raises. A SCORE IS ONLY TRUE OF ONE COMMIT -- quote the pin beside it.",
+    "MEASURED 2026-08-23 against the upstream pdn goldens at pin @OPENROAD_PIN@: 110 of 110 comparable cases exact on shapes, vias and block terminals, 0 failing, and 9 of 9 on the diagnostic a refused command raises. A SCORE IS ONLY TRUE OF ONE COMMIT -- quote the pin beside it.",
     "36 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 29 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
     "Diagnostics implemented so far: PDN-0003, 0004, 0005 (connect rules), 0106, 0107, 0108, 0114, 0117, 0118, 0191 (argument validation), 0185 and 0215 (runtime). A case whose golden names any other code is skipped with that code named, never silently passed.",
     "status is one of generated, vacuous or error. VACUOUS IS NOT GENERATED: it means the run laid no metal at all, and this assertion passes only on generated, so a no-op fails it rather than reporting a grid that was never built. Zero can still be the right answer for the design; read shapes and decide.",
@@ -6635,7 +6657,7 @@ fn main() -> ExitCode {
         // ⚠️ Before any database is touched: `--describe` is a contract query, not a run, and a
         // caller asking what this engine promises must not need a design to ask.
         Some("--describe") => {
-            print!("{DESCRIBE}");
+            print!("{}", describe());
             ExitCode::SUCCESS
         }
         _ => usage(),
@@ -6723,6 +6745,39 @@ mod describe_tests {
             assert!(
                 super::REPORT_FIELDS.contains(&field),
                 "{field} is promised but not emitted"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{describe, PIN_TOKEN};
+
+    #[test]
+    fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+        let d = describe();
+        assert!(
+            !d.contains(PIN_TOKEN),
+            "the pin placeholder survived into the output -- the substitution did not run"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&d).expect("the descriptor is still valid JSON once filled in");
+        assert_eq!(
+            v["openroad_pin"], super::CRATE_PIN,
+            "the descriptor must report the pin this binary was actually built against"
+        );
+        assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
+    }
+
+    /// ⛔ The whole point of inheriting the pin is that no engine carries one of its own.
+    #[test]
+    fn no_sha_is_hardcoded_anywhere_in_the_descriptor() {
+        let raw = super::DESCRIBE;
+        for tok in raw.split(|c: char| !c.is_ascii_hexdigit()) {
+            assert!(
+                tok.len() < 40,
+                "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
             );
         }
     }
