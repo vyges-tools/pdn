@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: Apache-2.0
+# Build & test on every push to main and on pull requests (plus manual dispatch).
+#
+# ⚠️ Not the plain std-only ci.yml a pure-Rust crate would use: vyges-pdn reads and writes the
+# design database through vyges-opendb, which statically links libodb (C++, built from source).
+# So this needs the sibling checkout layout and a C++ toolchain — see release.yml for the same
+# reasoning applied to the per-target builds.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vyges-tools-pdn
+    steps:
+      # ⚠️ Sibling layout, so every `[patch]` path entry in Cargo.toml resolves. A patch whose
+      # path does not exist is a hard `failed to load source` — Cargo does NOT fall back to the
+      # git source it is patching, so a missing checkout here fails the build outright.
+      - uses: actions/checkout@v4
+        with:
+          path: vyges-tools-pdn
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb
+          path: vyges-tools-opendb
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb-lib
+          path: vyges-tools-opendb-lib
+
+      - name: Toolchain
+        # Boost (headers) + zlib only; fmt/spdlog/abseil are built from source by libodb's build.
+        # bison is for the LEF/DEF parsers.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No --locked: Cargo.lock is gitignored here, and the [patch] resolves the opendb crates to
+      # the freshly-checked-out siblings — let Cargo resolve.
+      - name: Build
+        run: cargo build --release --verbose
+      - name: Test
+        run: cargo test --release --verbose
+
+      # 🔑 The descriptor is the contract this engine publishes, and it is assembled by hand
+      # rather than serialised — a stray comma makes it unparseable to the consumer it exists for.
+      # The unit tests check it, but only this proves the shipped BINARY emits valid JSON.
+      - name: Descriptor is valid JSON and names the pin it was built against
+        run: |
+          ./target/release/vyges-pdn --describe > /tmp/describe.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("/tmp/describe.json"))
+          assert d["schema"] == "vyges-tool-descriptor/1.1", d["schema"]
+          pin = d["openroad_pin"]
+          assert len(pin) == 40 and all(c in "0123456789abcdef" for c in pin), pin
+          # The assertion must name a field the engine emits, and pass on one value only.
+          assert d["assertion"]["field"] == "status", d["assertion"]
+          assert d["assertion"]["pass_when"] == {"eq": "generated"}, d["assertion"]
+          print(f"descriptor ok; built against {pin}")
+          PY
