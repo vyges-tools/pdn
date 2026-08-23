@@ -133,6 +133,8 @@ const USAGE: &str = concat!(
          \x20        [--pins <layer>[,<layer>...]]  (shapes there are never shrunk)\n\
          \x20        [--split-cuts <layer>:<pitch>[:stagger]]   (micron, repeatable)\n\
          \n\
+         \x20  vyges-pdn --describe | --help | --version\n\
+         \n\
          ⚠️ Shapes are emitted BEFORE trimming, which belongs with the via stage. Compare against\n\
          the reference run with `pdngen -skip_trim`."
 );
@@ -6670,6 +6672,19 @@ fn main() -> ExitCode {
         // ⚠️ Before any database is touched: `--describe` is a contract query, not a run, and a
         // caller asking what this engine promises must not need a design to ask.
         Some("--help") | Some("-h") => help(),
+        // 🔑 **The commit, not just the version.** A version alone cannot tell you which build a
+        // bug report came from — two binaries can share a version and differ by a fix. build.rs
+        // bakes the git SHA in, preferring GITHUB_SHA on CI so a release is never stamped -dirty
+        // by the untracked files a release run leaves behind.
+        Some("--version") | Some("-V") => {
+            println!(
+                "vyges-pdn {} ({})",
+                vyges_pdn::VERSION,
+                env!("VYGES_GIT_SHA")
+            );
+            println!("{}", vyges_pdn::COPYRIGHT);
+            ExitCode::SUCCESS
+        }
         Some("--describe") => {
             print!("{}", describe());
             ExitCode::SUCCESS

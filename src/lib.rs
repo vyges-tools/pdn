@@ -80,6 +80,12 @@ mod settle_status_tests {
     }
 }
 
+/// This crate's version, as Cargo knows it — the single number the whole suite is released on.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The copyright line `--version` prints.
+pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
 /// `(xlo, ylo, xhi, yhi)`, in database units, as odb spells a rectangle.
 pub type Rect = (i32, i32, i32, i32);
 
