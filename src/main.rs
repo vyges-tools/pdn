@@ -329,6 +329,7 @@ fn validate_grids(
     grids: &[(GridSpec, Opts)],
     build_nets: &[String],
     per_micron: f64,
+    core: Rect,
 ) -> Option<validate::Diag> {
     // ⚠️ **A follow pin takes its direction from the ROWS, not from its layer** — and that is what
     // decides whether a layer's width table governs it at all. With no rows the reference leaves
@@ -450,14 +451,40 @@ fn validate_grids(
                         rules.manufacturing_grid.unwrap_or(1),
                     )
                 });
+            // ⚠️ **The grid's extent ACROSS the strap's direction**, which is what a group of
+            // straps has to fit inside — a horizontal set is bounded by the grid's height.
+            // ℹ️ Taken as the core area: a region or instance grid is bounded by its own
+            // rectangle, which this pass does not resolve. Same scoping limit as `-pins` above.
+            let grid_width = if rules.direction == Direction::Horizontal {
+                core.3 - core.1
+            } else {
+                core.2 - core.0
+            };
             let dims = validate::StrapDims {
                 width,
                 spacing,
                 pitch,
                 offset,
                 min_spacing: min_spacing_for(db, layer, width),
+                snap: p.get(5).copied() == Some("snap"),
+                // `TechLayer::populateGrid` reads the block's track grid for this layer along the
+                // strap's direction; no tracks there is what PDN-0215 refuses.
+                has_track_grid: {
+                    // 🔑 **The axis follows the STRAP's direction**, as `populateGrid` does:
+                    // a horizontal strap snaps to the Y tracks, a vertical one to the X.
+                    let (x, y) = db.track_grid(layer).unwrap_or_default();
+                    if rules.direction == Direction::Horizontal {
+                        !y.is_empty()
+                    } else {
+                        !x.is_empty()
+                    }
+                },
+                grid_width,
+                net_count,
             };
-            if let Some(d) = validate::check_strap(&rules, dims, rules.direction) {
+            if let Some(d) =
+                validate::check_strap(&rules, dims, rules.direction, &g.name)
+            {
                 return Some(d);
             }
         }
@@ -2376,7 +2403,7 @@ fn generate(args: &[String]) -> ExitCode {
 
     // ── what the technology allows a component to state ─────────────────────────────────────
     // 🔑 **Before anything is built, and the first violation ends the run.** See `validate_grids`.
-    if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron) {
+    if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron, core) {
         eprintln!("{d}");
         return ExitCode::from(1);
     }

@@ -220,6 +220,67 @@ pub struct StrapDims {
     pub offset: i32,
     /// The layer's own minimum spacing for a shape of `width`, read from the database.
     pub min_spacing: i32,
+    /// `-snap_to_grid`: the set is to be snapped to the layer's routing tracks.
+    pub snap: bool,
+    /// Whether the layer HAS routing tracks in the strap's direction, read from the database.
+    pub has_track_grid: bool,
+    /// The grid's own extent across the strap's direction — what the group has to fit inside.
+    pub grid_width: i32,
+    /// How many nets the group carries; the group is that many straps and the gaps between them.
+    pub net_count: i32,
+}
+
+/// **PDN-0215** — a set asked to snap to tracks on a layer that declares none.
+///
+/// ⚠️ **Only when snapping was ASKED FOR.** A layer with no routing grid is perfectly ordinary;
+/// it is the combination with `-snap_to_grid` that has no answer.
+pub fn check_snap(l: &LayerRules, snap: bool, has_track_grid: bool) -> Option<Diag> {
+    if !snap || has_track_grid {
+        return None;
+    }
+    Diag::new(
+        215,
+        format!(
+            "Unable to snap strap on {} to grid, no routing grid defined for layer.",
+            l.name
+        ),
+    )
+}
+
+/// **PDN-0185** — the group of straps does not fit in the grid, once the offset is taken.
+///
+/// The group is `net_count` straps and the gaps between them: `n*width + (n-1)*spacing`. It fails
+/// when `grid_width < offset + group`.
+///
+/// ⚠️ **Three different precisions in one message** — the grid width prints to TWO decimals and the
+/// two widths to ONE, where every other diagnostic in this family uses four. A message assembled
+/// from the family's habit rather than from this line is wrong in three places at once.
+pub fn check_group_fits(
+    l: &LayerRules,
+    grid_name: &str,
+    grid_width: i32,
+    offset: i32,
+    group_width: i32,
+) -> Option<Diag> {
+    if grid_width >= offset + group_width {
+        return None;
+    }
+    Diag::new(
+        185,
+        format!(
+            "Insufficient width ({:.2} um) to add straps on layer {} in grid \"{}\" with total strap width {:.1} um and offset {:.1} um.",
+            grid_width as f64 / l.units_per_micron as f64,
+            l.name,
+            grid_name,
+            group_width as f64 / l.units_per_micron as f64,
+            offset as f64 / l.units_per_micron as f64,
+        ),
+    )
+}
+
+/// The width a group of straps occupies: one per net, with the stated spacing between them.
+pub fn strap_group_width(net_count: i32, width: i32, spacing: i32) -> i32 {
+    net_count * width + (net_count - 1) * spacing
 }
 
 /// Every check a strap set's own dimensions must pass, in the order the reference runs them.
@@ -227,13 +288,23 @@ pub struct StrapDims {
 /// ⚠️ **The order is the answer, not just the outcome.** A command stating both a bad width and a
 /// bad pitch reports the width, because the reference stops at the first. Running the manufacturing
 /// grid checks before the layer ones would report the pitch instead.
-pub fn check_strap(l: &LayerRules, d: StrapDims, direction: Direction) -> Option<Diag> {
+pub fn check_strap(
+    l: &LayerRules,
+    d: StrapDims,
+    direction: Direction,
+    grid_name: &str,
+) -> Option<Diag> {
+    let group = strap_group_width(d.net_count, d.width, d.spacing);
     check_width(l, d.width, direction)
         .or_else(|| check_spacing(l, d.spacing, d.min_spacing))
         .or_else(|| check_on_grid(l, "Width", d.width))
         .or_else(|| check_on_grid(l, "Spacing", d.spacing))
         .or_else(|| check_on_grid(l, "Pitch", d.pitch))
         .or_else(|| check_on_grid(l, "Offset", d.offset))
+        // ⚠️ The snap check sits AFTER the manufacturing-grid ones and BEFORE the fit check —
+        // a set that is both unsnappable and too wide reports the snap.
+        .or_else(|| check_snap(l, d.snap, d.has_track_grid))
+        .or_else(|| check_group_fits(l, grid_name, d.grid_width, d.offset, group))
 }
 
 /// Every check one of a ring's two layers must pass.
@@ -462,8 +533,10 @@ mod tests {
         };
         let d = check_strap(
             &l,
-            StrapDims { width: 150, spacing: 1000, pitch: 8008, offset: 0, min_spacing: 0 },
+            StrapDims { width: 150, spacing: 1000, pitch: 8008, offset: 0, min_spacing: 0,
+                        snap: false, has_track_grid: true, grid_width: i32::MAX, net_count: 2 },
             Direction::Horizontal,
+            "Core",
         )
         .unwrap();
         assert_eq!(d.code, 117, "the width is checked before the pitch");
@@ -478,8 +551,10 @@ mod tests {
         };
         assert!(check_strap(
             &l,
-            StrapDims { width: 140, spacing: 1000, pitch: 8000, offset: 0, min_spacing: 280 },
+            StrapDims { width: 140, spacing: 1000, pitch: 8000, offset: 0, min_spacing: 280,
+                        snap: false, has_track_grid: true, grid_width: i32::MAX, net_count: 2 },
             Direction::Horizontal,
+            "Core",
         )
         .is_none());
     }
@@ -490,6 +565,57 @@ mod tests {
         let d = check_ring_layer(&l, 4000, 4000, 280, &[4000, 4000, 8008, 4000]).unwrap();
         assert_eq!(d.code, 191);
         assert!(d.message.starts_with("Core offset of 4.0040 um"));
+    }
+
+    #[test]
+    fn snapping_to_a_layer_with_no_routing_grid_is_refused() {
+        // Upstream rule: `Straps::checkLayerSpecifications` populates the layer's grid when
+        // `snap_` is set and raises PDN-0215 when the layer has none.
+        let l = LayerRules { name: "metal1".into(), ..nangate_metal5() };
+        let d = check_snap(&l, true, false).unwrap();
+        assert_eq!(d.code, 215);
+        assert_eq!(
+            d.message,
+            "Unable to snap strap on metal1 to grid, no routing grid defined for layer."
+        );
+    }
+
+    #[test]
+    fn a_layer_with_no_grid_is_only_a_problem_when_snapping_was_asked_for() {
+        let l = nangate_metal5();
+        assert!(check_snap(&l, false, false).is_none(), "no -snap_to_grid, no complaint");
+        assert!(check_snap(&l, true, true).is_none(), "asked, and the tracks are there");
+    }
+
+    #[test]
+    fn a_group_too_wide_for_its_grid_is_refused() {
+        // The upstream `design_width` case: ASAP7 M8, width 2.0 spacing 2.0 offset 10.0 over two
+        // nets, so the group is 2*2 + 1*2 = 6.0 um and the grid is 14.04 um.
+        let m8 = LayerRules {
+            name: "M8".into(),
+            units_per_micron: 1000,
+            manufacturing_grid: Some(1),
+            ..nangate_metal5()
+        };
+        let group = strap_group_width(2, 2000, 2000);
+        assert_eq!(group, 6000, "two straps and the one gap between them");
+        let d = check_group_fits(&m8, "Core", 14040, 10000, group).unwrap();
+        assert_eq!(d.code, 185);
+        // ⚠️ Three precisions in one line: the grid width to TWO decimals, the widths to ONE.
+        assert_eq!(
+            d.message,
+            "Insufficient width (14.04 um) to add straps on layer M8 in grid \"Core\" \
+             with total strap width 6.0 um and offset 10.0 um."
+        );
+    }
+
+    #[test]
+    fn a_group_that_exactly_fills_its_grid_is_accepted() {
+        // ⚠️ The test is `grid_width < offset + group`, so equality passes — a group filling the
+        // grid exactly is legal, and an off-by-one here refuses a whole class of tight designs.
+        let l = nangate_metal5();
+        assert!(check_group_fits(&l, "Core", 16000, 10000, 6000).is_none());
+        assert_eq!(check_group_fits(&l, "Core", 15999, 10000, 6000).unwrap().code, 185);
     }
 
     #[test]
