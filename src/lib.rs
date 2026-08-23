@@ -48,6 +48,38 @@ pub mod validate;
 pub mod viagen;
 pub mod vias;
 
+/// The verdict word for a run that emitted `shapes` pieces of metal.
+///
+/// 🔑 **A pass word asserts that work was DONE; if none was, do not say it.** The descriptor's
+/// assertion reads `status == "generated"`, so a run that laid no metal at all would otherwise
+/// pass a gate having built no grid. ⚠️ The failure this guards is not exotic input but **an
+/// option that fails to arrive**: an untranslated `--stripe` or `--ring` does not error, it
+/// silently contributes nothing. That mechanism hid four `tap` cases behind `-halo_width_x` and
+/// cost `ppl` a day on `set_slots_per_section`.
+///
+/// ⚠️ **`vacuous` is not an error.** A caller may legitimately ask for a grid a design cannot
+/// take. The count is in the report; the caller reads it and decides.
+///
+/// ℹ️ `vacuous` is reserved across every engine in this suite, so one word means the same thing
+/// everywhere: the run produced no work, and the declared assertion must not pass.
+pub fn settle_status(shapes: usize) -> &'static str {
+    if shapes == 0 {
+        return "vacuous";
+    }
+    "generated"
+}
+
+#[cfg(test)]
+mod settle_status_tests {
+    use super::settle_status;
+
+    #[test]
+    fn a_run_that_emitted_no_metal_is_not_reported_as_generated() {
+        assert_eq!(settle_status(0), "vacuous");
+        assert_eq!(settle_status(1), "generated");
+    }
+}
+
 /// `(xlo, ylo, xhi, yhi)`, in database units, as odb spells a rectangle.
 pub type Rect = (i32, i32, i32, i32);
 

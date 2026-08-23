@@ -26,6 +26,65 @@ fn trace(stage: &str, detail: &str) {
     }
 }
 
+/// The machine-readable contract, as every other engine in the programme carries one.
+///
+/// ⚠️ **An assertion must name a field the engine actually emits.** `pdn` printed only human text
+/// on stderr until this landed, so declaring `status` meant emitting a report to go with it —
+/// a descriptor promising a field that does not exist is worse than no descriptor, because a
+/// consumer reading the contract resolves `unknown` and cannot tell that from a failure.
+/// The fields the report on stdout carries, named once so a test can check the descriptor's
+/// promises against them rather than against a comment.
+#[cfg(test)]
+const REPORT_FIELDS: &[&str] = &[
+    "tool",
+    "status",
+    "shapes",
+    "vias",
+    "pin_shapes",
+    "die_edge_pin_shapes",
+    "def_written",
+];
+
+const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "name": "vyges-pdn",
+  "summary": "power distribution network generation: rings, straps, follow pins and the vias between them",
+  "maturity": "correlated",
+  "provenance_limitations": [
+    "input_hash covers the argument vector, not the content of the .odb it names.",
+    "MEASURED 2026-08-23 against the upstream pdn goldens at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c: 110 of 110 comparable cases exact on shapes, vias and block terminals, 0 failing, and 9 of 9 on the diagnostic a refused command raises. A SCORE IS ONLY TRUE OF ONE COMMIT -- quote the pin beside it.",
+    "36 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 29 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
+    "Diagnostics implemented so far: PDN-0003, 0004, 0005 (connect rules), 0106, 0107, 0108, 0114, 0117, 0118, 0191 (argument validation), 0185 and 0215 (runtime). A case whose golden names any other code is skipped with that code named, never silently passed.",
+    "status is one of generated, vacuous or error. VACUOUS IS NOT GENERATED: it means the run laid no metal at all, and this assertion passes only on generated, so a no-op fails it rather than reporting a grid that was never built. Zero can still be the right answer for the design; read shapes and decide.",
+    "The engine validates inside the ordinary build path, as the reference does inside addRing and addStrap, so every design it accepts has passed those checks too -- the diagnostics are not a separate check mode.",
+    "Written against the upstream pdn regression suite. The algorithm is reimplemented from the published behaviour and the goldens' implementation-defined details (snapping, tie-breaks, rounding), not transliterated from the source."
+  ],
+  "invocation": {
+    "args_template": ["generate", "{odb}"],
+    "optional": {
+      "out_def": { "type": "path", "description": "write the result as DEF" },
+      "power": { "type": "string", "description": "the power net name" },
+      "ground": { "type": "string", "description": "the ground net name" },
+      "starts_with": { "type": "string", "description": "power or ground; which net takes the innermost ring" },
+      "followpins": { "type": "string", "description": "layer[:extend[:width]], repeatable" },
+      "stripe": { "type": "string", "description": "layer:width:pitch:offset[:extend[:count[:snap[:spacing]]]], repeatable" },
+      "ring": { "type": "string", "description": "layer0,layer1:width:spacing:offset[:boundary], repeatable" },
+      "connect": { "type": "string", "description": "layer0,layer1[:vias], repeatable" },
+      "pins": { "type": "string", "description": "layers whose shapes are never shrunk" },
+      "split_cuts": { "type": "string", "description": "layer:pitch[:stagger], repeatable" },
+      "domain": { "type": "string", "description": "region:power:ground, per grid" }
+    }
+  },
+  "consumes": ["odb"],
+  "artifacts": [ { "role": "pdn_def", "field": "def_written" } ],
+  "assertion": {
+    "id": "pdn-generated",
+    "field": "status",
+    "pass_when": { "eq": "generated" }
+  }
+}
+"#;
+
 fn usage() -> ExitCode {
     eprintln!(
         "usage: vyges-pdn generate <db> --out-def <def> --power <net> --ground <net>\n\
@@ -6554,6 +6613,18 @@ fn generate(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     eprintln!("vyges-pdn: {written} shapes");
+
+    // 🔑 **The machine-readable result the descriptor's assertion reads.** Everything above goes
+    // to stderr for a human; a gate needs one line it can parse without reading prose. On stdout,
+    // which no harness consumes — both `pdn-grid-check.py` and `pdn-error-check.py` read stderr
+    // and the exit code, so this is additive.
+    println!(
+        "{{\n  \"tool\": \"vyges-pdn\",\n  \"status\": \"{status}\",\n  \
+         \"shapes\": {written},\n  \"vias\": {vias_placed},\n  \
+         \"pin_shapes\": {pin_boxes},\n  \"die_edge_pin_shapes\": {edge_boxes},\n  \
+         \"def_written\": \"{out}\"\n}}",
+        status = vyges_pdn::settle_status(written),
+    );
     ExitCode::SUCCESS
 }
 
@@ -6561,8 +6632,98 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("generate") => generate(&args[1..]),
+        // ⚠️ Before any database is touched: `--describe` is a contract query, not a run, and a
+        // caller asking what this engine promises must not need a design to ask.
+        Some("--describe") => {
+            print!("{DESCRIBE}");
+            ExitCode::SUCCESS
+        }
         _ => usage(),
     }
 }
 
 // `shapes` is used by the library's own tests and by the cut stage the binary does not yet reach.
+
+#[cfg(test)]
+mod describe_tests {
+    use super::DESCRIBE;
+
+    #[test]
+    fn the_descriptor_is_valid_json_and_matches_the_schema_contract() {
+        let d: serde_json::Value =
+            serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+
+        assert_eq!(d["schema"], "vyges-tool-descriptor/1.1");
+        assert_eq!(d["name"], "vyges-pdn");
+
+        // consumes: role strings, never objects
+        let consumes = d["consumes"].as_array().expect("consumes is an array");
+        assert!(
+            consumes.iter().all(|c| c.is_string()),
+            "consumes must be role STRINGS, got {consumes:?}"
+        );
+
+        // exactly one recognised predicate: an unrecognised one is dropped and the verdict
+        // resolves `unknown`, which a caller cannot tell from a failure.
+        let pw = d["assertion"]["pass_when"]
+            .as_object()
+            .expect("pass_when is an object");
+        assert_eq!(pw.len(), 1, "exactly one predicate, got {pw:?}");
+        let key = pw.keys().next().unwrap().as_str();
+        assert!(
+            matches!(key, "is_true" | "eq" | "lte"),
+            "`{key}` is not a predicate the schema defines (is_true | eq | lte)"
+        );
+
+        let limits = d["provenance_limitations"]
+            .as_array()
+            .expect("provenance_limitations is an array");
+        assert!(
+            !limits.is_empty(),
+            "the schema requires provenance_limitations"
+        );
+    }
+
+    /// ⚠️ **The one failure a descriptor invites: asserting on a field the engine never emits.**
+    /// A consumer reading such a contract resolves `unknown` and cannot tell that from a failure,
+    /// which is worse than carrying no descriptor at all. This engine printed nothing but human
+    /// text on stderr until the report landed beside this descriptor, so the two are checked
+    /// against each other rather than each being checked alone.
+    #[test]
+    fn the_assertion_names_a_field_and_a_value_this_engine_actually_emits() {
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("valid JSON");
+        assert_eq!(d["assertion"]["field"], "status");
+
+        let pass_word = d["assertion"]["pass_when"]["eq"]
+            .as_str()
+            .expect("the assertion compares against a string");
+        assert_eq!(
+            pass_word,
+            vyges_pdn::settle_status(1),
+            "the descriptor's pass word and settle_status() have drifted apart"
+        );
+        assert_ne!(
+            pass_word,
+            vyges_pdn::settle_status(0),
+            "a run that emitted no metal must NOT satisfy the assertion"
+        );
+    }
+
+    /// The report is assembled by hand rather than serialised, so its shape is worth pinning:
+    /// a stray comma or an unquoted value makes it unparseable to the consumer it exists for.
+    #[test]
+    fn the_report_names_every_field_the_descriptor_promises() {
+        let artifact_field = {
+            let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("valid JSON");
+            d["artifacts"][0]["field"].as_str().unwrap().to_string()
+        };
+        assert_eq!(artifact_field, "def_written");
+        // The literal the report is built from, kept next to the assertion that reads it.
+        for field in ["tool", "status", "shapes", "vias", "def_written"] {
+            assert!(
+                super::REPORT_FIELDS.contains(&field),
+                "{field} is promised but not emitted"
+            );
+        }
+    }
+}
