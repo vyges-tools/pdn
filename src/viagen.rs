@@ -407,6 +407,56 @@ pub fn snap_enclosure(e: Enclosure, manufacturing_grid: i32) -> Enclosure {
 ///
 /// ⚠️ Halved with integer division, and **not clamped**: a shape narrower than its own cut array
 /// yields a negative value, which the reference carries through rather than treating as zero.
+/// **E30** — the enclosure a shape has OUTSIDE the intersection, per layer.
+///
+/// 🔑 **The intersection is not the whole shape, and measuring enclosure from it alone throws away
+/// real metal.** A follow pin 0.054 wide crossing one 0.018 wide intersects over 0.018 — exactly
+/// the cut — so the wider layer appears to have zero enclosure and every via on the grid is
+/// refused, while 0.018 of metal sits either side doing nothing. This is the room that is there.
+///
+/// Returned as `(bottom, top)`: how far the LOWER shape reaches past the upper, and the upper past
+/// the lower.
+///
+/// ⚠️ **The SMALLER of the two sides, floored at zero.** An enclosure is symmetric about the cut,
+/// so a shape reaching far past on one side and flush on the other has no usable spare — taking the
+/// larger side, or their sum, would claim metal that is not there on the side that matters.
+///
+/// ⚠️ **The two are exact opposites**, so at most one can be positive on a given axis: whichever
+/// shape is wider has the spare and the other has none.
+pub fn spare_enclosure(lower: crate::Rect, upper: crate::Rect) -> (Enclosure, Enclosure) {
+    let x_lo = upper.0 - lower.0;
+    let x_hi = lower.2 - upper.2;
+    let y_lo = upper.1 - lower.1;
+    let y_hi = lower.3 - upper.3;
+    (
+        Enclosure {
+            x: 0.max(x_lo.min(x_hi)),
+            y: 0.max(y_lo.min(y_hi)),
+        },
+        Enclosure {
+            x: 0.max((-x_lo).min(-x_hi)),
+            y: 0.max((-y_lo).min(-y_hi)),
+        },
+    )
+}
+
+/// **E31** — the enclosure to try on a side whose rule the intersection alone cannot satisfy.
+///
+/// 🔑 **Capped at what the rule ASKS, never at what the shape HAS.** The spare is permission to
+/// meet the requirement, not licence to claim every spare unit — upstream takes
+/// `min(required, built + spare)`, so a shape with plenty of room still reports exactly the
+/// enclosure the rule wanted.
+///
+/// ⚠️ **A via admitted this way MUST NOT BE CACHED.** The answer depends on where the two shapes
+/// actually are, not merely on how big their overlap is, so a cache keyed on the crossing's size
+/// would hand this via to a crossing of the same size with no spare beside it.
+pub fn spare_applied(built: Enclosure, required: Enclosure, spare: Enclosure) -> Enclosure {
+    Enclosure {
+        x: required.x.min(built.x + spare.x),
+        y: required.y.min(built.y + spare.y),
+    }
+}
+
 pub fn overlap_enclosure(extent: (i32, i32), span: (i32, i32)) -> Enclosure {
     Enclosure {
         x: (extent.0 - span.0) / 2,
@@ -1427,6 +1477,66 @@ pub fn array_placements(fit: &ArrayFit, cut: (i32, i32)) -> Vec<ArrayPlacement> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real numbers from `asap7_M1_M2_followpin_enclosure`: an M1 follow pin 54 tall crossing
+    /// an M2 follow pin 18 tall, over an 18-tall cut. Upstream rule: V1 asks 9 of enclosure below,
+    /// and the intersection gives 0 — the 18 either side is what makes the via legal.
+    #[test]
+    fn the_spare_is_the_metal_OUTSIDE_the_intersection() {
+        let m1 = (1080, 1053, 15120, 1107); // 54 tall
+        let m2 = (1080, 1071, 15120, 1089); // 18 tall, the whole intersection
+        let (bottom, top) = spare_enclosure(m1, m2);
+        assert_eq!(bottom.y, 18, "M1 reaches 18 past M2 on each side");
+        assert_eq!(top.y, 0, "M2 reaches past nothing");
+        assert_eq!((bottom.x, top.x), (0, 0), "they share their x extent exactly");
+    }
+
+    #[test]
+    fn the_spare_takes_the_SMALLER_side_because_an_enclosure_is_symmetric() {
+        // Reaching 40 past on one side and 5 on the other gives 5 of usable enclosure, not 40
+        // and not 45: the cut sits between them and the tight side governs.
+        let lower = (0, 60, 100, 110); // 40 below the upper, 5 above it
+        let upper = (0, 100, 100, 105);
+        let (bottom, _) = spare_enclosure(lower, upper);
+        assert_eq!(bottom.y, 5);
+    }
+
+    #[test]
+    fn a_shape_that_reaches_past_on_ONE_side_only_has_no_spare() {
+        // ⚠️ Flush on one side means no room, whatever the other side does.
+        let lower = (0, 0, 100, 200);
+        let upper = (0, 0, 100, 100);
+        let (bottom, _) = spare_enclosure(lower, upper);
+        assert_eq!(bottom.y, 0, "flush at the low edge");
+    }
+
+    #[test]
+    fn the_two_sides_are_opposites_so_at_most_one_can_have_spare() {
+        let (b, t) = spare_enclosure((0, 0, 100, 100), (0, 30, 100, 70));
+        assert_eq!((b.y, t.y), (30, 0));
+        let (b, t) = spare_enclosure((0, 30, 100, 70), (0, 0, 100, 100));
+        assert_eq!((b.y, t.y), (0, 30), "swapping the roles swaps the spare");
+    }
+
+    #[test]
+    fn the_applied_enclosure_is_capped_at_what_the_RULE_asks() {
+        // 🔑 Not at what the shape has: plenty of room still reports exactly the requirement.
+        let built = Enclosure { x: 0, y: 0 };
+        let required = Enclosure { x: 0, y: 9 };
+        let spare = Enclosure { x: 0, y: 18 };
+        assert_eq!(spare_applied(built, required, spare), Enclosure { x: 0, y: 9 });
+    }
+
+    #[test]
+    fn too_little_spare_does_not_reach_the_requirement() {
+        // ⚠️ It must still FAIL afterwards — the spare is not a way to pass a rule that is unmet.
+        let got = spare_applied(
+            Enclosure { x: 0, y: 0 },
+            Enclosure { x: 0, y: 9 },
+            Enclosure { x: 0, y: 4 },
+        );
+        assert_eq!(got.y, 4, "raised to what exists, still short of 9");
+    }
 
     fn gen(name: &str, cut_area: i32, bottom: (i32, i32), top: (i32, i32)) -> Generator {
         Generator {

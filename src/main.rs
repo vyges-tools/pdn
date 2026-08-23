@@ -4924,6 +4924,23 @@ fn generate(args: &[String]) -> ExitCode {
                         };
                         // Each axis from the shape that constrains it — see `vias::via_area`.
                         let area = vyges_pdn::vias::via_area(lower_rect, upper_rect);
+                        // The metal each shape has outside that intersection — see `E30`.
+                        //
+                        // ⛔ **Upstream marks a via admitted this way UNCACHEABLE** (`can_cache_ =
+                        // false`, added in the same commit) because its `Connect::makeVia` caches
+                        // the BUILT VIA keyed by the crossing's size, and the spare depends on
+                        // where the shapes are rather than how big the overlap is.
+                        //
+                        // ✅ **No bypass is needed here, and the reason is not "we got away with
+                        // it".** This engine's `via_cache` holds the two ends' ORIENTATIONS and
+                        // nothing else, so the enclosure — spare included — is recomputed from
+                        // each crossing's own rects. A crossing of the same size with no spare
+                        // computes zero spare and fails its own check.
+                        //
+                        // ⚠️ **That stops being true the moment the cache holds geometry.** If it
+                        // is ever widened, this via must not be cached.
+                        let (spare_b, spare_t) =
+                            vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
 
                         // ── the enclosure pair, chosen the way the reference chooses it ─────
                         // 🔑 Candidates from the rules, crossed, each scored by how many cuts
@@ -5052,10 +5069,38 @@ fn generate(args: &[String]) -> ExitCode {
                                     vyges_pdn::viagen::snap_enclosure(built_b, grid_mfg);
                                 let built_t =
                                     vyges_pdn::viagen::snap_enclosure(built_t, grid_mfg);
-                                vyges_pdn::viagen::enclosure_satisfies(built_b, &bot_rules)
+                                // 🔑 **A side the intersection cannot satisfy is re-checked
+                                // against the metal OUTSIDE it.** `determineRowsAndColumns` ends
+                                // by applying the spare enclosure to whichever side still fails,
+                                // capped at what the rule asks. Without it a follow pin wider
+                                // than the layer it crosses reports zero enclosure and every via
+                                // on the grid is refused — `asap7_M1_M2_followpin_enclosure` is
+                                // 53 vias that come back as 0.
+                                //
+                                // ⚠️ **Per side, and only the failing one.** Upstream checks the
+                                // bottom and top separately (`checkMinEnclosure(true, false)`),
+                                // so a side that already passes is left exactly as built.
+                                let ok_b = vyges_pdn::viagen::enclosure_satisfies(
+                                    built_b, &bot_rules,
+                                ) || (spare_b.x > 0 || spare_b.y > 0)
                                     && vyges_pdn::viagen::enclosure_satisfies(
-                                        built_t, &top_rules,
-                                    )
+                                        vyges_pdn::viagen::snap_enclosure(
+                                            vyges_pdn::viagen::spare_applied(built_b, b, spare_b),
+                                            grid_mfg,
+                                        ),
+                                        &bot_rules,
+                                    );
+                                let ok_t = vyges_pdn::viagen::enclosure_satisfies(
+                                    built_t, &top_rules,
+                                ) || (spare_t.x > 0 || spare_t.y > 0)
+                                    && vyges_pdn::viagen::enclosure_satisfies(
+                                        vyges_pdn::viagen::snap_enclosure(
+                                            vyges_pdn::viagen::spare_applied(built_t, t, spare_t),
+                                            grid_mfg,
+                                        ),
+                                        &top_rules,
+                                    );
+                                ok_b && ok_t
                             },
                         ) else {
                             if std::env::var_os("PDN_VIA_TRACE").is_some() {
