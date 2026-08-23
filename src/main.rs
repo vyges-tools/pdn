@@ -69,7 +69,7 @@ fn describe() -> String {
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "@OPENROAD_PIN@",
-  "name": "vyges-pdn",
+  "name": "pdn",
   "summary": "power distribution network generation: rings, straps, follow pins and the vias between them",
   "maturity": "correlated",
   "provenance_limitations": [
@@ -6676,7 +6676,9 @@ mod describe_tests {
             serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
 
         assert_eq!(d["schema"], "vyges-tool-descriptor/1.1");
-        assert_eq!(d["name"], "vyges-pdn");
+        // The bare engine name, as every other engine in the suite reports — the figure
+        // derivation and the curation file both key on it. The BINARY is vyges-pdn.
+        assert_eq!(d["name"], "pdn");
 
         // consumes: role strings, never objects
         let consumes = d["consumes"].as_array().expect("consumes is an array");
