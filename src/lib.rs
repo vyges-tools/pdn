@@ -100,3 +100,48 @@ pub enum Direction {
     Vertical,
     None,
 }
+
+/// Compile a global-connection pattern with **full-match** semantics.
+///
+/// ⛔ **`std::regex_match` (upstream) matches the WHOLE string; Rust's `Regex::is_match` is a
+/// SEARCH.** `_dbGlobalConnect::appliesTo` is `std::regex_match(inst->getConstName(), inst_regex_)`
+/// and the pin mapping is the same, so an unanchored port here silently widens every rule: a rule
+/// written for the instance `u_cpu` would also claim `u_cpu_reset` and `top/u_cpu2`, connecting
+/// supply pins the rule never named. Anchoring is the transcription, not a convenience.
+///
+/// ⚠️ The pattern is wrapped in a NON-capturing group before anchoring. Without it, a top-level
+/// alternation binds wrongly: `^a|b$` is "starts with a, or ends with b", which is not `a|b`.
+pub fn full_match_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+}
+
+#[cfg(test)]
+mod global_connect_tests {
+    use super::full_match_regex;
+
+    #[test]
+    fn a_pattern_matches_the_whole_name_not_a_substring() {
+        let re = full_match_regex("u_cpu").unwrap();
+        assert!(re.is_match("u_cpu"));
+        assert!(!re.is_match("u_cpu_reset"), "a search would claim this instance too");
+        assert!(!re.is_match("top/u_cpu"), "and this one");
+    }
+
+    #[test]
+    fn the_patterns_a_pdn_config_actually_uses_still_behave() {
+        // Nangate45.pdn.tcl: -inst_pattern {.*} -pin_pattern {^VDD$}
+        assert!(full_match_regex(".*").unwrap().is_match("anything/at/all"));
+        let vdd = full_match_regex("^VDD$").unwrap();
+        assert!(vdd.is_match("VDD"));
+        assert!(!vdd.is_match("VDDPE"), "the config keeps these as separate rules on purpose");
+    }
+
+    #[test]
+    fn an_alternation_is_grouped_before_it_is_anchored() {
+        // ⛔ Without the non-capturing group this reads as ^a | b$ and matches "abc" and "xb".
+        let re = full_match_regex("VDD|VSS").unwrap();
+        assert!(re.is_match("VDD") && re.is_match("VSS"));
+        assert!(!re.is_match("VDDX"), "^a|b$ would have accepted this");
+        assert!(!re.is_match("XVSS"));
+    }
+}

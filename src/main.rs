@@ -6665,10 +6665,206 @@ fn generate(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `global-connect`: `add_global_connection` + `global_connect`, transcribed.
+///
+/// 🔑 **This is LibreLane `Classic` step 15's job** (`Odb.SetPowerConnections`) and the last
+/// reference step the floorplan chain still borrowed from OpenROAD. Without it the supply nets do
+/// not exist and this engine correctly refuses with "no net named VSS".
+///
+/// **`add_global_connection`** (`OpenRoad.tcl:378`), per rule, in declaration order:
+///   * find the net; **create it when absent** (upstream warns ORD-44 when neither `-power` nor
+///     `-ground` was given, because an accidental signal net is the likely mistake);
+///   * `-power`  -> `setSpecial()` **and** `setSigType(POWER)`;
+///   * `-ground` -> `setSpecial()` **and** `setSigType(GROUND)`.
+///
+/// **`dbBlock::globalConnect`** (`dbBlock.cpp:3424`), then, over the accumulated rules:
+///   * instances marked do-not-touch are removed BEFORE matching;
+///   * a rule whose net is do-not-touch is skipped whole (ODB-379);
+///   * per matching instance, per matching master terminal:
+///       - already on this net            -> nothing to do;
+///       - on a do-not-touch net          -> left alone;
+///       - on some OTHER net, without force -> counted as a CONFLICT and skipped;
+///       - otherwise                      -> connect, and `setSpecial()` on the iterm when the
+///                                           net is special.
+///
+/// ⛔ **`std::regex_match` is a FULL match; Rust's `is_match` is a SEARCH.** Both patterns are
+/// therefore anchored here. Leaving them unanchored would make `-pin_pattern {^VDD$}` behave the
+/// same but `-inst_pattern {u_cpu}` match every instance containing that substring, silently
+/// connecting far more than the rule asked for.
+///
+/// ⚠️ **Non-region rules run before region rules** upstream ("order rules so non-regions are
+/// handled first"). Regions are not implemented here; a rule naming one is refused rather than
+/// quietly treated as global.
+fn global_connect(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    let mut force = false;
+    // (net, pin_pattern, inst_pattern, kind)
+    let mut rules: Vec<(String, String, String, String)> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--force" => force = true,
+            "--out-odb" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = Some(v),
+                    None => {
+                        eprintln!("vyges-pdn global-connect: --out-odb needs a FILE");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--connect" => {
+                i += 1;
+                let Some(spec) = args.get(i) else {
+                    eprintln!("vyges-pdn global-connect: --connect needs NET:PINPAT:INSTPAT:KIND");
+                    return ExitCode::from(2);
+                };
+                let f: Vec<&str> = spec.splitn(4, ':').collect();
+                if f.len() != 4 {
+                    eprintln!("vyges-pdn global-connect: --connect wants NET:PINPAT:INSTPAT:KIND, \
+                               got {spec:?}");
+                    return ExitCode::from(2);
+                }
+                if !matches!(f[3], "power" | "ground" | "signal") {
+                    eprintln!("vyges-pdn global-connect: KIND must be power|ground|signal, \
+                               got {:?}", f[3]);
+                    return ExitCode::from(2);
+                }
+                rules.push((f[0].into(), f[1].into(), f[2].into(), f[3].into()));
+            }
+            a if a.starts_with("--") => {
+                eprintln!("vyges-pdn global-connect: unknown option {a}");
+                return ExitCode::from(2);
+            }
+            a => path = Some(a),
+        }
+        i += 1;
+    }
+
+    let Some(path) = path else {
+        eprintln!("vyges-pdn global-connect: needs <design.odb>");
+        return ExitCode::from(2);
+    };
+    // ⛔ No rules is VACUOUS, not success: a pass word must never come from a run that did nothing.
+    if rules.is_empty() {
+        eprintln!("vyges-pdn global-connect: no --connect rule given; nothing was connected.");
+        return ExitCode::from(3);
+    }
+
+    let mut db = match vyges_opendb::Db::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("vyges-pdn global-connect: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // ---- add_global_connection: create the nets and type them, in declaration order ----------
+    let mut warned: Vec<String> = Vec::new();
+    for (net, _pin, _inst, kind) in &rules {
+        let exists = db.net_names().iter().any(|n| n == net);
+        if !exists {
+            if let Err(e) = db.create_net(net) {
+                eprintln!("vyges-pdn global-connect: cannot create net {net}: {e}");
+                return ExitCode::from(1);
+            }
+            if kind == "signal" {
+                // Upstream ORD-44: created a net with no -power/-ground, which is usually a slip.
+                warned.push(format!("created net {net} with no power/ground kind (ORD-44)"));
+            }
+        }
+        if kind == "power" || kind == "ground" {
+            let ty = if kind == "power" { "POWER" } else { "GROUND" };
+            if let Err(e) = db.net_set_special(net).and_then(|_| db.net_set_sig_type(net, ty)) {
+                eprintln!("vyges-pdn global-connect: cannot type net {net} as {ty}: {e}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+
+    // ---- globalConnect: apply every rule, in order -------------------------------------------
+    let insts = db.inst_names();
+    // ⚠️ Instances marked do-not-touch are removed BEFORE matching, not skipped inside the loop.
+    let live: Vec<String> =
+        insts.into_iter().filter(|n| !db.inst_is_do_not_touch(n)).collect();
+    let mut masters: std::collections::HashMap<String, Vec<String>> = Default::default();
+
+    let mut connected = 0usize;
+    let mut skipped = 0usize;
+    for (net, pin_pat, inst_pat, _kind) in &rules {
+        if db.net_is_do_not_touch(net) {
+            warned.push(format!("{net} is marked do not touch, skipped (ODB-379)"));
+            continue;
+        }
+        let (Ok(inst_re), Ok(pin_re)) = (
+            vyges_pdn::full_match_regex(inst_pat),
+            vyges_pdn::full_match_regex(pin_pat),
+        ) else {
+            eprintln!("vyges-pdn global-connect: bad pattern in rule for {net}");
+            return ExitCode::from(2);
+        };
+        let special = db.net_is_special(net);
+        for inst in &live {
+            if !inst_re.is_match(inst) {
+                continue;
+            }
+            let master = db.inst_get_master(inst);
+            let terms = masters
+                .entry(master.clone())
+                .or_insert_with(|| db.master_get_m_terms(&master))
+                .clone();
+            for t in terms.iter().filter(|t| pin_re.is_match(t)) {
+                let current = db.iterm_get_net(inst, t);
+                if current == *net {
+                    continue; // already connected
+                }
+                if !current.is_empty() {
+                    if db.net_is_do_not_touch(&current) {
+                        continue; // connected to a do-not-touch net: left alone
+                    }
+                    if !force {
+                        skipped += 1; // a conflict; upstream needs -force to move it
+                        continue;
+                    }
+                }
+                if let Err(e) = db.connect(inst, t, net) {
+                    eprintln!("vyges-pdn global-connect: {inst}/{t} -> {net}: {e}");
+                    return ExitCode::from(1);
+                }
+                if special {
+                    let _ = db.iterm_set_special(inst, t);
+                }
+                connected += 1;
+            }
+        }
+    }
+
+    let dest = out.unwrap_or(path);
+    if let Err(e) = db.write(dest) {
+        eprintln!("vyges-pdn global-connect: cannot write {dest}: {e}");
+        return ExitCode::from(2);
+    }
+    println!("{}", serde_json::json!({
+        "tool": "vyges-pdn",
+        "command": "global-connect",
+        "status": "applied",
+        "connections": connected,
+        "conflicts_skipped": skipped,
+        "rules": rules.len(),
+        "warnings": warned,
+        "odb_written": dest,
+    }));
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("generate") => generate(&args[1..]),
+        Some("global-connect") => global_connect(&args[1..]),
         // ⚠️ Before any database is touched: `--describe` is a contract query, not a run, and a
         // caller asking what this engine promises must not need a design to ask.
         Some("--help") | Some("-h") => help(),
