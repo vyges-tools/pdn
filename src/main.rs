@@ -2521,6 +2521,21 @@ fn generate(args: &[String]) -> ExitCode {
     // ── what the technology allows a component to state ─────────────────────────────────────
     // 🔑 **Before anything is built, and the first violation ends the run.** See `validate_grids`.
     if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron, core) {
+        // 🔑 **One site, every diagnostic.** `Diag` already carries the reference's own code and
+        // wording (PDN-0003/0004/0005, 0106/0107/0108/0114/0117/0118/0191, 0185, 0215), and its
+        // `Display` renders upstream's exact `[ERROR PDN-0106] ...` line. Routing it here puts all
+        // twelve on the causal trail without a second list to keep in step with the first.
+        //
+        // ⚠️ The house code carries the reference's NUMBER, so a consumer can cluster by the code
+        // upstream would have raised rather than by our prose.
+        vyges_events::emit(
+            &vyges_events::Event::new(
+                "vyges-pdn",
+                vyges_events::Severity::Error,
+                format!("PDN-{:04} {}", d.code, d.message),
+            )
+            .with_code(&format!("PDN-{:04}", d.code)),
+        );
         eprintln!("{d}");
         return ExitCode::from(1);
     }
@@ -2789,6 +2804,26 @@ fn generate(args: &[String]) -> ExitCode {
     }
     let mut pending: Vec<PendingVias> = Vec::new();
     for (grid_index, (grid, opts)) in grids.iter().enumerate() {
+        // 🔑 **`Grid::makeShapes` opens with PDN-0001** (`grid.cpp:122`), once per grid, and the
+        // name it prints is `getLongName()`: the grid's own name for a core grid, and
+        // `"<name> - <instance>"` for an instance grid (`grid.cpp:1442`). Reproducing the long
+        // form matters — a design with one macro grid per macro prints one line each, and the
+        // instance is the only thing telling them apart.
+        vyges_events::emit(
+            &vyges_events::Event::new(
+                "vyges-pdn",
+                vyges_events::Severity::Info,
+                format!(
+                    "PDN-0001 Inserting grid: {}",
+                    if grid.instance.is_empty() {
+                        grid.name.clone()
+                    } else {
+                        format!("{} - {}", grid.name, grid.instance)
+                    }
+                ),
+            )
+            .with_code("PDN-GRID-INSERT"),
+        );
         // 🔑 **`-starts_with` belongs to the GRID that declared it**, and `define_pdn_grid`
         // defaults it to GROUND — `set start_with_power 0`. A grid that says nothing gets ground
         // however loudly a sibling asked for power.
