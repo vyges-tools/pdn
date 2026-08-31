@@ -133,6 +133,12 @@ const USAGE: &str = concat!(
          \x20        [--pins <layer>[,<layer>...]]  (shapes there are never shrunk)\n\
          \x20        [--split-cuts <layer>:<pitch>[:stagger]]   (micron, repeatable)\n\
          \n\
+         \x20  vyges-pdn global-connect <db> --connect NET:PINPAT:INSTPAT:power|ground|signal\n\
+         \x20        [--connect ...]  [--force]  [--out-odb FILE]\n\
+         \x20        creates the supply nets and connects matching instance pins to them.\n\
+         \x20        Patterns are FULL matches, as OpenROAD's are. Without this, `generate`\n\
+         \x20        refuses: there is no net to build a grid on.\n\
+         \n\
          \x20  vyges-pdn --describe | --help | --version\n\
          \n\
          ⚠️ Shapes are emitted BEFORE trimming, which belongs with the via stage. Compare against\n\
