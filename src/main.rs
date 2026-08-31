@@ -2027,7 +2027,11 @@ fn generate(args: &[String]) -> ExitCode {
     let mut db = match Db::open(path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("vyges-pdn: cannot open {path}: {e}");
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Error,
+                format!("cannot open {path}: {e}"),
+            );
             return ExitCode::from(2);
         }
     };
@@ -2114,7 +2118,11 @@ fn generate(args: &[String]) -> ExitCode {
                 continue;
             }
             if nets::domain_name(name) != nets::CORE_DOMAIN {
-                eprintln!("vyges-pdn: voltage domain {name:?} is not the core domain");
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Warn,
+                    format!("voltage domain {name:?} is not the core domain"),
+                );
                 return ExitCode::from(2);
             }
         }
@@ -2265,10 +2273,12 @@ fn generate(args: &[String]) -> ExitCode {
         blockages.push((layer.clone(), *rect, None, *rect));
     }
     if !skipped_gridded.is_empty() {
-        eprintln!(
-            "vyges-pdn: {} gridded instance(s) contribute no real obstruction \
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Warn,
+            format!("{} gridded instance(s) contribute no real obstruction \
              (makeInitialObstructions skips them; their keep-out is grid-level only)",
-            skipped_gridded.len()
+            skipped_gridded.len()),
         );
         if std::env::var_os("PDN_TRACE").is_some() {
             for inst in &skipped_gridded {
@@ -2874,7 +2884,11 @@ fn generate(args: &[String]) -> ExitCode {
             let switched = f.next().unwrap_or("").to_string();
             let boxes = db.region_boundaries(name).unwrap_or_default();
             if boxes.is_empty() || power.is_empty() || ground.is_empty() {
-                eprintln!("vyges-pdn: no usable region {name:?} for grid {:?}", grid.name);
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Warn,
+                    format!("no usable region {name:?} for grid {:?}", grid.name),
+                );
                 return None;
             }
             let area = boxes
@@ -2902,7 +2916,11 @@ fn generate(args: &[String]) -> ExitCode {
         } else {
             let bbox = db.inst_bbox(&grid.instance).unwrap_or_default();
             if bbox.len() != 4 {
-                eprintln!("vyges-pdn: no instance {:?} for grid {:?}", grid.instance, grid.name);
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Warn,
+                    format!("no instance {:?} for grid {:?}", grid.instance, grid.name),
+                );
                 continue;
             }
             let area = (bbox[0], bbox[1], bbox[2], bbox[3]);
@@ -3385,8 +3403,10 @@ fn generate(args: &[String]) -> ExitCode {
                         ring_area,
                         per_micron,
                     ) else {
-                        eprintln!(
-                            "vyges-pdn: unable to determine width of followpin straps from standard cells"
+                        vyges_events::log(
+                            "vyges-pdn",
+                            vyges_events::Severity::Warn,
+                            "unable to determine width of followpin straps from standard cells",
                         );
                         return ExitCode::from(2);
                     };
@@ -3746,7 +3766,11 @@ fn generate(args: &[String]) -> ExitCode {
         let dropped = emitted.iter().filter(|(_, _, r, _)| *r == (0, 0, 0, 0)).count();
         if dropped != 0 {
             emitted.retain(|(_, _, r, _)| *r != (0, 0, 0, 0));
-            eprintln!("vyges-pdn: {dropped} over-pad straps removed with nowhere legal to sit");
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Warn,
+                format!("{dropped} over-pad straps removed with nowhere legal to sit"),
+            );
         }
 
         // ── cleanupShapes ────────────────────────────────────────────────────────────────────────
@@ -3842,7 +3866,11 @@ fn generate(args: &[String]) -> ExitCode {
                     // to be kept out.
                     let dont_use = parts.next().filter(|d| !d.is_empty()).and_then(|d| {
                         regex::Regex::new(d)
-                            .map_err(|e| eprintln!("vyges-pdn: bad --connect via filter {d:?}: {e}"))
+                            .map_err(|e| vyges_events::log(
+                                             "vyges-pdn",
+                                             vyges_events::Severity::Warn,
+                                             format!("bad --connect via filter {d:?}: {e}"),
+                                         ))
                             .ok()
                     });
                     // ⚠️ **Per connect, not global.** `-ongrid` names layers whose track grid this
@@ -4385,9 +4413,11 @@ fn generate(args: &[String]) -> ExitCode {
                 vyges_pdn::trim::Decision::Remove => {}
             }
         }
-        eprintln!(
-            "vyges-pdn: trim kept {} of {} shapes; {held_any} had something attached, {} vias known",
-            kept.len(), emitted_before, via_areas.len()
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("trim kept {} of {} shapes; {held_any} had something attached, {} vias known",
+            kept.len(), emitted_before, via_areas.len()),
         );
         emitted = kept;
 
@@ -4444,9 +4474,11 @@ fn generate(args: &[String]) -> ExitCode {
         });
         drcfill.retain(|(net, _, _, lo, hi, area)| held(net, lo, hi, *area));
         if placements.len() != before {
-            eprintln!(
-                "vyges-pdn: {} vias dropped as no longer held",
-                before - placements.len()
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Debug,
+                format!("{} vias dropped as no longer held",
+                before - placements.len()),
             );
         }
     }
@@ -6178,10 +6210,12 @@ fn generate(args: &[String]) -> ExitCode {
                 }
             }
         }
-        eprintln!(
-            "vyges-pdn: {} via locations, {} dropped, {written} written",
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{} via locations, {} dropped, {written} written",
             placed.len(),
-            dropped.len()
+            dropped.len()),
         );
     }
 
@@ -6335,14 +6369,20 @@ fn generate(args: &[String]) -> ExitCode {
                 .iter()
                 .any(|(n, l, h, a)| n == net && l == lo && h == hi && a == area)
         });
-        eprintln!(
-            "vyges-pdn: {ripped} vias ripped up ({direct} for metal outside their shape, \
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{ripped} vias ripped up ({direct} for metal outside their shape, \
              {} with the stacks they broke)",
-            ripped - direct
+            ripped - direct),
         );
     }
     if !via_faces.is_empty() {
-        eprintln!("vyges-pdn: {widened} shapes grown to cover via metal");
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{widened} shapes grown to cover via metal"),
+        );
     }
 
     // ── shapes left floating by failed vias ───────────────────────────────────────────────────
@@ -6396,9 +6436,11 @@ fn generate(args: &[String]) -> ExitCode {
             })
         });
         if emitted.len() != before {
-            eprintln!(
-                "vyges-pdn: {} shape(s) left floating by failed vias and removed",
-                before - emitted.len()
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Warn,
+                format!("{} shape(s) left floating by failed vias and removed",
+                before - emitted.len()),
             );
         }
     }
@@ -6485,8 +6527,10 @@ fn generate(args: &[String]) -> ExitCode {
                 // `bterm->connect(net)` here; no accessor for that is bridged yet, so an adopted
                 // terminal keeps whatever net it had. Stated rather than silently skipped — a
                 // design reaching this path gets a terminal on the wrong net.
-                eprintln!(
-                    "vyges-pdn: terminal {net} adopted but not connected -- no accessor for it"
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Warn,
+                    format!("terminal {net} adopted but not connected -- no accessor for it"),
                 );
                 let _ = db.bterm_set_io_type(net, "INOUT");
                 net.clone()
@@ -6498,7 +6542,11 @@ fn generate(args: &[String]) -> ExitCode {
                         net.clone()
                     }
                     Err(e) => {
-                        eprintln!("vyges-pdn: cannot create a terminal for {net}: {e}");
+                        vyges_events::log(
+                            "vyges-pdn",
+                            vyges_events::Severity::Warn,
+                            format!("cannot create a terminal for {net}: {e}"),
+                        );
                         continue;
                     }
                 }
@@ -6532,7 +6580,11 @@ fn generate(args: &[String]) -> ExitCode {
         match db.add_swire_box_shaped(net, layer, *rect, false, shape) {
             Ok(()) => written += 1,
             Err(e) => {
-                eprintln!("vyges-pdn: cannot write {net} on {layer}: {e}");
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Warn,
+                    format!("cannot write {net} on {layer}: {e}"),
+                );
                 return ExitCode::from(2);
             }
         }
@@ -6545,13 +6597,19 @@ fn generate(args: &[String]) -> ExitCode {
     // special wires and the clear above would take them.
     for (net, layer, rect, ..) in &drcfill {
         if let Err(e) = db.add_swire_box_shaped(net, layer, *rect, false, "DRCFILL") {
-            eprintln!("vyges-pdn: cannot write DRCFILL on {layer}: {e}");
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Warn,
+                format!("cannot write DRCFILL on {layer}: {e}"),
+            );
         }
     }
     if !drcfill.is_empty() {
-        eprintln!(
-            "vyges-pdn: {} patches on passed-through layers",
-            drcfill.len()
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{} patches on passed-through layers",
+            drcfill.len()),
         );
     }
     // 🔑 **A via takes the shape TYPE of what it lands on, not `STRIPE` always.**
@@ -6608,9 +6666,11 @@ fn generate(args: &[String]) -> ExitCode {
         }
     }
     if !placements.is_empty() {
-        eprintln!(
-            "vyges-pdn: {vias_placed} of {} vias placed",
-            placements.len()
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{vias_placed} of {} vias placed",
+            placements.len()),
         );
     }
     // ── the pin geometry itself ──────────────────────────────────────────────────────────────
@@ -6632,7 +6692,11 @@ fn generate(args: &[String]) -> ExitCode {
             match db.bterm_add_pin_box(bterm, layer, *rect) {
                 Ok(true) => pin_boxes += 1,
                 Ok(false) => {}
-                Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
+                Err(e) => vyges_events::log(
+                              "vyges-pdn",
+                              vyges_events::Severity::Warn,
+                              format!("cannot pin {net} on {layer}: {e}"),
+                          ),
             }
         }
     }
@@ -6664,11 +6728,19 @@ fn generate(args: &[String]) -> ExitCode {
         match db.bterm_add_pin_box(bterm, layer, r) {
             Ok(true) => edge_boxes += 1,
             Ok(false) => {}
-            Err(e) => eprintln!("vyges-pdn: cannot pin {net} on {layer}: {e}"),
+            Err(e) => vyges_events::log(
+                          "vyges-pdn",
+                          vyges_events::Severity::Warn,
+                          format!("cannot pin {net} on {layer}: {e}"),
+                      ),
         }
     }
     if pin_boxes + edge_boxes > 0 {
-        eprintln!("vyges-pdn: {pin_boxes} pin shapes, {edge_boxes} at the die edge");
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{pin_boxes} pin shapes, {edge_boxes} at the die edge"),
+        );
     }
 
     // 🔑 **A terminal this run created and then left empty is destroyed.** `PdnGen::writeToDb`
@@ -6687,10 +6759,18 @@ fn generate(args: &[String]) -> ExitCode {
     }
 
     if let Err(e) = db.write_def(out) {
-        eprintln!("vyges-pdn: cannot write {out}: {e}");
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Error,
+            format!("cannot write {out}: {e}"),
+        );
         return ExitCode::from(2);
     }
-    eprintln!("vyges-pdn: {written} shapes");
+    vyges_events::log(
+        "vyges-pdn",
+        vyges_events::Severity::Debug,
+        format!("{written} shapes"),
+    );
 
     // 🔑 **The machine-readable result the descriptor's assertion reads.** Everything above goes
     // to stderr for a human; a gate needs one line it can parse without reading prose. On stdout,
