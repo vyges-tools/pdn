@@ -6853,6 +6853,21 @@ fn global_connect(args: &[String]) -> ExitCode {
         eprintln!("vyges-pdn global-connect: cannot write {dest}: {e}");
         return ExitCode::from(2);
     }
+    // 🔑 **Upstream's own line** — `_dbBlock::globalConnect` closes with ODB-403
+    // (`dbBlock.cpp:3502`), including the "use -force" tail only when something was skipped.
+    // This is `pdn`'s first structured event: the crate carried the `vyges-events` dependency
+    // with no emission at all, so the largest construction engine reached the trail silently.
+    vyges_events::emit(
+        &vyges_events::Event::new(
+            "vyges-pdn",
+            vyges_events::Severity::Info,
+            format!(
+                "ODB-0403 {connected} connections made, {skipped} conflicts skipped{}",
+                if skipped == 0 { "." } else { ", use -force to connect." }
+            ),
+        )
+        .with_code("PDN-GLOBAL-CONNECT"),
+    );
     println!("{}", serde_json::json!({
         "tool": "vyges-pdn",
         "command": "global-connect",
