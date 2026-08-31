@@ -6983,7 +6983,10 @@ fn global_connect(args: &[String]) -> ExitCode {
         )
         .with_code("PDN-GLOBAL-CONNECT"),
     );
-    println!("{}", serde_json::json!({
+    // ⚠️ PRETTY, like `generate`'s report. `json!`'s Display is compact, and a chain that prints
+    // one command's report as a block and the next one's as a single long line reads as two
+    // different tools.
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "tool": "vyges-pdn",
         "command": "global-connect",
         "status": "applied",
@@ -6992,7 +6995,7 @@ fn global_connect(args: &[String]) -> ExitCode {
         "rules": rules.len(),
         "warnings": warned,
         "odb_written": dest,
-    }));
+    })).expect("the global-connect report is valid JSON"));
     ExitCode::SUCCESS
 }
 
