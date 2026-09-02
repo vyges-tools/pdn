@@ -138,6 +138,9 @@ const USAGE: &str = concat!(
          \x20        creates the supply nets and connects matching instance pins to them.\n\
          \x20        Patterns are FULL matches, as OpenROAD's are. Without this, `generate`\n\
          \x20        refuses: there is no net to build a grid on.\n\
+         \x20        status is applied or vacuous. VACUOUS IS NOT APPLIED: the rules matched no\n\
+         \x20        pin and nothing was connected. Exit is still 0 -- a design already wired\n\
+         \x20        correctly connects nothing on a second run -- so read connections.\n\
          \n\
          \x20  vyges-pdn --describe | --help | --version\n\
          \n\
@@ -6989,7 +6992,9 @@ fn global_connect(args: &[String]) -> ExitCode {
     println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "tool": "vyges-pdn",
         "command": "global-connect",
-        "status": "applied",
+        // ⛔ NOT the literal "applied". A run whose rules matched nothing connected nothing, and
+        // the pass word must not come from it — see `connect_status`.
+        "status": vyges_pdn::connect_status(connected),
         "connections": connected,
         "conflicts_skipped": skipped,
         "rules": rules.len(),

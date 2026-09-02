@@ -80,6 +80,47 @@ mod settle_status_tests {
     }
 }
 
+/// The verdict word for a `global-connect` run that made `connected` connections.
+///
+/// 🔑 **Same reserved word, different pass word.** `generate`'s is `generated`; this command's is
+/// `applied`, and the rule is identical — a pass word asserts that work was DONE, so a run that
+/// connected nothing must not say it.
+///
+/// ⛔ **The failure this guards is an option that fails to ARRIVE, not exotic input.** Measured
+/// 2026-09-02 by the `io-ring.sh` flow: four `--connect` rules whose instance pattern was empty
+/// matched nothing, and the report read `"status": "applied"`, `connections: 0`, `rules: 4`, no
+/// warning, exit 0. The next command then failed with `no net named DVSS` — three steps later,
+/// where the cause was no longer visible. The same mechanism hid four `tap` cases behind
+/// `-halo_width_x` and cost `ppl` a day on `set_slots_per_section`.
+///
+/// ⚠️ **`vacuous` is not an error, and this one is not even unusual.** A design whose pins are
+/// already on the right nets legitimately connects nothing on a second run — upstream's own
+/// `_dbBlock::globalConnect` skips an iterm already on the target net (`dbBlock.cpp`) and reports
+/// `0 connections made` without complaint. So the exit status stays 0 and the log line is
+/// unchanged; what changes is that the envelope stops claiming a transformation happened.
+///
+/// ⛔ **Do not "fix" this by warning instead.** Upstream warns only when there are NO rules
+/// (`ODB-378`) or an instance is do-not-touch (`ODB-383`); it says nothing when rules match
+/// nothing. Adding a warning would be a divergence in the log the correlation harness compares.
+pub fn connect_status(connected: usize) -> &'static str {
+    if connected == 0 {
+        return "vacuous";
+    }
+    "applied"
+}
+
+#[cfg(test)]
+mod connect_status_tests {
+    use super::connect_status;
+
+    #[test]
+    fn rules_that_matched_nothing_are_not_reported_as_applied() {
+        // The exact shape the flow hit: four rules in, zero connections out.
+        assert_eq!(connect_status(0), "vacuous");
+        assert_eq!(connect_status(1), "applied");
+    }
+}
+
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
