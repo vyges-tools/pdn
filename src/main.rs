@@ -74,7 +74,9 @@ const DESCRIBE: &str = r#"{
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "MEASURED 2026-08-23 against the upstream pdn goldens at pin @OPENROAD_PIN@: 110 of 110 comparable cases exact on shapes, vias and block terminals, 0 failing, and 9 of 9 on the diagnostic a refused command raises. A SCORE IS ONLY TRUE OF ONE COMMIT -- quote the pin beside it.",
+    "MEASURED 2026-09-03 against the upstream pdn goldens at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34: 106 of 114 comparable cases exact on shapes, vias and block terminals, of 151 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
+    "Of the 8 failures, SIX are cases upstream added in the same window and this engine has never supported: core_grid_mirrored_rows, core_grid_multiheight_rows, core_grid_multiheight_rows_pitch, core_grid_multiheight_site_order, stacked_via_merged_enclosure and pads_ihp_sg13g2_balance. HYBRID AND MULTI-HEIGHT ROWS are the gap they name. Only TWO are regressions against goldens upstream changed: pads_black_parrot_flipchip_connect_overpads and power_switch_cut_rows.",
+    "The previous reading was 104 of 104 at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c on 2026-08-30. An earlier `110 of 110` carried in this descriptor was NOT reproducible and is withdrawn.",
     "36 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 29 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
     "Diagnostics implemented so far: PDN-0003, 0004, 0005 (connect rules), 0106, 0107, 0108, 0114, 0117, 0118, 0191 (argument validation), 0185 and 0215 (runtime). A case whose golden names any other code is skipped with that code named, never silently passed.",
     "status is one of generated, vacuous or error. VACUOUS IS NOT GENERATED: it means the run laid no metal at all, and this assertion passes only on generated, so a no-op fails it rather than reporting a grid that was never built. Zero can still be the right answer for the design; read shapes and decide.",
@@ -7141,14 +7143,46 @@ mod pin_tests {
         assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
     }
 
-    /// ⛔ The whole point of inheriting the pin is that no engine carries one of its own.
+    /// ⛔ The `openroad_pin` FIELD must never be a literal — that is what `--pins` reads, and a
+    /// hand-typed constant makes the comparison vacuous.
+    ///
+    /// ⚠️ **It guards the FIELD, not the prose, and the earlier version got that wrong.** It
+    /// rejected any 40-hex token ANYWHERE in the descriptor, which forbids the one thing a
+    /// correlation claim must do: **name the commit it was MEASURED at**. Under that rule
+    /// `"MEASURED ... at pin @OPENROAD_PIN@: 110 of 110"` was the only legal spelling, and it
+    /// silently re-asserts a 2026-08-23 measurement at every future pin — the descriptor claimed
+    /// 110 of 110 at `7d490b8`, where the real reading is 106 of 114.
+    ///
+    /// 🔑 **The pin a binary was BUILT against and the pin a score was MEASURED at are different
+    /// facts.** The first is inherited; the second is written down and left alone.
     #[test]
-    fn no_sha_is_hardcoded_anywhere_in_the_descriptor() {
-        let raw = super::DESCRIBE;
-        for tok in raw.split(|c: char| !c.is_ascii_hexdigit()) {
+    fn the_openroad_pin_field_is_the_token_not_a_literal() {
+        let raw: serde_json::Value = serde_json::from_str(super::DESCRIBE)
+            .expect("the raw descriptor is valid JSON before substitution");
+        assert_eq!(
+            raw["openroad_pin"], PIN_TOKEN,
+            "openroad_pin must be {PIN_TOKEN} in the source so it tracks the build"
+        );
+    }
+
+    /// A measurement that names no commit is unquotable, so every `MEASURED` claim must carry a
+    /// full SHA — the opposite of what the old blanket test enforced.
+    #[test]
+    fn every_measured_claim_names_the_commit_it_was_taken_at() {
+        let raw: serde_json::Value =
+            serde_json::from_str(super::DESCRIBE).expect("valid JSON");
+        for lim in raw["provenance_limitations"].as_array().expect("an array") {
+            let t = lim.as_str().unwrap();
+            if !t.starts_with("MEASURED") {
+                continue;
+            }
+            let has_sha = t
+                .split(|c: char| !c.is_ascii_hexdigit())
+                .any(|tok| tok.len() == 40);
+            assert!(has_sha, "a MEASURED claim must name its commit: {t}");
             assert!(
-                tok.len() < 40,
-                "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
+                !t.contains(PIN_TOKEN),
+                "a MEASURED claim must not use {PIN_TOKEN} -- it would follow the build: {t}"
             );
         }
     }
