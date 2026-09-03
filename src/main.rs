@@ -71,7 +71,7 @@ const DESCRIBE: &str = r#"{
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "pdn",
   "summary": "power distribution network generation: rings, straps, follow pins and the vias between them",
-  "maturity": "correlated",
+  "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
     "MEASURED 2026-08-23 against the upstream pdn goldens at pin @OPENROAD_PIN@: 110 of 110 comparable cases exact on shapes, vias and block terminals, 0 failing, and 9 of 9 on the diagnostic a refused command raises. A SCORE IS ONLY TRUE OF ONE COMMIT -- quote the pin beside it.",
@@ -7151,5 +7151,35 @@ mod pin_tests {
                 "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod maturity_guard {
+    //! ⛔ **`maturity` is a CLOSED ENUM of three** — `discovered`, `structured`,
+    //! `workflow-validated` — and an unrecognised word is not a modest claim, it is a DISCARDED
+    //! RESULT. `Maturity::parse` returns `None`, the consumer treats the engine as `discovered`,
+    //! `can_assert()` is false, and the verdict is suppressed to `unknown` however well-formed
+    //! the assertion is. The JSON schema's `enum` rejects it too.
+    //!
+    //! ⚠️ **Four engines shipped an invalid one at once** — `ppl`, `pad` and `dpl` said `partial`,
+    //! `pdn` said `correlated` — each chosen to sound honest about incompleteness, each silently
+    //! throwing its own verdict away. None of the four had a test on it.
+    //!
+    //! 🔑 **The rung is about the shape of the EVIDENCE, not feature completeness.** What is
+    //! unbuilt belongs in `provenance_limitations`, which is required and can carry nuance a
+    //! one-word rung cannot. `workflow-validated` additionally needs a pinned design IN THIS
+    //! REPO that the suite runs end to end and asserts against.
+    use super::DESCRIBE;
+
+    #[test]
+    fn maturity_is_one_of_the_three_legal_rungs() {
+        let v: serde_json::Value =
+            serde_json::from_str(DESCRIBE).expect("the descriptor is valid JSON");
+        let m = v["maturity"].as_str().unwrap_or_default().to_string();
+        assert!(["discovered", "structured", "workflow-validated"].contains(&m.as_str()),
+                "`{m}` is not a legal maturity; an unrecognised one suppresses the verdict");
+        assert!(!v["provenance_limitations"].as_array().expect("required").is_empty(),
+                "provenance_limitations is required and states what the hash does not cover");
     }
 }
