@@ -1947,9 +1947,15 @@ fn make_followpins(
     };
     let width = stated_width.or_else(|| followpin_width(db))?;
     // 🔑 **A follow pin set's PITCH is twice a row's height**, and stage 6f bloats by it to decide
-    // which rails form one channel. `FollowPins` reads it off the first row.
-    let pitch = rows.first().map(|r| 2 * (r.bbox.3 - r.bbox.1)).unwrap_or(0);
-    let rails = followpins::make(layer, power, ground, width, rows, core, fp_bound);
+    // which rails form one channel.
+    //
+    // ⛔ **Twice the MINIMUM-site-height row's height, not the first row's.** `determinePitch`
+    // has always taken `std::min_element` over the domain's rows; reading `rows.first()` agreed
+    // only because every row in the corpus was the same height until upstream added the
+    // multi-height cases. The same number is now also the STEP the rails ladder by.
+    let row_height = followpins::row_height(rows).unwrap_or(0);
+    let pitch = 2 * row_height;
+    let rails = followpins::make(layer, power, ground, width, rows, core, fp_bound, row_height);
     // ⚠️ **Accumulated, not deduped.** Adjacent rows are flipped, so every interior row edge is
     // written by both of the rows that meet on it — but the two are not always the same rectangle.
     // Where a macro splits one row and not the row beneath it, the shared edge is written once at

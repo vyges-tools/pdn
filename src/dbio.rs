@@ -1478,11 +1478,21 @@ pub(crate) fn rows_of(db: &Db) -> Vec<followpins::Row> {
     let mut out = Vec::new();
     for i in 0.. {
         match db.nth_row(i) {
-            Ok(Some((bbox, site, orient))) if bbox.len() == 4 => out.push(followpins::Row {
-                bbox: (bbox[0], bbox[1], bbox[2], bbox[3]),
-                site,
-                orient,
-            }),
+            Ok(Some((bbox, site, orient))) if bbox.len() == 4 => {
+                // ⚠️ The SITE's height, not the row's — `determinePitch` picks the minimum by
+                // site and only then measures that row's bbox. See `followpins::row_height`.
+                let site_height = db.site_get_height(&site);
+                // ⚠️ A hybrid site's row is skipped entirely by `makeShapes` — its row pattern
+                // already holds the rails.
+                let has_row_pattern = db.site_has_row_pattern(&site);
+                out.push(followpins::Row {
+                    bbox: (bbox[0], bbox[1], bbox[2], bbox[3]),
+                    site,
+                    orient,
+                    site_height,
+                    has_row_pattern,
+                })
+            }
             _ => break,
         }
     }
