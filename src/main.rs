@@ -3144,13 +3144,16 @@ fn generate(args: &[String]) -> ExitCode {
         //
         // 🔑 **Order is the answer.** `GridComponent::make` is `makeShapes → cutShapes →
         // getObstructions → getShapes`: each component is cut against everything built before it,
-        // then becomes an obstruction for everything after. Pad connections in particular run
-        // SECOND — `-connect_to_pads` is an argument to `define_pdn_grid`, so its straps enter
-        // `straps_` ahead of any `add_pdn_stripe` — so a pad targets the RINGS, and the followpins
-        // and straps after it are cut around it.
+        // then becomes an obstruction for everything after.
         //
-        // ⚠️ Confirmed against a reference run under `set_debug_level PDN Make 1`: ring, then all
-        // sixteen `Direct connect pin` components, then `Followpin`, then the two `Strap` sets.
+        // ⚠️ **Where the pad connections sit is decided by which command asked for them**, not by
+        // a fixed rule: `define_pdn_grid -connect_to_pads` runs `setupDirectConnect` before any
+        // `add_pdn_stripe` can, while `add_pdn_ring -connect_to_pads` runs it at the ring
+        // statement's own position. `components::plan` carries that; see its rule 2.
+        //
+        // ⚠️ Confirmed against a reference run under `set_debug_level PDN Make 1`: on
+        // `pads_black_parrot_grid_define`, ring, then all sixteen `Direct connect pin` components,
+        // then `Followpin`, then the two `Strap` sets.
         let mut ring_area = strap_boundary;
         let mut rings_measured = false;
         // 🔑 **A component that builds nothing is retried once, after every other has run.**
