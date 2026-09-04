@@ -761,9 +761,49 @@ pub(crate) fn pad_connections(
                     db.master_get_width(&master) as i32,
                     db.master_get_height(&master) as i32,
                 );
-                match vyges_pdn::pads::pins_forming_ring(&pins, master_size, &routing) {
+                // ⛔ **`getPinsFormingRing` works entirely in MASTER coordinates**, and its last
+                // refusal compares this terminal's ring pins against EVERY mterm's geometry:
+                //
+                // ```text
+                // if (geo_layer->getNumber() == routing_layer->getNumber()) {
+                //   for (auto* pin : pins) { if (pin->getBox().intersects(geo->getBox())) return {}; }
+                // }
+                // ```
+                //
+                // Both sides there are `getBox()` — master space. The instance transform is
+                // applied later and only to the merged shape (`getMergedPinShape`).
+                //
+                // ⚠️ **We were comparing PLACED ring pins against MASTER geometry**, two different
+                // spaces, so on any pad placed away from the origin the rectangles could not
+                // intersect and the refusal never fired. Measured 2026-09-04 on
+                // `pads_ihp_sg13g2_balance`: the reference reports *"vdd_pad_n/vdd has 0 pins"*
+                // and rejects that connection for lack of connectivity, while `vdd_pad_n/vss` on
+                // the same pad keeps its one pin. We built BOTH, which made the pad a group of two
+                // rather than one — and `computeOverPadLanes` divides by `2 * (n + 1)`, so its
+                // strap came out 13330 wide where the reference's is 20000.
+                //
+                // 🔑 So select the ring and test it in master space, and transform only what
+                // survives.
+                let pins_master: Vec<vyges_pdn::pads::Pin> = pins
+                    .iter()
+                    .zip(raw.iter())
+                    .map(|(p, r)| vyges_pdn::pads::Pin { rect: *r, ..p.clone() })
+                    .collect();
+                match vyges_pdn::pads::pins_forming_ring(&pins_master, master_size, &routing) {
                     Some((ring, at)) if may_run_over(db, &master, &ring, at, &routing) => {
-                        (ring, Some(routing[at].clone()))
+                        let placed: Vec<vyges_pdn::pads::Pin> = ring
+                            .into_iter()
+                            .map(|p| vyges_pdn::pads::Pin {
+                                rect: vyges_pdn::orient::place_in_bbox(
+                                    p.rect,
+                                    &orient,
+                                    master_size,
+                                    (inst_rect.0, inst_rect.1),
+                                ),
+                                ..p
+                            })
+                            .collect();
+                        (placed, Some(routing[at].clone()))
                     }
                     _ => continue, // no component at all, which is what the reference makes
                 }

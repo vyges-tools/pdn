@@ -2426,10 +2426,26 @@ fn generate(args: &[String]) -> ExitCode {
     // every pad in turn — upstream #9994's *"one VSS connection per side against five VDD"*.
     let mut pad_net_connections: std::collections::HashMap<String, i32> =
         std::collections::HashMap::new();
-    // A pad whose group has been built. `make()` returns false for every other member once one of
-    // them carries shapes: *"all the connections on a pad are built together, so if any of them
-    // already has a shape the group has been built"*.
-    let mut pad_group_built: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // A pad on which some member actually PLACED. `make()` returns false for every other member
+    // once one of them carries shapes: *"all the connections on a pad are built together, so if
+    // any of them already has a shape the group has been built"*.
+    let mut pad_group_placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // ⛔ **A group that places NOTHING is retried, up to `kMaxGroupBuildAttempts`.**
+    //
+    // ```text
+    // for (auto* member : getAssociatedStraps()) { if (member->getShapeCount() != 0) return false; }
+    // if (group_attempts_ >= kMaxGroupBuildAttempts) { return false; }
+    // return buildGroup(shapes, obstructions);
+    // ```
+    //
+    // 🔑 The check is on SHAPES, not on having tried: a pad whose whole group failed has no
+    // shapes, so its next component turn builds it again — and by then more of the grid is
+    // standing, so the same candidates can succeed where they could not before. ⚠️ Measured
+    // 2026-09-04 on `pads_ihp_sg13g2_balance`: the reference walks 84 candidates per connection
+    // where we walked 42, exactly twice, because it builds those groups a second time.
+    let mut pad_group_attempts: std::collections::HashMap<String, i32> =
+        std::collections::HashMap::new();
+    const MAX_GROUP_BUILD_ATTEMPTS: i32 = 2;
     let mut refinable_next: Vec<(usize, Option<usize>, OverPadStrap)> = Vec::new();
     // What stage 6f needs to know about the components that made each shape: a strap set's own
     // width, spacing and pitch, and the follow pins' pitch.
@@ -3287,10 +3303,15 @@ fn generate(args: &[String]) -> ExitCode {
                     // agreed on `fill_276` only because the order happened to agree there. The
                     // lane arithmetic was never wrong; the ORDER was.
                     let group_members: Vec<&PadConnection> = if conn.over_pads.is_some() {
-                        if pad_group_built.contains(&conn.inst) {
+                        if pad_group_placed.contains(&conn.inst) {
                             continue;
                         }
-                        pad_group_built.insert(conn.inst.clone());
+                        let attempts =
+                            pad_group_attempts.entry(conn.inst.clone()).or_insert(0);
+                        if *attempts >= MAX_GROUP_BUILD_ATTEMPTS {
+                            continue;
+                        }
+                        *attempts += 1;
                         on_pad.clone()
                     } else {
                         vec![conn]
@@ -3590,6 +3611,9 @@ fn generate(args: &[String]) -> ExitCode {
                         // on the NEXT pad, which is the opposite of balancing.
                         if over_pad.is_some() && placed {
                             *pad_net_connections.entry(conn.net.clone()).or_insert(0) += 1;
+                            // Some member of this pad now carries shapes, so the group is built
+                            // and no later turn rebuilds it.
+                            pad_group_placed.insert(conn.inst.clone());
                         }
                     }
                 }
