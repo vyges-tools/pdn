@@ -189,28 +189,228 @@ pub fn over_pad_strap(
             (v / grid) * grid
         }
     };
-    let (inst_width, inst_offset) = if horizontal {
-        (inst.3 - inst.1, inst.1)
+    let _ = snap_by;
+    // 🔑 **One rule, in one place.** The width/spacing and the default lane are now
+    // `over_pad_lanes` and `default_lane_offset`, because `buildOverPad` needs them separately in
+    // order to try other lanes; this keeps the historical single-shot form on top of them rather
+    // than restating the arithmetic and letting the two drift.
+    let (width, spacing) = over_pad_lanes(
+        count, inst, horizontal, layer_min_width, layer_max_width, layer_spacing,
+        manufacturing_grid,
+    )?;
+    let offset =
+        default_lane_offset(index, width, spacing, inst, horizontal, manufacturing_grid);
+    Some(slot_at_offset(pin_shape, horizontal, offset, width))
+}
+
+/// `TechLayer::snapToManufacturingGrid(pos, round_up, multiplier)`.
+///
+/// ```text
+/// const int grid = grid_multiplier * tech->getManufacturingGrid();
+/// if (pos % grid != 0) { int round_pos = pos / grid; if (round_up) round_pos += 1; ... }
+/// ```
+///
+/// ⚠️ **Already on the grid is left alone**, whichever way `round_up` points — the adjustment is
+/// inside the `pos % grid != 0` test, so this is not `ceil`/`floor` of a division.
+/// ⚠️ Integer division truncates toward ZERO, so for a negative `pos` the untaken branch rounds
+/// the other way. Pad coordinates here are die coordinates and positive.
+pub fn snap_grid(pos: i32, round_up: bool, grid: i32) -> i32 {
+    if grid <= 0 || pos % grid == 0 {
+        return pos;
+    }
+    let mut r = pos / grid;
+    if round_up {
+        r += 1;
+    }
+    r * grid
+}
+
+/// **P1g** — `makeShapeOverPad`: the pin rectangle narrowed onto one lane.
+///
+/// ```text
+/// pin_shape.set_ylo(offset - getWidth() / 2);
+/// pin_shape.set_yhi(pin_shape.yMin() + getWidth());
+/// ```
+///
+/// ⚠️ `- width / 2` then `+ width`, the same asymmetry the straps have: for an odd width the extra
+/// unit falls on the high side of the lane. ⚠️ And the second edge is set from the FIRST, not from
+/// `offset + width / 2`, which differs by one for an odd width.
+pub fn slot_at_offset(pin_shape: Rect, horizontal: bool, offset: i32, width: i32) -> Rect {
+    let lo = offset - width / 2;
+    if horizontal {
+        (pin_shape.0, lo, pin_shape.2, lo + width)
     } else {
-        (inst.2 - inst.0, inst.0)
-    };
-    // ⚠️ `2 * (n + 1)`, not `n` — the pad keeps room either side of every strap.
-    let max_width = inst_width / (2 * (count as i32 + 1));
-    let target_width = snap_by(max_width, 2);
+        (lo, pin_shape.1, lo + width, pin_shape.3)
+    }
+}
+
+/// **P1b** — `computeOverPadLanes`: the width and spacing every strap on one pad shares.
+///
+/// ```text
+/// const int max_width = inst_width / (2 * (group_size + 1));
+/// const int target_width = layer.snapToManufacturingGrid(max_width, false, 2);
+/// if (target_width < layer.getMinWidth()) return false;      // build NOTHING
+/// width   = std::min(target_width, layer.getMaxWidth());
+/// spacing = std::max(width, layer.getSpacing(width));
+/// ```
+///
+/// ⚠️ **`2 * (n + 1)`, not `n`** — the pad keeps room either side of every strap.
+/// ⚠️ **The WIDTH snaps to TWICE the manufacturing grid**; the offset snaps to once. The third
+/// argument is a multiplier, not a flag.
+/// 🔑 **A pad carrying too many connections builds NONE of them**: below the layer minimum the
+/// reference returns false, so a high count does not merely narrow the straps, it removes them.
+#[allow(clippy::too_many_arguments)]
+pub fn over_pad_lanes(
+    group_size: usize,
+    inst: Rect,
+    horizontal: bool,
+    layer_min_width: i32,
+    layer_max_width: i32,
+    layer_spacing: i32,
+    manufacturing_grid: i32,
+) -> Option<(i32, i32)> {
+    let inst_width = if horizontal { inst.3 - inst.1 } else { inst.2 - inst.0 };
+    let max_width = inst_width / (2 * (group_size as i32 + 1));
+    let target_width = snap_grid(max_width, false, manufacturing_grid * 2);
     if target_width < layer_min_width {
         return None;
     }
     let width = target_width.min(layer_max_width);
-    let spacing = width.max(layer_spacing);
-    let target_offset = snap_by(inst_offset + spacing + width / 2, 1);
-    let offset = target_offset + index as i32 * (spacing + width);
-    Some(if horizontal {
-        let lo = offset - width / 2;
-        (pin_shape.0, lo, pin_shape.2, lo + width)
+    Some((width, width.max(layer_spacing)))
+}
+
+/// **P1c** — `getDefaultLaneOffset`: where the strap at `index` would historically have been put.
+///
+/// ```text
+/// const int target_offset = layer.snapToManufacturingGrid(inst_offset + spacing + width / 2, false);
+/// return target_offset + index * (spacing + width);
+/// ```
+///
+/// 🔑 This is still the FIRST position tried; the search below only supplies fallbacks. So a
+/// design where nothing blocks the pad places exactly where it always did.
+pub fn default_lane_offset(
+    index: usize,
+    width: i32,
+    spacing: i32,
+    inst: Rect,
+    horizontal: bool,
+    manufacturing_grid: i32,
+) -> i32 {
+    let inst_offset = if horizontal { inst.1 } else { inst.0 };
+    let target = snap_grid(inst_offset + spacing + width / 2, false, manufacturing_grid);
+    target + index as i32 * (spacing + width)
+}
+
+/// **P1d** — `buildOverPad`'s lane bounds: the strap has to stay over the pin it connects to.
+///
+/// ```text
+/// lane_min = (is_horizontal ? pin.yMin() : pin.xMin()) + getWidth() / 2;
+/// lane_max = (is_horizontal ? pin.yMax() : pin.xMax()) - getWidth() / 2;
+/// if (lane_min > lane_max) return false;
+/// ```
+pub fn lane_range(pin_shape: Rect, horizontal: bool, width: i32) -> Option<(i32, i32)> {
+    let (lo, hi) = if horizontal {
+        (pin_shape.1, pin_shape.3)
     } else {
-        let lo = offset - width / 2;
-        (lo, pin_shape.1, lo + width, pin_shape.3)
-    })
+        (pin_shape.0, pin_shape.2)
+    };
+    let (lane_min, lane_max) = (lo + width / 2, hi - width / 2);
+    (lane_min <= lane_max).then_some((lane_min, lane_max))
+}
+
+/// **P1e** — the positions `buildOverPad` tries, in order.
+///
+/// ```text
+/// const int step = layer.snapToManufacturingGrid(
+///     std::max(layer.getMinIncrementStep(), getWidth() / 8), true);
+/// for (int offset = snap(lane_min, true); offset < lane_max; offset += step) offsets.push_back(offset);
+/// offsets.push_back(snap(lane_max, false));
+/// std::ranges::sort(offsets, [preferred](int l, int r) { return abs(l - preferred) < abs(r - preferred); });
+/// offsets.insert(offsets.begin(), preferred);
+/// ```
+///
+/// 🔑 **`preferred` is prepended AFTER the sort**, so it is tried first even though it is also
+/// somewhere inside the sorted list — the historical position gets first refusal and the walk is
+/// the fallback. That is what keeps designs with clear pads bit-identical to the old behaviour.
+///
+/// ⚠️ **`<` not `<=` in the loop, and `lane_max` is then appended snapped DOWN** — so the top of
+/// the range is always a candidate and is never produced by the stride.
+///
+/// ⛔ **`std::ranges::sort` is NOT stable.** Two offsets equidistant from `preferred` come out in
+/// an unspecified order upstream. We sort stably, which is one fixed choice out of the two the
+/// reference is entitled to make; if a case ever turns on it, this comment is the place to start.
+pub fn lane_offsets(
+    lane_min: i32,
+    lane_max: i32,
+    preferred: i32,
+    width: i32,
+    manufacturing_grid: i32,
+) -> Vec<i32> {
+    let min_increment = if manufacturing_grid > 0 { manufacturing_grid } else { 1 };
+    let step = snap_grid(min_increment.max(width / 8), true, manufacturing_grid).max(1);
+    let mut offsets = Vec::new();
+    let mut offset = snap_grid(lane_min, true, manufacturing_grid);
+    while offset < lane_max {
+        offsets.push(offset);
+        offset += step;
+    }
+    offsets.push(snap_grid(lane_max, false, manufacturing_grid));
+    offsets.sort_by_key(|o| (o - preferred).abs());
+    offsets.insert(0, preferred);
+    offsets
+}
+
+/// **P1f** — `buildGroup`'s ordering: hand out positions to the net with the FEWEST connections.
+///
+/// ```text
+/// for (int count = 0; count < member_count; count++) {
+///   int next = -1;
+///   for (int index = 0; index < member_count; index++) {
+///     if (handled[index]) continue;
+///     if (next == -1 || connections[nets[index]] < connections[nets[next]]) next = index;
+///   }
+///   handled[next] = true; ...; connections[nets[next]]++;
+/// }
+/// ```
+///
+/// ⛔ **This is the whole point of the change.** Upstream #9994: *"`-connect_to_pads` only adds
+/// sporadic connections"* — a real chip came out with ONE VSS connection per side against five
+/// VDD, because core straps block the lanes and whichever net was placed first took what was
+/// available. Interleaving the nets is what PR #11213 did about it (*"There are now 12 VDD
+/// connections and 14 VSS connections"*).
+///
+/// ⚠️ **`<` is strict, so the FIRST index wins a tie** — with all counts equal this returns the
+/// members in their existing order, which is what keeps a single-net pad unchanged.
+///
+/// `counts` carries in the connections each net has ALREADY made elsewhere on the grid, and is
+/// updated as positions are handed out; the returned order indexes `nets`.
+pub fn balanced_order(nets: &[String], counts: &mut std::collections::HashMap<String, i32>) -> Vec<usize> {
+    let n = nets.len();
+    let mut handled = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut next: Option<usize> = None;
+        for index in 0..n {
+            if handled[index] {
+                continue;
+            }
+            let better = match next {
+                None => true,
+                Some(k) => {
+                    counts.get(&nets[index]).copied().unwrap_or(0)
+                        < counts.get(&nets[k]).copied().unwrap_or(0)
+                }
+            };
+            if better {
+                next = Some(index);
+            }
+        }
+        let Some(next) = next else { break };
+        handled[next] = true;
+        *counts.entry(nets[next].clone()).or_insert(0) += 1;
+        order.push(next);
+    }
+    order
 }
 
 /// **P2** — the pins that face the core.
@@ -416,6 +616,81 @@ mod ring_tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].layer, "M2");
         assert_eq!(routing, 2);
+    }
+
+    /// `snapToManufacturingGrid` adjusts only when the value is OFF the grid.
+    #[test]
+    fn a_value_already_on_the_grid_is_left_alone_either_way() {
+        assert_eq!(snap_grid(100, true, 10), 100, "on-grid, rounding up changes nothing");
+        assert_eq!(snap_grid(100, false, 10), 100);
+        assert_eq!(snap_grid(101, true, 10), 110);
+        assert_eq!(snap_grid(101, false, 10), 100);
+        assert_eq!(snap_grid(101, true, 0), 101, "no manufacturing grid: unchanged");
+    }
+
+    /// ⛔ The historical position is tried FIRST even though the sorted walk also contains it.
+    #[test]
+    fn the_preferred_offset_is_tried_first_and_the_rest_by_distance_from_it() {
+        // lane 100..200, preferred 150, width 80 -> step = max(grid, 10) snapped up.
+        let offs = lane_offsets(100, 200, 150, 80, 5);
+        assert_eq!(offs[0], 150, "the historical lane gets first refusal");
+        let rest = &offs[1..];
+        let mut d: Vec<i32> = rest.iter().map(|o| (o - 150).abs()).collect();
+        let sorted = { let mut c = d.clone(); c.sort(); c };
+        assert_eq!(d, sorted, "the fallbacks walk outward from the preferred position");
+        d.clear();
+        assert!(offs.contains(&200), "lane_max is always a candidate");
+        // ⚠️ Probe must be able to fail: a plain ascending sweep would start at lane_min.
+        assert_ne!(offs[0], 100, "not simply the bottom of the lane");
+    }
+
+    /// ⚠️ `<` in the stride loop, then `lane_max` appended snapped DOWN.
+    #[test]
+    fn the_top_of_the_lane_is_appended_not_strided_onto() {
+        let offs = lane_offsets(0, 100, 0, 80, 7);
+        assert!(offs.contains(&snap_grid(100, false, 7)), "lane_max, snapped down");
+        assert!(offs.iter().all(|&o| o <= 100), "nothing past the top of the lane");
+    }
+
+    /// A strap must stay over its pin, and a pin narrower than the strap has no lane at all.
+    #[test]
+    fn a_pin_narrower_than_the_strap_offers_no_lane() {
+        assert_eq!(lane_range((0, 100, 10, 300), true, 100), Some((150, 250)));
+        assert_eq!(lane_range((0, 100, 10, 140), true, 100), None, "40 tall, 100 wide strap");
+    }
+
+    /// ⛔ **The whole point of PR #11213** (upstream #9994: one VSS connection against five VDD).
+    #[test]
+    fn positions_go_to_whichever_net_has_made_the_fewest_connections() {
+        use std::collections::HashMap;
+        let nets: Vec<String> = ["VDD", "VDD", "VSS", "VDD"].iter().map(|s| s.to_string()).collect();
+        let mut counts: HashMap<String, i32> = HashMap::new();
+        let order = balanced_order(&nets, &mut counts);
+        let picked: Vec<&str> = order.iter().map(|&i| nets[i].as_str()).collect();
+        assert_eq!(picked, vec!["VDD", "VSS", "VDD", "VDD"], "interleaved, not VDD VDD VDD VSS");
+        assert_eq!(counts["VDD"], 3);
+        assert_eq!(counts["VSS"], 1);
+    }
+
+    /// The count carried in from the REST of the grid decides who goes first here.
+    #[test]
+    fn a_net_already_ahead_elsewhere_on_the_grid_yields_the_first_position() {
+        use std::collections::HashMap;
+        let nets: Vec<String> = ["VDD", "VSS"].iter().map(|s| s.to_string()).collect();
+        let mut counts: HashMap<String, i32> = HashMap::from([("VDD".into(), 5), ("VSS".into(), 1)]);
+        let order = balanced_order(&nets, &mut counts);
+        assert_eq!(order, vec![1, 0], "VSS is behind, so VSS is served first");
+        // ⚠️ Probe must be able to fail: with the counts level the order is the natural one.
+        let mut level: HashMap<String, i32> = HashMap::new();
+        assert_eq!(balanced_order(&nets, &mut level), vec![0, 1], "a tie keeps the existing order");
+    }
+
+    /// ⚠️ The width snaps to TWICE the grid; a pad with too many connections builds nothing.
+    #[test]
+    fn the_shared_lane_width_snaps_to_twice_the_grid_and_can_refuse_outright() {
+        assert_eq!(over_pad_lanes(1, (0, 0, 100, 200), true, 10, 999, 5, 10), Some((40, 40)));
+        assert_eq!(over_pad_lanes(20, (0, 0, 100, 200), true, 40, 999, 5, 10), None,
+                   "below the layer minimum the reference builds NOTHING");
     }
 
     #[test]

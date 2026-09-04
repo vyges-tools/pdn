@@ -847,7 +847,9 @@ pub(crate) fn pad_strap_for(
     die: Rect,
     // ⚠️ Which of this PAD's over-pad connections this is, and how many there are — they share
     // the pad's width, so one cannot be placed without knowing the others.
-    over_pad_slot: (usize, usize),
+    // `(lane index, connections on this pad, explicit lane offset)`. The third is `Some` while
+    // `buildOverPad` walks the pad looking for a lane that survives its cut.
+    over_pad_slot: (usize, usize, Option<i32>),
     // Filled for an over-pads connection: what a later refine pass needs. See [`OverPadStrap`].
     refine: &mut Option<OverPadStrap>,
 ) -> Vec<(String, String, Rect, Rect)> {
@@ -878,24 +880,31 @@ pub(crate) fn pad_strap_for(
                     .iter()
                     .map(|p| p.rect)
                     .reduce(|a, b| (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3)));
-                let (index, on_pad) = over_pad_slot;
+                let (index, on_pad, offset_override) = over_pad_slot;
                 if let Some(ring) = ring {
                     let horizontal =
                         matches!(edge, vyges_pdn::pads::Edge::East | vyges_pdn::pads::Edge::West);
-                    if let Some(slot) = vyges_pdn::pads::over_pad_strap(
-                        ring,
-                        *inst_rect,
-                        horizontal,
-                        index,
-                        on_pad,
-                        db.layer_get_min_width(layer) as i32,
-                        {
-                            let m = db.layer_get_max_width(layer) as i32;
-                            if m > 0 { m } else { i32::MAX }
-                        },
-                        db.layer_get_spacing(layer),
-                        db.manufacturing_grid().unwrap_or_default().unwrap_or(1),
-                    ) {
+                    let min_w = db.layer_get_min_width(layer) as i32;
+                    let max_w = {
+                        let m = db.layer_get_max_width(layer) as i32;
+                        if m > 0 { m } else { i32::MAX }
+                    };
+                    let lay_sp = db.layer_get_spacing(layer);
+                    let mfg = db.manufacturing_grid().unwrap_or_default().unwrap_or(1);
+                    // ⛔ **An explicit offset still has to pass `computeOverPadLanes`.** The width
+                    // is the pad's shared one either way, and a pad whose group is too large to
+                    // fit builds nothing at any offset — `buildOverPad` is never reached, because
+                    // `buildGroup` returns before it.
+                    let slot_here = match offset_override {
+                        Some(off) => vyges_pdn::pads::over_pad_lanes(
+                            on_pad, *inst_rect, horizontal, min_w, max_w, lay_sp, mfg,
+                        )
+                        .map(|(w, _)| vyges_pdn::pads::slot_at_offset(ring, horizontal, off, w)),
+                        None => vyges_pdn::pads::over_pad_strap(
+                            ring, *inst_rect, horizontal, index, on_pad, min_w, max_w, lay_sp, mfg,
+                        ),
+                    };
+                    if let Some(slot) = slot_here {
                         // The reference prints this as `Connecting using shape:`; keyed the way it
                         // names the connection so the two can be joined per connection.
                         if std::env::var_os("PDN_TRACE").is_some() {

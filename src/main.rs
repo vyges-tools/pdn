@@ -1984,7 +1984,7 @@ fn make_pad_connection(
     standing: &[(String, String, Rect, &'static str)],
     core: Rect,
     die: Rect,
-    over_pad_slot: (usize, usize),
+    over_pad_slot: (usize, usize, Option<i32>),
     refine: &mut Option<dbio::OverPadStrap>,
 ) -> Vec<(String, String, Rect, Rect)> {
     let reaches = |layer: &str| -> Vec<String> {
@@ -3254,10 +3254,73 @@ fn generate(args: &[String]) -> ExitCode {
                     // only afterwards, so a pad whose orientation reverses an axis sorts the other
                     // way round if placed rects are used.
                     on_pad.sort_by_key(|c| c.sort_key);
-                    let slot = (
-                        on_pad.iter().position(|c| c.term == conn.term).unwrap_or(0),
-                        on_pad.len(),
-                    );
+                    let lane_index = on_pad.iter().position(|c| c.term == conn.term).unwrap_or(0);
+                    let group_size = on_pad.len();
+
+                    // ⛔ **`buildOverPad` — the strap WALKS THE PAD when its own lane will not do.**
+                    //
+                    // The old rule put the strap at one lane derived from its index and, if the cut
+                    // took it, lost the connection outright. Upstream #9994 is what that costs on a
+                    // real chip: *"`-connect_to_pads` only adds sporadic connections"*, one VSS
+                    // connection per side against five VDD, because core straps block the lanes and
+                    // whichever net was placed first took what was left. PR #11213 answers it by
+                    // trying the historical lane FIRST and then walking outward from it.
+                    //
+                    // 🔑 **The preferred lane keeps first refusal**, so a design whose pads are
+                    // clear places exactly where it always did and nothing moves.
+                    let lane_candidates: Vec<Option<i32>> = match conn.over_pads.as_ref() {
+                        None => vec![None],
+                        Some(layer) => {
+                            let ring = conn
+                                .facing
+                                .iter()
+                                .map(|p| p.rect)
+                                .reduce(|a, b| {
+                                    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
+                                });
+                            let horizontal = matches!(
+                                conn.edge,
+                                vyges_pdn::pads::Edge::East | vyges_pdn::pads::Edge::West
+                            );
+                            let mfg =
+                                db.manufacturing_grid().unwrap_or_default().unwrap_or(1);
+                            let max_w = {
+                                let m = db.layer_get_max_width(layer) as i32;
+                                if m > 0 { m } else { i32::MAX }
+                            };
+                            let lanes = vyges_pdn::pads::over_pad_lanes(
+                                group_size,
+                                conn.inst_rect,
+                                horizontal,
+                                db.layer_get_min_width(layer) as i32,
+                                max_w,
+                                db.layer_get_spacing(layer),
+                                mfg,
+                            );
+                            match (ring, lanes) {
+                                (Some(ring), Some((width, spacing))) => {
+                                    let preferred = vyges_pdn::pads::default_lane_offset(
+                                        lane_index, width, spacing, conn.inst_rect, horizontal, mfg,
+                                    );
+                                    match vyges_pdn::pads::lane_range(ring, horizontal, width) {
+                                        Some((lo, hi)) => vyges_pdn::pads::lane_offsets(
+                                            lo, hi, preferred, width, mfg,
+                                        )
+                                        .into_iter()
+                                        .map(Some)
+                                        .collect(),
+                                        // No lane fits over the pin — `buildOverPad` returns false
+                                        // before trying anything.
+                                        None => vec![],
+                                    }
+                                }
+                                // `computeOverPadLanes` refused, or there is no ring to sit on: the
+                                // single-shot path answers `None` for its own reasons and the edge
+                                // fallback still applies.
+                                _ => vec![None],
+                            }
+                        }
+                    };
                     // 🔑 **`PadDirectConnectionStraps::getConnectableShapes` — the pad's OWN pins
                     // are via targets, and only for the over-pads form.**
                     //
@@ -3290,17 +3353,70 @@ fn generate(args: &[String]) -> ExitCode {
                             }
                         }
                     }
+                    // ⛔ **Each candidate is BUILT, CUT and judged, and the first that survives
+                    // wins** — `buildOverPadAt` is `makeShapeOverPad` then `cutShapes` then
+                    // `keepShapesReachingTarget`, and a lane that leaves nothing reaching the net
+                    // is discarded before the next is tried. Judging a lane by its geometry alone
+                    // would accept the very positions the old rule already lost.
                     let mut over_pad: Option<OverPadStrap> = None;
-                    let made = make_pad_connection(
-                        &db,
-                        opts,
-                        conn,
-                        &emitted[grid_shapes_from..],
-                        core,
-                        die,
-                        slot,
-                        &mut over_pad,
-                    );
+                    let mut made: Vec<(String, String, Rect, Rect)> = Vec::new();
+                    let mut pieces: Vec<(String, String, Rect)> = Vec::new();
+                    let obstructions: Vec<(String, Rect, Option<String>, Rect)> = blockages
+                        .iter()
+                        .cloned()
+                        .chain(made_obstructions(&db, &emitted))
+                        .collect();
+                    for cand in &lane_candidates {
+                        let mut try_over_pad: Option<OverPadStrap> = None;
+                        let try_made = make_pad_connection(
+                            &db,
+                            opts,
+                            conn,
+                            &emitted[grid_shapes_from..],
+                            core,
+                            die,
+                            (lane_index, group_size, *cand),
+                            &mut try_over_pad,
+                        );
+                        let try_pieces = cut_shapes(
+                            &db,
+                            &try_made
+                                .iter()
+                                .map(|(n, l, r, _)| (n.clone(), l.clone(), *r))
+                                .collect::<Vec<_>>(),
+                            &obstructions,
+                        );
+                        // The over-pads half of `cutShapes`: a piece must TOUCH the pad and LEAVE
+                        // it. Applied per candidate, because it is half of what decides whether
+                        // this lane survived at all.
+                        let over_pad_rect = try_over_pad.as_ref().map(|_| conn.inst_rect);
+                        let try_pieces: Vec<_> = try_pieces
+                            .into_iter()
+                            .filter(|(_, _, r)| {
+                                let Some(p) = over_pad_rect else { return true };
+                                let contained = p.0 <= r.0 && p.1 <= r.1 && p.2 >= r.2 && p.3 >= r.3;
+                                let touches = p.0 <= r.2 && p.2 >= r.0 && p.1 <= r.3 && p.3 >= r.1;
+                                !contained && touches
+                            })
+                            .collect();
+                        // `keepShapesReachingTarget` — a fragment that no longer reaches anything
+                        // on its net is not a connection. ⚠️ Only for the over-pads form: an edge
+                        // strap is judged by its cut alone, as it always was.
+                        let reaches = over_pad_rect.is_none()
+                            || try_pieces.iter().any(|(net, _, r)| {
+                                emitted[grid_shapes_from..]
+                                    .iter()
+                                    .any(|(n, _, s, _)| n == net && overlaps(*s, *r))
+                            });
+                        if !try_pieces.is_empty() && reaches {
+                            over_pad = try_over_pad;
+                            made = try_made;
+                            pieces = try_pieces;
+                            break;
+                        }
+                        // ⚠️ Nothing is kept from a refused lane — `buildOverPadAt` calls
+                        // `clearOverPadShapes()` on both failure paths.
+                    }
                     // 🔑 **A pad strap is cut like anything else.**
                     // `PadDirectConnectionStraps::cutShapes` opens by calling the base
                     // `Straps::cutShapes`; only the over-pads form adds anything on top. The
@@ -3310,19 +3426,7 @@ fn generate(args: &[String]) -> ExitCode {
                     // ⚠️ Earlier attempts at this were catastrophic because a connected pad's own
                     // pins were in the obstruction set, so every strap was cut apart by the very
                     // pin it starts from. They are excluded now — see `pad_connect_insts`.
-                    let obstructions: Vec<(String, Rect, Option<String>, Rect)> = blockages
-                        .iter()
-                        .cloned()
-                        .chain(made_obstructions(&db, &emitted))
-                        .collect();
-                    let pieces = cut_shapes(
-                        &db,
-                        &made
-                            .iter()
-                            .map(|(n, l, r, _)| (n.clone(), l.clone(), *r))
-                            .collect::<Vec<_>>(),
-                        &obstructions,
-                    );
+
                     // 🔑 **An over-pad strap must both TOUCH the pad and LEAVE it.**
                     // `PadDirectConnectionStraps::cutShapes` runs the base cut and then, for the
                     // over-pads form alone, throws away every piece that fails either half.
