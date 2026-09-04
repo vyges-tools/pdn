@@ -827,6 +827,24 @@ pub(crate) fn pad_connections(
             });
         }
     }
+    // ⛔ **`setupDirectConnect` walks NET-MAJOR, not instance-major.**
+    //
+    // ```text
+    // for (auto* net : getNets()) {
+    //   for (auto* iterm : net->getITerms()) { ... iterms.push_back(iterm); }
+    //   for (auto* iterm : iterms) { ... addStrap(std::move(pad_connect)); }
+    // }
+    // ```
+    //
+    // `addStrap` appends in that order and `Grid::makeShapes` walks the components in it, so the
+    // net order decides which pad's group is built first — and a pad's group is cut against
+    // everything already standing. ⚠️ We collected instance-major, which gives the same SET of
+    // connections in a different order, and order is behaviour here for the same reason the
+    // in-group balance is.
+    //
+    // 🔑 `nets` arrives in the domain's own order (power first, then ground), which is what
+    // `getNets()` yields. A stable sort by net keeps the within-net order this loop produced.
+    out.sort_by_key(|c| nets.iter().position(|n| *n == c.net).unwrap_or(usize::MAX));
     out
 }
 
