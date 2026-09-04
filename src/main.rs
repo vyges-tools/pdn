@@ -2414,6 +2414,22 @@ fn generate(args: &[String]) -> ExitCode {
     // Over-pad straps that survived their cut whole, and so are still eligible for a refine.
     // `(index into emitted, index into iterm_holds, what the refine needs)`.
     let mut refinable: Vec<(usize, Option<usize>, OverPadStrap)> = Vec::new();
+    // ⛔ **`CoreGrid::setupDirectConnect` makes ONE counter and every pad shares it.**
+    //
+    // ```text
+    // std::shared_ptr<odb::PtrMap<odb::dbNet,int>> net_map = std::make_shared<...>();
+    // for (auto* net : getNets()) { (*net_map)[net] = 0; ... }
+    // ```
+    //
+    // 🔑 The balance is GRID-WIDE, not per pad. A pad hands its first position to whichever net is
+    // behind across the whole design so far, which is what stops one net taking the good lane on
+    // every pad in turn — upstream #9994's *"one VSS connection per side against five VDD"*.
+    let mut pad_net_connections: std::collections::HashMap<String, i32> =
+        std::collections::HashMap::new();
+    // A pad whose group has been built. `make()` returns false for every other member once one of
+    // them carries shapes: *"all the connections on a pad are built together, so if any of them
+    // already has a shape the group has been built"*.
+    let mut pad_group_built: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut refinable_next: Vec<(usize, Option<usize>, OverPadStrap)> = Vec::new();
     // What stage 6f needs to know about the components that made each shape: a strap set's own
     // width, spacing and pitch, and the follow pins' pitch.
@@ -3254,8 +3270,49 @@ fn generate(args: &[String]) -> ExitCode {
                     // only afterwards, so a pad whose orientation reverses an axis sorts the other
                     // way round if placed rects are used.
                     on_pad.sort_by_key(|c| c.sort_key);
-                    let lane_index = on_pad.iter().position(|c| c.term == conn.term).unwrap_or(0);
+
+                    // ⛔ **A pad's connections are built as a GROUP, in balanced order.**
+                    //
+                    // `make()` for the over-pads form builds every member of the pad at once and
+                    // returns false for the others, so whichever member's component turn comes
+                    // first does the work. `buildGroup` then hands out positions one at a time to
+                    // whichever net has made the fewest connections SO FAR, adding each strap to
+                    // the shapes and obstructions as soon as it is placed so the ones that follow
+                    // are placed knowing where it ended up.
+                    //
+                    // ⚠️ **Measured 2026-09-04, and this is what the last 1740 dbu was.** On
+                    // `fill_55` the reference places VSS first — one attempt, keeping its
+                    // preferred lane — and VDD then walks 18 positions to land 0.87um away. We did
+                    // the exact mirror: VDD first at its preferred, VSS walking 17. Both engines
+                    // agreed on `fill_276` only because the order happened to agree there. The
+                    // lane arithmetic was never wrong; the ORDER was.
+                    let group_members: Vec<&PadConnection> = if conn.over_pads.is_some() {
+                        if pad_group_built.contains(&conn.inst) {
+                            continue;
+                        }
+                        pad_group_built.insert(conn.inst.clone());
+                        on_pad.clone()
+                    } else {
+                        vec![conn]
+                    };
                     let group_size = on_pad.len();
+                    let mut handled = vec![false; group_members.len()];
+                    let member_nets: Vec<String> =
+                        group_members.iter().map(|c| c.net.clone()).collect();
+
+                    // ⛔ **Picked one at a time, not sorted once.** The count advances only when a
+                    // member actually PLACES — `if (!buildOverPad(...)) continue;` sits before
+                    // `addNetConnection()` — so a member that finds no lane leaves its net's count
+                    // untouched and the next pick is made as though it had never been tried.
+                    while let Some(member_at) = vyges_pdn::pads::pick_next_member(
+                        &member_nets,
+                        &handled,
+                        &pad_net_connections,
+                    ) {
+                        handled[member_at] = true;
+                        let conn: &PadConnection = group_members[member_at];
+                        let lane_index =
+                            on_pad.iter().position(|c| c.term == conn.term).unwrap_or(0);
 
                     // ⛔ **`buildOverPad` — the strap WALKS THE PAD when its own lane will not do.**
                     //
@@ -3439,18 +3496,11 @@ fn generate(args: &[String]) -> ExitCode {
                     // and an edge strap is not required to leave the pad. `over_pad` is set only
                     // where a slot was placed and a target found, which is exactly when there are
                     // shapes here to filter.
+                    // ⚠️ The touch-and-leave filter now runs INSIDE the candidate loop above,
+                    // because it is half of what decides whether a lane survived at all — a lane
+                    // whose pieces all fail it is a lane to walk past, not a connection to keep.
                     let over_pad_rect = over_pad.as_ref().map(|_| conn.inst_rect);
-                    let pieces: Vec<_> = pieces
-                        .into_iter()
-                        .filter(|(_, _, r)| {
-                            let Some(p) = over_pad_rect else { return true };
-                            let contained =
-                                p.0 <= r.0 && p.1 <= r.1 && p.2 >= r.2 && p.3 >= r.3;
-                            let touches =
-                                p.0 <= r.2 && p.2 >= r.0 && p.1 <= r.3 && p.3 >= r.1;
-                            !contained && touches
-                        })
-                        .collect();
+                    let placed = !pieces.is_empty();
                     for (net, layer, rect) in pieces {
                         // ⚠️ The holding pin follows the piece it lands in; a piece that no longer
                         // covers the pin is held by nothing and stands on its vias like any strap.
@@ -3503,6 +3553,15 @@ fn generate(args: &[String]) -> ExitCode {
                         if let Some(hold) = hold {
                             // Its own pin holds it, exactly as an iterm connection does.
                             iterm_holds.push((net, layer, hold));
+                        }
+                    }
+                        // ⛔ **`addNetConnection()` runs ONLY where the member placed**, and it is
+                        // the shared, grid-wide map it advances — `(*net_to_pin_count_)[net]++`.
+                        // Counting an attempt rather than a placement would let a net that can
+                        // never be placed on this pad push a net that can to the back of the queue
+                        // on the NEXT pad, which is the opposite of balancing.
+                        if over_pad.is_some() && placed {
+                            *pad_net_connections.entry(conn.net.clone()).or_insert(0) += 1;
                         }
                     }
                 }

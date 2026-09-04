@@ -384,28 +384,44 @@ pub fn lane_offsets(
 ///
 /// `counts` carries in the connections each net has ALREADY made elsewhere on the grid, and is
 /// updated as positions are handed out; the returned order indexes `nets`.
+pub fn pick_next_member(
+    nets: &[String],
+    handled: &[bool],
+    counts: &std::collections::HashMap<String, i32>,
+) -> Option<usize> {
+    let mut next: Option<usize> = None;
+    for index in 0..nets.len() {
+        if handled[index] {
+            continue;
+        }
+        let better = match next {
+            None => true,
+            Some(k) => {
+                counts.get(&nets[index]).copied().unwrap_or(0)
+                    < counts.get(&nets[k]).copied().unwrap_or(0)
+            }
+        };
+        if better {
+            next = Some(index);
+        }
+    }
+    next
+}
+
+/// The order `buildGroup` visits a pad's connections in **when every one of them places**.
+///
+/// ⛔ **Upstream increments only on SUCCESS**, and the selection is interleaved with the building:
+/// `if (!member->buildOverPad(...)) { continue; }` comes BEFORE `addNetConnection()` and before
+/// `connections[net]++`. A member that finds no lane therefore leaves its net's count untouched
+/// and the next pick is made as though it had never been tried. ⟹ the caller drives
+/// `pick_next_member` around its own build, and this convenience exists for the tests and for the
+/// case where placement cannot fail.
 pub fn balanced_order(nets: &[String], counts: &mut std::collections::HashMap<String, i32>) -> Vec<usize> {
     let n = nets.len();
     let mut handled = vec![false; n];
     let mut order = Vec::with_capacity(n);
     for _ in 0..n {
-        let mut next: Option<usize> = None;
-        for index in 0..n {
-            if handled[index] {
-                continue;
-            }
-            let better = match next {
-                None => true,
-                Some(k) => {
-                    counts.get(&nets[index]).copied().unwrap_or(0)
-                        < counts.get(&nets[k]).copied().unwrap_or(0)
-                }
-            };
-            if better {
-                next = Some(index);
-            }
-        }
-        let Some(next) = next else { break };
+        let Some(next) = pick_next_member(nets, &handled, counts) else { break };
         handled[next] = true;
         *counts.entry(nets[next].clone()).or_insert(0) += 1;
         order.push(next);
