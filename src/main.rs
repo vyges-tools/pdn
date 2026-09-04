@@ -3537,16 +3537,44 @@ fn generate(args: &[String]) -> ExitCode {
                                 .find(|(_, l, _, h)| *l == layer && overlaps(*h, rect))
                                 .and_then(|(_, _, _, h)| intersect_rect(*h, rect))
                         };
-                        // 🔑 **Only a piece IDENTICAL to what was built keeps its target**, and
-                        // only a shape with a target can be refined. `replaceShape` carries a
-                        // shape's vias onto its pieces and nothing else, so a cut strap vanishes
-                        // from `target_shapes_` and `strapViaIsObstructed` answers false for it
-                        // without looking at anything.
-                        if let Some(r) = over_pad.as_ref().filter(|r| r.strap == rect) {
+                        // ⛔ **EVERY surviving piece keeps a target, and that changed at
+                        // `f832f861a4`.**
+                        //
+                        // It used to be true that only a piece identical to what was built could
+                        // be refined: `target_shapes_` was filled once, in `makeShapesOverPads`,
+                        // for the shape as built, and a cut piece is a different `Shape` — so it
+                        // vanished from the map and `strapViaIsObstructed` answered false for it
+                        // without looking at anything. That was a faithful transcription of the
+                        // old code.
+                        //
+                        // 🔑 `keepShapesReachingTarget` now REBUILDS the mapping after the cut:
+                        //
+                        // ```text
+                        // target_shapes_.clear(); target_pin_shape_.clear();
+                        // for (shape : getShapes()) {
+                        //   Shape* target = findConnectableShape(shape->getRect(), other_shapes);
+                        //   if (target == nullptr) { remove_shapes.push_back(...); continue; }
+                        //   target_shapes_[shape.get()] = target;
+                        //   target_pin_shape_[shape.get()] = target_pin_;
+                        // }
+                        // ```
+                        //
+                        // ⟹ a cut piece IS refinable, and the pin it may slide over is
+                        // `target_pin_` — the original merged pin shape, not the piece's own
+                        // extent. ⚠️ Measured 2026-09-04 on `fill_288/VDD`: both engines walk the
+                        // same 18 candidates and both end at 1367550, and the reference then
+                        // REFINES it down to 1367360. We never considered it, because the cut had
+                        // changed it and the old rule dropped it — the last 190 dbu.
+                        if let Some(r) = over_pad.as_ref() {
+                            let mut piece = r.clone();
+                            // `refineShape` slides across the pin and keeps the ends where
+                            // `getClosestShape` put them, so the piece's own along-axis extent is
+                            // what moves.
+                            piece.strap = rect;
                             refinable.push((
                                 emitted.len(),
                                 hold.map(|_| iterm_holds.len()),
-                                r.clone(),
+                                piece,
                             ));
                         }
                         emitted.push((net.clone(), layer.clone(), rect, "STRIPE"));
