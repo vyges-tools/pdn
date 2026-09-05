@@ -5712,10 +5712,10 @@ fn generate(args: &[String]) -> ExitCode {
                         // where the shapes are rather than how big the overlap is.
                         //
                         // ✅ **No bypass is needed here, and the reason is not "we got away with
-                        // it".** This engine's `via_cache` holds the two ends' ORIENTATIONS and
-                        // nothing else, so the enclosure — spare included — is recomputed from
-                        // each crossing's own rects. A crossing of the same size with no spare
-                        // computes zero spare and fails its own check.
+                        // it".** This engine's `via_cache` holds the two ends' CONSTRAINTS and
+                        // nothing else — no geometry — so the enclosure, spare included, is still
+                        // recomputed from each crossing's own rects. A crossing of the same size
+                        // with no spare computes zero spare and fails its own check.
                         //
                         // ⚠️ **That stops being true the moment the cache holds geometry.** If it
                         // is ever widened, this via must not be cached.
@@ -6080,10 +6080,11 @@ fn generate(args: &[String]) -> ExitCode {
                         // ⚠️ **Before the snap and after the split-cut override**, which is where
                         // the reference puts it — the block sits outside `if (isSplitCutArray())`
                         // and above the two `->snap(getTech())` calls.
-                        // ℹ️ Upstream also clears `can_cache_` here. Our `via_cache` holds only
-                        // the two ends' orientations, so there is nothing to invalidate — but if
-                        // it is ever widened to hold geometry, a via that took the spare must not
-                        // be cached.
+                        // ℹ️ Upstream also clears `can_cache_` here. Our `via_cache` holds the
+                        // two ends' CONSTRAINTS and no geometry, so there is nothing to
+                        // invalidate — but ⛔ **the moment it is widened to hold geometry, a via
+                        // that took the spare must not be cached**, which is exactly what
+                        // `can_cache_ = false` is for. Read this before doing the stack cache.
                         let spare_for = |built: vyges_pdn::viagen::Enclosure,
                                          at_end: bool,
                                          minimum: vyges_pdn::viagen::Enclosure,
