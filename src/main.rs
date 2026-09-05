@@ -20,6 +20,20 @@ use dbio::*;
 /// ℹ️ The reference orders components as `rings_` then `straps_` **in insertion order**, and
 /// `-connect_to_pads` inserts its straps at `define_pdn_grid` time — before any `add_pdn_stripe`.
 /// So its sequence is ring, pad connects, followpins, stripes; ours is what this prints.
+/// Elapsed wall time at a named stage, under `PDN_STAGE_TIME`.
+///
+/// 🔑 **Coarse on purpose.** It exists to say WHICH phase a slow design is stuck in, which is the
+/// only question worth asking before a profiler. `pads_connect_from_non_pref_edge` was over ten
+/// minutes with no indication of where, and two markers narrowed it to one function.
+fn stage_time(stage: &str) {
+    use std::sync::OnceLock;
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    if std::env::var_os("PDN_STAGE_TIME").is_some() {
+        eprintln!("[stagetime] {:>8.2}s {stage}", start.elapsed().as_secs_f64());
+    }
+}
+
 fn trace(stage: &str, detail: &str) {
     if std::env::var_os("PDN_TRACE").is_some() {
         eprintln!("[trace] {stage}: {detail}");
@@ -1307,6 +1321,20 @@ fn repair_vias(
             .iter()
             .any(|s| s.layer == layer && s.rect == rect)
     };
+    // ⛔ **Hoisted, and it is the difference between seconds and ten minutes.** This partition of
+    // `blockages` by layer was rebuilt — allocation and all — once per via END, inside the loop
+    // below. On `pads_connect_from_non_pref_edge` that is 22,876 vias against **712,108**
+    // blockages, so the scan alone ran ~3 × 10^10 times and the function took over eight minutes
+    // where the reference finishes the whole design in seconds.
+    //
+    // 🔑 **`blockages` does not change in this function**, so one partition serves every via.
+    // ⚠️ `others`, just below, genuinely cannot be hoisted the same way: `emitted[i].2` is written
+    // inside the loop, so a cached copy of it goes stale. It is 3,600 entries against 712,108 —
+    // two hundred times smaller — and is left as a scan deliberately.
+    let mut obstructions_by_layer: std::collections::HashMap<&str, Vec<Rect>> = Default::default();
+    for (l, r, ..) in blockages {
+        obstructions_by_layer.entry(l.as_str()).or_default().push(*r);
+    }
     for v in placed {
         // Either end unowned and the via is not repairable at all — not merely at that end.
         if is_fixed(&v.lower, v.lower_rect) || is_fixed(&v.upper, v.upper_rect) {
@@ -1324,11 +1352,10 @@ fn repair_vias(
             }) else {
                 continue;
             };
-            let obstructions: Vec<Rect> = blockages
-                .iter()
-                .filter(|(l, ..)| l == layer)
-                .map(|(_, r, ..)| *r)
-                .collect();
+            let obstructions: &[Rect] = obstructions_by_layer
+                .get(layer.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             let others: Vec<Rect> = emitted
                 .iter()
                 .enumerate()
@@ -1337,7 +1364,7 @@ fn repair_vias(
                 .collect();
             let halo = db.layer_get_spacing(layer).max(1);
             if let Some(grown) =
-                vyges_pdn::shapes::extend_to(emitted[i].2, toward, &obstructions, &others, halo)
+                vyges_pdn::shapes::extend_to(emitted[i].2, toward, obstructions, &others, halo)
             {
                 if std::env::var_os("PDN_TRACE").is_some() && grown != emitted[i].2 {
                     eprintln!(
@@ -2393,6 +2420,35 @@ fn generate(args: &[String]) -> ExitCode {
                 r,
             ));
         }
+    }
+
+    // ⛔ **`blockages` partitioned by layer ONCE, because three hot sites did it per CALL.**
+    //
+    // `Shape::cut` and `check_shapes` both ask "what is on this layer near me", and the answer was
+    // built by scanning the whole list and allocating a fresh `Vec` every time. On
+    // `pads_connect_from_non_pref_edge` the list is **712,108 entries** and the via-metal absorb ran
+    // it once per via END — 45,752 times, ~3 × 10^10 scans, **273 seconds** of a run the reference
+    // finishes in seconds. `repair_vias` had the identical shape and cost another eight minutes.
+    //
+    // 🔑 **`blockages` is complete here and never written again**, so one partition serves every
+    // reader below. ⚠️ If that ever stops being true this must move or be rebuilt — the whole
+    // saving rests on it.
+    let blockages_by_layer: std::collections::HashMap<&str, Vec<Rect>> = {
+        let mut m: std::collections::HashMap<&str, Vec<Rect>> = Default::default();
+        for (l, r, ..) in &blockages {
+            m.entry(l.as_str()).or_default().push(*r);
+        }
+        m
+    };
+    /// The blockage rects on one layer, or nothing — the hoisted form of
+    /// `blockages.iter().filter(|(l, ..)| l == layer).map(|(_, r, ..)| *r)`.
+    macro_rules! blockages_on {
+        ($layer:expr) => {
+            blockages_by_layer
+                .get($layer.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        };
     }
 
     let rows = rows_of(&db);
@@ -4207,9 +4263,27 @@ fn generate(args: &[String]) -> ExitCode {
                 .chain(emitted.iter().map(|(_, l, r, _)| (l.clone(), obstruction_of(&db, l, *r))))
                 .collect();
             trace("Making vias", "start");
-            let (placed, dropped) = vyges_pdn::vias::place(&connects, &via_shapes, &via_obstructions);
+            let (placed, dropped) = if std::env::var_os("PDN_VIA_TIMING").is_some() {
+                let t0 = std::time::Instant::now();
+                let cand = vyges_pdn::vias::intersections(&connects, &via_shapes);
+                eprintln!("[viatime] intersections {} candidates from {} shapes in {:?}",
+                          cand.len(), via_shapes.len(), t0.elapsed());
+                let t1 = std::time::Instant::now();
+                let (kept, mut dropped) =
+                    vyges_pdn::vias::remove_obstructed(cand, &connects, &via_obstructions);
+                eprintln!("[viatime] remove_obstructed -> {} kept, {} obstructions, in {:?}",
+                          kept.len(), via_obstructions.len(), t1.elapsed());
+                let t2 = std::time::Instant::now();
+                let (kept, more) = vyges_pdn::vias::remove_overlapping(kept);
+                eprintln!("[viatime] remove_overlapping -> {} kept in {:?}", kept.len(), t2.elapsed());
+                dropped.extend(more);
+                (kept, dropped)
+            } else {
+                vyges_pdn::vias::place(&connects, &via_shapes, &via_obstructions)
+            };
             trace("Making vias", &format!("end, {} placed", placed.len()));
 
+            stage_time("repairVias");
             // ── repairVias ───────────────────────────────────────────────────────────────────────
             // 🔑 **A via whose two shapes do not reach each other pulls the shorter one out.**
             // `Grid::makeVias` builds the vias, calls `repairVias`, and — if any shape moved — builds
@@ -4296,6 +4370,7 @@ fn generate(args: &[String]) -> ExitCode {
                 (placed, dropped)
             };
 
+            stage_time("repairGridChannels");
             // ── stage 6f: repairGridChannels ────────────────────────────────────────────────────
             // 🔑 **A shape with nothing above it is a hole in the grid.** After the vias are made, the
             // reference gathers every strap or follow pin that no via reaches up from, treats the
@@ -4426,6 +4501,7 @@ fn generate(args: &[String]) -> ExitCode {
                 }
             }
 
+            stage_time("crossing areas for trim");
             // ── what TRIMMING needs, which is only the crossing areas ────────────────────────
             // 🔑 **A crossing holds its two shapes whether or not a via is ever built there.**
             // `Grid::makeVias` creates a `Via` per intersection and `updateVias` attaches it to
@@ -4473,6 +4549,7 @@ fn generate(args: &[String]) -> ExitCode {
     }
 
 
+    stage_time("trim");
     // ── trim ─────────────────────────────────────────────────────────────────────────────────
     // ⚠️ **After the vias and before the write.** A shape is trimmed to the extent of what is
     // attached to it, so it cannot be decided earlier; and a shape with nothing attached is
@@ -4648,6 +4725,7 @@ fn generate(args: &[String]) -> ExitCode {
         );
         emitted = kept;
 
+        stage_time("cleanupVias");
         // ── stage 9: cleanupVias ─────────────────────────────────────────────────────────────
         // 🔑 **Trimming invalidates vias.** `GridComponent::replaceShape` removes the old shape —
         // which nulls that end on every via attached to it — and re-attaches only the vias whose
@@ -4710,6 +4788,7 @@ fn generate(args: &[String]) -> ExitCode {
         }
     }
 
+    stage_time("via geometry");
     // ── via geometry ─────────────────────────────────────────────────────────────────────────
     // 🔑 **After trimming, because that is where `PdnGen::writeToDb` sits.** Each grid's crossings
     // were found against the shapes as they stood; each grid's vias are SIZED against the shapes as
@@ -4826,6 +4905,25 @@ fn generate(args: &[String]) -> ExitCode {
             }
         }
         let mut written = 0;
+        if std::env::var_os("PDN_STAGE_TIME").is_some() {
+            eprintln!(
+                "[stagetime]   sizes: placed {} emitted {} connectable_pins {} fixed_via_shapes {}",
+                placed.len(), emitted.len(), connectable_pins.len(), fixed_via_shapes.len()
+            );
+            let mut sizes: std::collections::HashSet<(String, i32, i32)> = Default::default();
+            for v in &placed {
+                sizes.insert((
+                    v.net.clone(),
+                    v.area.2 - v.area.0,
+                    v.area.3 - v.area.1,
+                ));
+            }
+            eprintln!(
+                "[stagetime]   distinct (net, dx, dy) among {} crossings: {}",
+                placed.len(), sizes.len()
+            );
+        }
+        let via_loop_start = std::time::Instant::now();
         for v in &placed {
             // The two shapes AS THEY STAND, which is not as they started.
             //
@@ -6413,11 +6511,7 @@ fn generate(args: &[String]) -> ExitCode {
                 } else {
                     direction_of(&db, layer)
                 };
-                let obstructions: Vec<Rect> = blockages
-                    .iter()
-                    .filter(|(l, ..)| l == layer)
-                    .map(|(_, r, ..)| *r)
-                    .collect();
+                let obstructions: &[Rect] = blockages_on!(layer);
                 // ⚠️ **Into `emitted` itself, which is what `check_shapes` does.** It calls
                 // `shape->setRect(new_shape)`, so the grown shape IS the shape from that moment on
                 // — for the next via in this same pass, and for the write. Holding the growth to
@@ -6436,6 +6530,12 @@ fn generate(args: &[String]) -> ExitCode {
                     emitted[si].2 = g;
                 }
             }
+        }
+        if std::env::var_os("PDN_STAGE_TIME").is_some() {
+            eprintln!(
+                "[stagetime]   via loop: {} crossings, {written} written, in {:?} ",
+                placed.len(), via_loop_start.elapsed()
+            );
         }
         vyges_events::log(
             "vyges-pdn",
@@ -6480,11 +6580,7 @@ fn generate(args: &[String]) -> ExitCode {
                 .iter()
                 .find(|f| f.net == *net && f.layer == *layer && overlaps(f.rect, *area))
             {
-                let obstructions: Vec<Rect> = blockages
-                    .iter()
-                    .filter(|(l, ..)| l == layer)
-                    .map(|(_, r, ..)| *r)
-                    .collect();
+                let obstructions: &[Rect] = blockages_on!(layer);
                 if let vyges_pdn::shapes::ViaCheck::Ripup(_) = vyges_pdn::shapes::check_via_shapes(
                     f.rect,
                     &[*metal],
@@ -6514,11 +6610,7 @@ fn generate(args: &[String]) -> ExitCode {
         } else {
             direction_of(&db, layer)
         };
-        let obstructions: Vec<Rect> = blockages
-            .iter()
-            .filter(|(l, ..)| l == layer)
-            .map(|(_, r, ..)| *r)
-            .collect();
+        let obstructions: &[Rect] = blockages_on!(layer);
         match vyges_pdn::shapes::check_via_shapes(
             emitted[si].2,
             &[*metal],
@@ -6612,6 +6704,7 @@ fn generate(args: &[String]) -> ExitCode {
         );
     }
 
+    stage_time("floating shapes");
     // ── shapes left floating by failed vias ───────────────────────────────────────────────────
     // 🔑 **`Via::writeToDb` marks a via FAILED, and `writeToDb` then destroys what only failed
     // vias were holding up.** The reference's last act before the swires are tidied.
@@ -6985,6 +7078,7 @@ fn generate(args: &[String]) -> ExitCode {
         }
     }
 
+    stage_time("write DEF");
     if let Err(e) = db.write_def(out) {
         vyges_events::log(
             "vyges-pdn",

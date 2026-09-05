@@ -429,13 +429,12 @@ pub fn remove_obstructed(
     connects: &[Connect],
     obstructions: &[(String, Rect)],
 ) -> (Vec<Via>, Vec<(Via, Failed)>) {
+    let index = ObstructionIndex::build(obstructions);
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for v in vias {
         let layers = &connects[v.connect].intermediate;
-        let blocked = obstructions
-            .iter()
-            .any(|(l, r)| layers.contains(l) && intersects(v.area, *r));
+        let blocked = layers.iter().any(|l| index.any_hit(l, v.area));
         if blocked {
             dropped.push((v, Failed::Obstructed));
         } else {
@@ -443,6 +442,153 @@ pub fn remove_obstructed(
         }
     }
     (kept, dropped)
+}
+
+/// The obstructions, bucketed by layer and by position, for [`remove_obstructed`].
+///
+/// 🔑 **A pure ACCELERATION — the predicate is unchanged.** `any_hit` answers exactly what
+/// `obstructions.iter().any(|(l, r)| layer == l && intersects(area, *r))` answers, and the pass is
+/// an existence test, so visiting a rect twice or in a different order cannot change the result.
+/// ⟹ **Its correctness test is that the output is IDENTICAL, not that it is plausible.**
+///
+/// ⛔ **Why it exists.** The reference does this test through a boost R-tree —
+/// `search_obs.qbegin(bgi::intersects(via->getArea()) && …)` — and we did it by scanning every
+/// obstruction for every candidate. On `pads_connect_from_non_pref_edge` that is **22,881
+/// candidates against 712,108 obstructions**, and it measured **128 seconds** in a run that has to
+/// do it twice, once before `repairVias` and once after. The reference finishes the whole design in
+/// seconds. Nothing about the rule was wrong; the loop was.
+///
+/// **A uniform grid, not an R-tree.** The data is what makes that the right pick: hundreds of
+/// thousands of small instance-pin rects spread evenly over a die, queried by small via areas. A
+/// grid costs one multiply per lookup and needs no dependency.
+///
+/// ⚠️ **A rect far larger than a cell would be listed in every cell it spans**, so anything
+/// covering more than [`Self::MAX_CELLS_PER_RECT`] cells goes in a per-layer `oversized` list that
+/// is scanned linearly. That keeps the memory bounded no matter how a technology mixes a macro
+/// blockage with pin-sized ones. There are few such rects in practice, which is why the linear
+/// scan for them costs nothing.
+struct ObstructionIndex {
+    layers: std::collections::HashMap<String, LayerBuckets>,
+}
+
+struct LayerBuckets {
+    /// The indexed area. Anything outside it cannot be hit, and no cell is allocated for it.
+    origin: (i32, i32),
+    cell: i64,
+    nx: i64,
+    ny: i64,
+    cells: Vec<Vec<u32>>,
+    rects: Vec<Rect>,
+    /// Rects spanning too many cells to list, scanned linearly.
+    oversized: Vec<Rect>,
+}
+
+impl ObstructionIndex {
+    /// A rect wider than this many cells on either axis goes to `oversized`.
+    const MAX_CELLS_PER_RECT: i64 = 64;
+
+    fn build(obstructions: &[(String, Rect)]) -> Self {
+        let mut by_layer: std::collections::HashMap<&str, Vec<Rect>> = Default::default();
+        for (l, r) in obstructions {
+            by_layer.entry(l.as_str()).or_default().push(*r);
+        }
+        let mut layers = std::collections::HashMap::new();
+        for (l, rects) in by_layer {
+            layers.insert(l.to_string(), LayerBuckets::build(rects));
+        }
+        ObstructionIndex { layers }
+    }
+
+    fn any_hit(&self, layer: &str, area: Rect) -> bool {
+        match self.layers.get(layer) {
+            Some(b) => b.any_hit(area),
+            None => false,
+        }
+    }
+}
+
+impl LayerBuckets {
+    fn build(rects: Vec<Rect>) -> Self {
+        // The bounding box of everything on the layer, and a cell size that puts roughly one rect
+        // in each cell. ⚠️ Guarded at 1: a layer whose shapes are all one point would divide by
+        // zero, and a single-cell grid is still correct, only slow.
+        let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+        for r in &rects {
+            x0 = x0.min(r.0);
+            y0 = y0.min(r.1);
+            x1 = x1.max(r.2);
+            y1 = y1.max(r.3);
+        }
+        let (w, h) = ((x1 as i64 - x0 as i64).max(1), (y1 as i64 - y0 as i64).max(1));
+        let n = rects.len().max(1) as i64;
+        let cell = (((w as f64 * h as f64) / n as f64).sqrt() as i64).max(1);
+        let nx = (w / cell + 1).clamp(1, 4096);
+        let ny = (h / cell + 1).clamp(1, 4096);
+        // ⚠️ The clamp above can leave a cell too small to cover the span, so recompute from the
+        // counts actually used rather than trusting the first estimate.
+        let cell_x = (w / nx + 1).max(1);
+        let cell_y = (h / ny + 1).max(1);
+        let cell = cell_x.max(cell_y);
+        let nx = (w / cell + 1).max(1);
+        let ny = (h / cell + 1).max(1);
+
+        let mut b = LayerBuckets {
+            origin: (x0, y0),
+            cell,
+            nx,
+            ny,
+            cells: vec![Vec::new(); (nx * ny) as usize],
+            rects: Vec::with_capacity(rects.len()),
+            oversized: Vec::new(),
+        };
+        for r in rects {
+            let (cx0, cy0, cx1, cy1) = b.span(r);
+            if (cx1 - cx0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
+                || (cy1 - cy0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
+            {
+                b.oversized.push(r);
+                continue;
+            }
+            let at = b.rects.len() as u32;
+            b.rects.push(r);
+            for cy in cy0..=cy1 {
+                for cx in cx0..=cx1 {
+                    b.cells[(cy * b.nx + cx) as usize].push(at);
+                }
+            }
+        }
+        b
+    }
+
+    /// The cell range a rect covers, clamped into the grid.
+    fn span(&self, r: Rect) -> (i64, i64, i64, i64) {
+        let cx0 = ((r.0 as i64 - self.origin.0 as i64) / self.cell).clamp(0, self.nx - 1);
+        let cy0 = ((r.1 as i64 - self.origin.1 as i64) / self.cell).clamp(0, self.ny - 1);
+        let cx1 = ((r.2 as i64 - self.origin.0 as i64) / self.cell).clamp(0, self.nx - 1);
+        let cy1 = ((r.3 as i64 - self.origin.1 as i64) / self.cell).clamp(0, self.ny - 1);
+        (cx0, cy0, cx1, cy1)
+    }
+
+    fn any_hit(&self, area: Rect) -> bool {
+        if self.oversized.iter().any(|r| intersects(area, *r)) {
+            return true;
+        }
+        // ⚠️ **Clamping the query into the grid is not enough on its own** — a query wholly outside
+        // the indexed area would clamp onto an edge cell and test rects it cannot touch. That is
+        // harmless here only because `intersects` is then asked anyway; the clamp is for indexing
+        // safety, and the rect test is what decides.
+        let (cx0, cy0, cx1, cy1) = self.span(area);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                for &at in &self.cells[(cy * self.nx + cx) as usize] {
+                    if intersects(area, self.rects[at as usize]) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 /// **V3** — of two overlapping candidates on the same layer pair, keep the larger.
@@ -1163,5 +1309,140 @@ mod tests {
         let (kept, _) = place(&c, &s, &[("x".into(), (30, 30, 50, 50))]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].area, (0, 0, 20, 20), "the small legal one survives");
+    }
+
+    // ── the obstruction index ────────────────────────────────────────────────────────────────
+    //
+    // 🔑 **An acceleration is judged against the thing it replaces, not against expectations.**
+    // `ObstructionIndex` exists only to answer the old linear scan faster, so every test below
+    // compares the two answers directly. A case list would only ever check the shapes someone
+    // thought of.
+
+    /// The predicate `remove_obstructed` used before the index, kept verbatim as the oracle.
+    fn naive_hit(obstructions: &[(String, Rect)], layer: &str, area: Rect) -> bool {
+        obstructions
+            .iter()
+            .any(|(l, r)| l == layer && intersects(area, *r))
+    }
+
+    /// A deterministic LCG — a seeded sweep must be reproducible, and a dependency for eight lines
+    /// of arithmetic is not worth it.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        fn in_range(&mut self, lo: i32, hi: i32) -> i32 {
+            lo + (self.next() % ((hi - lo) as u64 + 1)) as i32
+        }
+    }
+
+    #[test]
+    fn the_index_answers_exactly_what_the_linear_scan_answers() {
+        let mut rng = Lcg(0x5EED);
+        let layers = ["Metal2", "Metal3", "Via2"];
+        let mut obstructions: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..4000 {
+            let l = layers[(rng.next() % 3) as usize];
+            let x = rng.in_range(-5_000, 100_000);
+            let y = rng.in_range(-5_000, 100_000);
+            // ⚠️ A deliberate mix of sizes: pin-sized rects, and a few far larger than a cell so
+            // the `oversized` path is exercised rather than merely present.
+            let (w, h) = if rng.next() % 50 == 0 {
+                (rng.in_range(20_000, 60_000), rng.in_range(20_000, 60_000))
+            } else {
+                (rng.in_range(0, 400), rng.in_range(0, 400))
+            };
+            obstructions.push((l.to_string(), (x, y, x + w, y + h)));
+        }
+        let index = ObstructionIndex::build(&obstructions);
+
+        let mut checked = 0;
+        let mut hits = 0;
+        for _ in 0..20_000 {
+            // ⚠️ Query outside the indexed area too — clamping a query into the grid must not
+            // invent a hit on an edge cell.
+            let x = rng.in_range(-20_000, 120_000);
+            let y = rng.in_range(-20_000, 120_000);
+            let w = rng.in_range(0, 300);
+            let h = rng.in_range(0, 300);
+            let area = (x, y, x + w, y + h);
+            for l in layers.iter().chain(std::iter::once(&"NoSuchLayer")) {
+                let want = naive_hit(&obstructions, l, area);
+                assert_eq!(
+                    index.any_hit(l, area),
+                    want,
+                    "layer {l} area {area:?} disagreed with the linear scan"
+                );
+                checked += 1;
+                hits += want as usize;
+            }
+        }
+        // ⛔ **A check that cannot fail proves nothing.** If the sweep never found an obstruction,
+        // every `assert_eq!` above compared false to false and the index was never exercised.
+        assert_eq!(checked, 80_000);
+        assert!(hits > 1_000, "only {hits} hits — the sweep is not testing the positive path");
+    }
+
+    #[test]
+    fn a_rect_too_big_to_bucket_is_still_found() {
+        // ⛔ **This test exists because the sweep above did NOT cover the `oversized` path.**
+        // Deleting the oversized scan left that sweep green: with 4000 rects the grid is ~63 cells
+        // across, so a rect only lands in the oversized list if it spans nearly the whole layer,
+        // and none of the sweep's "large" rects did. A path no test reaches is a path with no
+        // witness, whatever the coverage of the tests around it.
+        //
+        // 10,000 small rects over a 1,000,000 span puts the grid at ~100 cells across, so one
+        // full-extent rect covers 100 > MAX_CELLS_PER_RECT and must take the linear path.
+        let mut rng = Lcg(0xB16);
+        let mut obstructions: Vec<(String, Rect)> = Vec::new();
+        for _ in 0..10_000 {
+            let x = rng.in_range(0, 1_000_000);
+            let y = rng.in_range(0, 1_000_000);
+            obstructions.push(("Metal2".to_string(), (x, y, x + 100, y + 100)));
+        }
+        // ⚠️ **On the SAME layer as the small ones.** The grid is built per layer, so a big rect
+        // alone on its own layer gets a grid sized for one rect and is never oversized — the first
+        // spelling of this test put it on `Metal3` and asserted a list that stayed empty.
+        obstructions.push(("Metal2".to_string(), (0, 0, 1_000_000, 1_000_000)));
+        let index = ObstructionIndex::build(&obstructions);
+
+        // The path is REACHED, not merely present.
+        assert_eq!(
+            index.layers["Metal2"].oversized.len(),
+            1,
+            "the full-extent rect must take the oversized path, or this test proves nothing"
+        );
+
+        // And it is ANSWERED: a query far outside every small rect still hits the big one.
+        let mut outside_hits = 0;
+        for _ in 0..2_000 {
+            let x = rng.in_range(-50_000, 1_050_000);
+            let y = rng.in_range(-50_000, 1_050_000);
+            let area = (x, y, x + 50, y + 50);
+            assert_eq!(
+                index.any_hit("Metal2", area),
+                naive_hit(&obstructions, "Metal2", area),
+                "oversized rect disagreed with the linear scan at {area:?}"
+            );
+            if x >= 0 && y >= 0 && x <= 1_000_000 && y <= 1_000_000 {
+                outside_hits += 1;
+            }
+        }
+        assert!(outside_hits > 100, "the sweep never queried inside the oversized rect");
+    }
+
+    #[test]
+    fn an_empty_layer_and_an_empty_index_hit_nothing() {
+        let index = ObstructionIndex::build(&[]);
+        assert!(!index.any_hit("Metal2", (0, 0, 10, 10)));
+        let one = [("Metal2".to_string(), (5, 5, 5, 5))];
+        let index = ObstructionIndex::build(&one);
+        // A degenerate zero-area rect still has to be found: `intersects` is the CLOSED test, so a
+        // touch counts, and building the grid must not divide by a zero span.
+        assert!(index.any_hit("Metal2", (0, 0, 5, 5)));
+        assert!(!index.any_hit("Metal2", (6, 6, 10, 10)));
+        assert!(!index.any_hit("Metal3", (0, 0, 10, 10)));
     }
 }
