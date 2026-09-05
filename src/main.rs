@@ -4831,9 +4831,18 @@ fn generate(args: &[String]) -> ExitCode {
         //
         // ⚠️ Caching is SKIPPED where either shape is unmodifiable or carries terminal
         // connections; the reference sets `skip_caching` and clears the entry after using it.
+        // 🔑 **The cache holds the two ends' CONSTRAINTS, not just their orientations.**
+        // `Connect::makeVia` looks its via up by `(net, dx, dy)` BEFORE any constraint is computed
+        // and reuses the whole `DbGenerateStackedVia` when it hits — so the first crossing of a
+        // size decides `must_fit_x`/`must_fit_y` for every later crossing of that size, whatever
+        // shapes those later ones land on.
+        // ⚠️ **Orientation alone is not enough**, because a constraint is also set by whether the
+        // shape is modifiable and whether it carries terminal connections. Recomputing those per
+        // crossing — instead of taking the first one's — moved two vias on
+        // `pads_ihp_sg13g2_balance` from the reference's 1315 to a minimum of 500.
         let mut via_cache: std::collections::HashMap<
             (usize, Option<String>, i32, i32),
-            (Direction, Direction),
+            (vyges_pdn::viagen::Constraint, vyges_pdn::viagen::Constraint),
         > = std::collections::HashMap::new();
         let mut placed = placed;
         placed.sort_by_key(|v| {
@@ -5017,10 +5026,66 @@ fn generate(args: &[String]) -> ExitCode {
                 inter.2 - inter.0,
                 inter.3 - inter.1,
             );
-            let dirs = *via_cache.entry(cache_key).or_insert((
-                vyges_pdn::viagen::rect_direction(lower_rect),
-                vyges_pdn::viagen::rect_direction(upper_rect),
-            ));
+            // ⛔ **A shape that cannot be MODIFIED, or that already carries TERMINAL
+            // connections, must fit on BOTH axes.** `Connect::makeVia`:
+            //
+            // ```cpp
+            // if (!lower->isModifiable() || lower->hasITermConnections()) {
+            //   lower_constraint.must_fit_x = true; must_fit_y = true;
+            //   lower_constraint.intersection_only = false;
+            // } else {
+            //   must_fit_x = !lower->isHorizontal(); must_fit_y = !lower->isVertical();
+            // }
+            // ```
+            //
+            // ⚠️ **We passed `true, false` for years and the flags were never read**, so the
+            // branch could not fire and one axis always took the MINIMUM where the reference takes
+            // the overlap. That was 41 vias across 20 cases, ours the smaller on exactly one axis
+            // every time — and the gate could not see any of it until it began reading the `VIAS`
+            // section.
+            //
+            // `Shape::isModifiable()` is `!is_locked_ && shape_type_ == kShape`: a LOCKED shape —
+            // a single-layer ring — and anything that is not a grid component's own shape, which
+            // for us is the routing the design arrived with. `hasITermConnections()` is
+            // `addITermConnection`, called only on the pad direct-connect straps, which is exactly
+            // what `iterm_holds` records.
+            let end_flags = |layer: &str, rect: Rect| -> (bool, bool) {
+                // ⚠️ **An instance PIN is `kFixed` too, and that is what this case turns on.**
+                // `InstanceGrid::getInstancePins` calls `shape->setShapeType(Shape::kFixed)` on
+                // every pin box it makes, so a via landing on a pad's own pin has a
+                // non-modifiable end and must fit on both axes. Counting only the routing the
+                // design arrived with leaves a pad-strap via taking the minimum on one axis:
+                // `pads_ihp_sg13g2_balance` writes 500 where the reference writes 1315.
+                let is_fixed = fixed_via_shapes
+                    .iter()
+                    .chain(connectable_pins.iter())
+                    .any(|f| f.net == v.net && f.layer == layer && f.rect == rect);
+                let locked_ring = locked_layers.iter().any(|l| l == layer)
+                    && emitted.iter().any(|(n, l, r, k)| {
+                        n == &v.net && l == layer && *r == rect && *k == "RING"
+                    });
+                let has_iterms = iterm_holds.iter().any(|(n, l, h)| {
+                    n == &v.net
+                        && l == layer
+                        && rect.0 <= h.0
+                        && rect.1 <= h.1
+                        && rect.2 >= h.2
+                        && rect.3 >= h.3
+                });
+                (!is_fixed && !locked_ring, has_iterms)
+            };
+            let ends = *via_cache.entry(cache_key).or_insert_with(|| {
+                let (mb, ib) = end_flags(&v.lower, lower_rect);
+                let (mt, it) = end_flags(&v.upper, upper_rect);
+                (
+                    vyges_pdn::viagen::constraint_for(
+                        vyges_pdn::viagen::rect_direction(lower_rect), mb, ib,
+                    ),
+                    vyges_pdn::viagen::constraint_for(
+                        vyges_pdn::viagen::rect_direction(upper_rect), mt, it,
+                    ),
+                )
+            });
             // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
             // metal6 needs a cut at each of five levels, and the reference's own counts show it:
             // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
@@ -5409,16 +5474,11 @@ fn generate(args: &[String]) -> ExitCode {
                 // is a shape, and a shape has exactly one candidate.
                 // ℹ️ From the CACHED orientations, not from this crossing's own rects: where the
                 // connect has already built a via of this size, that via is reused whole.
-                let bot_c = if at_bottom_end {
-                    vyges_pdn::viagen::constraint_for(dirs.0, true, false)
-                } else {
-                    Default::default()
-                };
-                let top_c = if at_top_end {
-                    vyges_pdn::viagen::constraint_for(dirs.1, true, false)
-                } else {
-                    Default::default()
-                };
+                // ℹ️ **From the CACHE, which is where the reference's constraints live too** —
+                // `Connect::makeVia` reuses the whole stack for a second crossing of the same
+                // size, so the first one's constraints are the ones that count. See the cache.
+                let bot_c = if at_bottom_end { ends.0 } else { Default::default() };
+                let top_c = if at_top_end { ends.1 } else { Default::default() };
 
                 // ── every lower candidate against every upper one ───────────────────────────
                 // 🔑 **`makeSingleLayerVia` crosses the two SETS.** A generator is made for each
@@ -5853,13 +5913,67 @@ fn generate(args: &[String]) -> ExitCode {
                         // ⚠️ Snapped LAST, after the split-cut override, because
                         // `determineRowsAndColumns` snaps on its way out and every branch
                         // above it funnels through that one line.
-                        let (bot_enc, top_enc) = if split.is_some() {
+                        let (b, t) = if split.is_some() {
                             (chosen.bottom, chosen.top)
                         } else {
                             (b, t)
                         };
-                        let bot_enc = vyges_pdn::viagen::snap_enclosure(bot_enc, grid_mfg);
-                        let top_enc = vyges_pdn::viagen::snap_enclosure(top_enc, grid_mfg);
+                        // ⛔ **The SPARE pass, applied for real and not merely asked about.**
+                        // `determineRowsAndColumns` ends by giving a side that still fails its
+                        // rules the metal lying OUTSIDE the intersection, capped at what the rule
+                        // asks:
+                        //
+                        // ```cpp
+                        // if (!use_bottom_min_enclosure)
+                        //   if ((spare_x > 0 || spare_y > 0) && !checkMinEnclosure(true, false)) {
+                        //     apply = min(bottom_min_enclosure, bottom_enclosure_ + spare);
+                        //     bottom_enclosure_->set(determine_enclosure(false, .., min, apply, c));
+                        //   }
+                        // ```
+                        //
+                        // ⚠️ **We already computed this and used it only as a QUESTION** — "would
+                        // this candidate pass if the spare were applied?" — and then built the via
+                        // without it. The candidate chosen was right and the geometry written was
+                        // not: on `asap7_M1_M2_followpin_enclosure` the trace shows
+                        // `CHOSE bottom { x: 0, y: 9 }` and the DEF says `ENCLOSURE 0 0 5 0`.
+                        // ⛔ **The gate could not see it** — it read via placements by name and
+                        // position and never the `VIAS` section — so 43 vias across 22 cases
+                        // carried an enclosure short on exactly one axis, always ours the smaller.
+                        //
+                        // ⚠️ **Per side, and only the failing one**, as `checkMinEnclosure(true,
+                        // false)` is asked of the bottom alone. A side that already passes is left
+                        // exactly as built.
+                        // ⚠️ **Before the snap and after the split-cut override**, which is where
+                        // the reference puts it — the block sits outside `if (isSplitCutArray())`
+                        // and above the two `->snap(getTech())` calls.
+                        // ℹ️ Upstream also clears `can_cache_` here. Our `via_cache` holds only
+                        // the two ends' orientations, so there is nothing to invalidate — but if
+                        // it is ever widened to hold geometry, a via that took the spare must not
+                        // be cached.
+                        let spare_for = |built: vyges_pdn::viagen::Enclosure,
+                                         at_end: bool,
+                                         minimum: vyges_pdn::viagen::Enclosure,
+                                         spare: vyges_pdn::viagen::Enclosure,
+                                         rules: &[(vyges_pdn::viagen::Enclosure, bool)],
+                                         c: vyges_pdn::viagen::Constraint| {
+                            if at_end
+                                && (spare.x > 0 || spare.y > 0)
+                                && !vyges_pdn::viagen::enclosure_satisfies(built, rules)
+                            {
+                                vyges_pdn::viagen::built_enclosure(
+                                    false,
+                                    minimum,
+                                    vyges_pdn::viagen::spare_applied(built, minimum, spare),
+                                    c,
+                                )
+                            } else {
+                                built
+                            }
+                        };
+                        let b = spare_for(b, at_bottom_end, chosen.bottom, spare_b, &bot_rules, bot_c);
+                        let t = spare_for(t, at_top_end, chosen.top, spare_t, &top_rules, top_c);
+                        let bot_enc = vyges_pdn::viagen::snap_enclosure(b, grid_mfg);
+                        let top_enc = vyges_pdn::viagen::snap_enclosure(t, grid_mfg);
                         let (bot_enc, top_enc) =
                             ((bot_enc.x, bot_enc.y), (top_enc.x, top_enc.y));
                         if std::env::var_os("PDN_ENC_TRACE").is_some() {
