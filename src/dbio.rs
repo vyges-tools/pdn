@@ -450,19 +450,34 @@ pub(crate) fn instance_has_supply(db: &Db, inst: &str, nets: &[String]) -> bool 
 /// where `dbTechLayer::getSpacing(width, length)` is itself the V5.4 RANGE rules, then the V5.5
 /// table which overwrites them, then an over-range V5.4 rule, and only then the plain `SPACING`.
 ///
-/// ⛔ **MEASURED AND LEFT UNWIRED, twice now, and the second measurement says where to look.**
-/// An earlier version read the chain as "the V5.5 table, else the plain SPACING" and cost seven
-/// designs their exact match. This one is the chain as the source states it, and across the suite
-/// it **gains one design and costs three**: more than it gains.
+/// ✅ **WIRED 2026-09-05, after the `applyHalo` prerequisite landed.** Its history is worth
+/// keeping, because the sequencing is the lesson:
 ///
-/// 🔑 **All three losses are macro grids with HALOS, and the one it fixes has none.** That is the old note's own hypothesis confirmed rather than the rule being wrong:
-/// `getInstanceObstructions(inst, halos_)` merges the halo rect with the spacing rect and takes the
-/// LARGER per side, so where our equivalent adds one to the other instead, widening the spacing
-/// term widens the error with it.
+/// - An early version read the chain as "the V5.5 table, else the plain `SPACING`" and cost seven
+///   designs their exact match.
+/// - This version — the chain as the source states it — was then measured twice and **left
+///   unwired**, because across the suite it gained one design and cost three.
+/// - 🔑 **All three losses were macro grids with HALOS, and the one it fixed had none.** That was
+///   the note's own hypothesis, and it was right: `getInstanceObstructions(inst, halos_)` merges
+///   the halo rect with the spacing rect and takes the LARGER per side, and our equivalent ADDED
+///   one to the other — so widening the spacing term widened that error with it.
+/// - `instance_obstructions` now takes `s.max(halo[i])` per side, as the reference does. With that
+///   in place this wires cleanly: **112 / 2 of 114 comparable at pin `7d490b8`, from 111 / 3**,
+///   `pads_ihp_sg13g2_balance` exact, and `macros_with_halo` and `macros_with_rings` — the very
+///   cases predicted to break — still matching.
 ///
-/// ⟹ **Fix `applyHalo` first, then measure this again.** Wiring it before that trades three cases
-/// for one, in both directions, forever.
-#[allow(dead_code)]
+/// ⟹ **A correct rule can be net-negative until its prerequisite lands, and the way to tell that
+/// from a wrong rule is that the losses share a feature the win does not have.**
+///
+/// ◐ **Two things this does NOT yet model**, both from `Shape::generateObstruction` and neither
+/// exercised by any case in the corpus: the LEF58 `SPACINGTABLE PARALLELRUNLENGTH` rules
+/// (`getTechLayerSpacingTablePrlRules`) and the end-of-line rules
+/// (`getTechLayerSpacingEolRules`). `generateObstruction` merges all three and takes the most
+/// restrictive box.
+///
+/// ⚠️ **Three repair-channel sites still ask `layer_find_v55_spacing`** (`build_repair` and its
+/// two retries). Those compute a STRAP SPACING — a grid parameter — not an obstruction halo, and
+/// they already fall back to the plain `SPACING`. Different quantity, deliberately left alone.
 pub(crate) fn obstruction_spacing(db: &Db, layer: &str, width: i32, length: i32) -> i32 {
     let db_spacing = db.layer_get_spacing_for(layer, width, length).unwrap_or(0);
     let two_widths = db.layer_find_tw_spacing(layer, width, width, length).unwrap_or(0);

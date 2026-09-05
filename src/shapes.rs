@@ -882,4 +882,46 @@ mod cut_sequence_tests {
         // obstruction's own halo counted twice.
         assert_ne!(s, Some((300, 2700)));
     }
+
+    #[test]
+    fn two_component_shapes_clear_each_other_by_the_SUM_of_their_halos() {
+        // ⛔ **The clearance between two grid-component shapes is 2 × the spacing, not 1 ×**, and
+        // the reason is the R-tree, not the arithmetic. `Shape::cut` queries an `ObstructionTree`,
+        // and that tree is indexed by `ObstructionIndexableGetter` — each entry's OBSTRUCTION box.
+        // The query rect is `getObstruction()`, this shape's own box. So both sides are bloated
+        // and two shapes conflict as soon as their halos touch. (A `ShapeTree`, by contrast, is
+        // indexed by `RectIndexableGetter` — the bare rect. Reading one for the other is silent.)
+        //
+        // The reference's own numbers, `pads_ihp_sg13g2_balance` at pin `7d490b8`, TopMetal2
+        // `SPACING 2` = 2000 both sides. A VSS pad strap against the VDD core strap raw at
+        // x 453380..455580, which spans the full ring area in y while it is an obstruction:
+        let raw = (453380, 327160, 455580, 871100);
+        let stored = (451380, 325160, 457580, 873100); // its own 2000, as `generateObstruction` bloats it
+        let h = Halo { left: 2000, top: 2000, right: 2000, bottom: 2000 };
+
+        // Lane 443405 — a gap of 3310 to the raw rect. Under 4000, so it IS cut, and the strap is
+        // taken back to 325160: one spacing below the ring it was trying to reach at 327160.
+        assert_eq!(
+            blocked_span((436740, 300000, 450070, 342160), h, stored, raw, false),
+            Some((325160, 873100)),
+            "3310 < 2000 + 2000, so the halos overlap and the strap is cut"
+        );
+
+        // Lane 441735 — a gap of 4980, and the reference accepts it. This is the lane the whole
+        // case turns on: it is the one that keeps its via to the TopMetal1 VSS ring.
+        assert_eq!(
+            blocked_span((435070, 300000, 448400, 342160), h, stored, raw, false),
+            None,
+            "4980 >= 2000 + 2000, so nothing is cut and the strap reaches the ring"
+        );
+
+        // ⚠️ **The regression this pins.** With the obstruction stored UNBLOATED — what a
+        // parallel-run-length-table-only lookup gives on a layer that declares no table — the
+        // clearance collapses to one spacing and the 3310 lane is wrongly accepted.
+        assert_eq!(
+            blocked_span((436740, 300000, 450070, 342160), h, raw, raw, false),
+            None,
+            "a zero-halo obstruction accepts a lane the reference refuses"
+        );
+    }
 }

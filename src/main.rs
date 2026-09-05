@@ -752,7 +752,7 @@ impl GridSpec {
 /// should have been trimmed away from.
 fn obstruction_of(db: &Db, layer: &str, r: Rect) -> Rect {
     let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
-    let h = db.layer_find_v55_spacing(layer, w, len).unwrap_or(0);
+    let h = obstruction_spacing(db, layer, w, len);
     (r.0 - h, r.1 - h, r.2 + h, r.3 + h)
 }
 
@@ -926,7 +926,7 @@ fn find_channels(
                 .filter(|(_, l, _, _)| *l == target_layer)
                 .map(|(_, l, r, _)| {
                     let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
-                    let h = db.layer_find_v55_spacing(l, w, len).unwrap_or(0);
+                    let h = obstruction_spacing(db, l, w, len);
                     (r.0 - h, r.1 - h, r.2 + h, r.3 + h)
                 })
                 .collect();
@@ -1098,9 +1098,7 @@ fn build_repair_at(
                     (straps.2 - straps.0).min(straps.3 - straps.1),
                     (straps.2 - straps.0).max(straps.3 - straps.1),
                 );
-                let h = db
-                    .layer_find_v55_spacing(&ch.target_layer, w, len)
-                    .unwrap_or(0);
+                let h = obstruction_spacing(db, &ch.target_layer, w, len);
                 let mut check = (
                     straps.0 - h,
                     straps.1 - h,
@@ -1132,7 +1130,7 @@ fn build_repair_at(
                         }
                         let (w, len) =
                             ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
-                        let hh = db.layer_find_v55_spacing(l, w, len).unwrap_or(0);
+                        let hh = obstruction_spacing(db, l, w, len);
                         if hits(l, (r.0 - hh, r.1 - hh, r.2 + hh, r.3 + hh)) {
                             return false;
                         }
@@ -1455,7 +1453,7 @@ fn made_obstructions(
         .iter()
         .map(|(net, l, r, kind)| {
             let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
-            let h = db.layer_find_v55_spacing(l, w, len).unwrap_or(0);
+            let h = obstruction_spacing(db, l, w, len);
             (
                 l.clone(),
                 (r.0 - h, r.1 - h, r.2 + h, r.3 + h),
@@ -2375,7 +2373,7 @@ fn generate(args: &[String]) -> ExitCode {
             let name = db.layer_name_by_number(layer);
             let r = (x0, y0, x1, y1);
             let (w, len) = ((x1 - x0).min(y1 - y0), (x1 - x0).max(y1 - y0));
-            let h = db.layer_find_v55_spacing(&name, w, len).unwrap_or(0);
+            let h = obstruction_spacing(&db, &name, w, len);
             // ⚠️ An octilinear box has no net and so connects to nothing — see below.
             if !octilinear {
                 fixed_via_shapes.push(vyges_pdn::vias::Shape {
@@ -2778,7 +2776,7 @@ fn generate(args: &[String]) -> ExitCode {
             for (l, r) in ring_blankets {
                 // The one blanket the reference bloats, and it is bloated by its own size.
                 let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
-                let h = db.layer_find_v55_spacing(&l, w, len).unwrap_or(0);
+                let h = obstruction_spacing(&db, &l, w, len);
                 out.push((i, l.clone(), (r.0 - h, r.1 - h, r.2 + h, r.3 + h), r));
                 if instance_grid && !layers.iter().any(|x| *x == l) {
                     out.push((i, l, grid_area, grid_area));
