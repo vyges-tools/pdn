@@ -5135,6 +5135,48 @@ fn generate(args: &[String]) -> ExitCode {
             // leaves its own metal on the layer above.
             // ⚠️ **And whether that via was an ARRAY**, because the patch on the layer between is
             // decided by `requiresPatch()` on either of the two vias, not by the geometry.
+            // ⛔ **`Connect::makeVia`'s SHARED-LAYER REBUILD.** The metal a stack leaves on a
+            // layer it only passes through is the union of the pad landing from the cut below and
+            // the pad landing from the cut above, so it can be WIDER than either pad alone — and a
+            // width-conditioned `LEF58_ENCLOSURE` tier is chosen against that merged shape, because
+            // that is what a DRC deck measures. The reference builds the stack, measures what
+            // actually lands on each shared layer, and rebuilds until the widths stop growing.
+            //
+            // 🔑 **It terminates**: a rebuild happens only when some shared layer got strictly
+            // wider, widths are never lowered, and the pads are bounded by the enclosures the
+            // technology asks for. At most one pass per width tier a layer actually crosses.
+            //
+            // ⚠️ **A single-layer via has no shared layer**, so the rebuild cannot fire and the
+            // loop runs exactly once — which is every connect in most designs. The cost is paid
+            // only by stacks that span an intermediate layer.
+            //
+            // 🔑 **Rebuilding is a TRUNCATE, not a dry-run flag.** Everything this loop produces
+            // is an in-memory vector; nothing reaches the database until later. So a pass that is
+            // about to be redone is undone by cutting those vectors back to where they started.
+            //
+            // ⛔ **A measuring pass creates NO `dbVia`, and that is the whole reason it exists.**
+            // Everything else this loop produces is an in-memory vector a truncate can undo;
+            // `create_generated_via` is a DATABASE write, and the via NAME encodes area, rows,
+            // columns and pitch — not the enclosure — so a definition written on an early pass is
+            // found by name on the next one, kept, and the DEF comes out with the SUPERSEDED
+            // enclosure while the metal around it uses the corrected one. ⚠️ **The gate cannot see
+            // that**: it compares via placements by name and position, so the case reads as an
+            // exact match with a wrong `VIAS` section. The reference has no such hazard because it
+            // reaches the fixed point before it builds any `DbVia` at all.
+            //
+            // ⚠️ **A single-layer via has no shared layer**, so no measuring pass is run for one
+            // and the common case costs exactly what it did before.
+            let mut shared_widths: Vec<Option<i32>> = vec![None; stack.len()];
+            let restore = (
+                placements.len(),
+                via_faces.len(),
+                drcfill.len(),
+                via_ok.len(),
+                written,
+            );
+            let mut measuring = stack.len() > 2;
+            loop {
+            let mut merged_widths: Vec<Option<i32>> = vec![None; stack.len()];
             let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
             for (level, pair) in stack.windows(2).enumerate() {
                 let (lo, hi) = (pair[0].as_str(), pair[1].as_str());
@@ -5229,10 +5271,18 @@ fn generate(args: &[String]) -> ExitCode {
                 // ⚠️ **Zero for a split array**, which is how a wide-metal rule is kept off a via
                 // that will be scattered as single cuts. See `rule_valid_for_width`.
                 let shape_width = |r: vyges_pdn::Rect| (r.2 - r.0).min(r.3 - r.1);
+                // ⚠️ **`getLowerWidth`/`getUpperWidth` take the LARGER of the shape and the
+                // merged shape on that layer** — `std::max(width, shared.value())` — and
+                // `getSharedLayerWidth` answers nothing for a split-cut array, whose metal is
+                // separate islands with no merged shape to widen the lookup. The `(0, 0)` below
+                // already expresses that for a split level.
                 let (width_lo, width_hi) = if split.is_some() {
                     (0, 0)
                 } else {
-                    (shape_width(rects[level]), shape_width(rects[level + 1]))
+                    (
+                        shape_width(rects[level]).max(shared_widths[level].unwrap_or(0)),
+                        shape_width(rects[level + 1]).max(shared_widths[level + 1].unwrap_or(0)),
+                    )
                 };
                 let rule_fits = |r: &ViaRule| {
                     vyges_pdn::viagen::rule_valid_for_width(r.bottom_width, width_lo)
@@ -5487,19 +5537,26 @@ fn generate(args: &[String]) -> ExitCode {
                             (fallback_enc, fallback_enc),
                             (fallback_enc, fallback_enc),
                         ));
+                        // ⚠️ **Each side takes its OWN layer's merged width** — `shared_widths`
+                        // is indexed by layer, and this level's two layers are `level` and
+                        // `level + 1`.
+                        let (shared_lo, shared_hi) =
+                            (shared_widths[level], shared_widths[level + 1]);
                         let bottoms = enclosure_candidates(
                             &db, cut_layer, cut, area, lo, false, Some(rule_bot), split.is_some(),
+                            shared_lo,
                         );
                         let tops = enclosure_candidates(
                             &db, cut_layer, cut, area, hi, true, Some(rule_top), split.is_some(),
+                            shared_hi,
                         );
                         // 🔑 **What `checkMinEnclosure` is asked against** — the cut layer's
                         // own rules, WITHOUT the generate rule's stated enclosure among them.
                         let bot_rules = enclosure_candidates_with_swap(
-                            &db, cut_layer, cut, area, lo, false, None, split.is_some(),
+                            &db, cut_layer, cut, area, lo, false, None, split.is_some(), shared_lo,
                         );
                         let top_rules = enclosure_candidates_with_swap(
-                            &db, cut_layer, cut, area, hi, true, None, split.is_some(),
+                            &db, cut_layer, cut, area, hi, true, None, split.is_some(), shared_hi,
                         );
 
                         // 🔑 **`PDN_VIA_TRACE=1` prints what the reference's `Via` and
@@ -5983,7 +6040,11 @@ fn generate(args: &[String]) -> ExitCode {
                         // a candidate that fits more cuts than any real rule and therefore always
                         // wins, which is how VIA34's M4 face came out 1126 against 1148.
                         let rules: Vec<(i32, i32)> =
-                            enclosure_candidates(&db, &g.cut_layer, cut, area, layer, above, None, split.is_some())
+                            enclosure_candidates(
+                                &db, &g.cut_layer, cut, area, layer, above, None, split.is_some(),
+                                // The side this call is asking about picks its own layer's width.
+                                if above { shared_widths[level + 1] } else { shared_widths[level] },
+                            )
                                 .into_iter()
                                 .map(|e| (e.x, e.y))
                                 .collect();
@@ -6165,6 +6226,7 @@ fn generate(args: &[String]) -> ExitCode {
                     let spacing =
                         vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
                     if is_array
+                        && !measuring
                         && db
                             .create_generated_via(
                                 &name,
@@ -6343,7 +6405,8 @@ fn generate(args: &[String]) -> ExitCode {
                     );
                     // ⚠️ One `dbVia` per distinct geometry, reused wherever needed — the
                     // reference looks it up by name and creates it only when absent.
-                    if db
+                    if !measuring
+                        && db
                         .create_generated_via(
                             &name,
                             rule.map(|r| r.name.as_str()).unwrap_or(""),
@@ -6421,6 +6484,25 @@ fn generate(args: &[String]) -> ExitCode {
                     split.is_none() && (best.array.is_some() || rows > 1 || columns > 1);
                 if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
                     if shared == lo && !prev_tops.is_empty() && !bots.is_empty() {
+                        // 🔑 **`Connect::updateSharedLayerWidths`, measured here because this is
+                        // the one place both pads are in hand.** The two pads are concentric, so
+                        // their union is the larger of each dimension; a width-conditioned rule
+                        // measures the SMALLER dimension of that union:
+                        //
+                        //     min( max(below_top.dx, above_bottom.dx),
+                        //          max(below_top.dy, above_bottom.dy) )
+                        //
+                        // ⚠️ **Below's TOP against above's BOTTOM**, not two tops or two bottoms.
+                        let extent = |rs: &[Rect]| -> (i32, i32) {
+                            let mut r = rs[0];
+                            for x in &rs[1..] {
+                                r = (r.0.min(x.0), r.1.min(x.1), r.2.max(x.2), r.3.max(x.3));
+                            }
+                            (r.2 - r.0, r.3 - r.1)
+                        };
+                        let (bw, bh) = extent(&prev_tops);
+                        let (aw, ah) = extent(&bots);
+                        merged_widths[level] = Some(bw.max(aw).min(bh.max(ah)));
                         // 🔑 **One patch for the whole level, not one per spot.** The reference
                         // builds `combine_layer` as the union of EVERY top shape of the
                         // previous via and EVERY bottom shape of this one, then takes
@@ -6463,6 +6545,36 @@ fn generate(args: &[String]) -> ExitCode {
                     }
                 }
                 previous_top = Some((hi.to_string(), tops, needs_patch));
+            }
+
+            // That was the real pass — its `dbVia`s are in the database and its shapes are kept.
+            if !measuring {
+                break;
+            }
+            // ⚠️ **Only ever wider.** A merged width that came out smaller than one already
+            // recorded is not a reason to rebuild — lowering it would let the loop oscillate
+            // between two tiers forever. `updateSharedLayerWidths` tests `>` for exactly that,
+            // which is also what makes this terminate: widths never fall, and the pads they come
+            // from are bounded by the enclosures the technology asks for.
+            let mut wider = false;
+            for (i, m) in merged_widths.iter().enumerate() {
+                if let Some(w) = *m {
+                    if shared_widths[i].is_none_or(|had| w > had) {
+                        shared_widths[i] = Some(w);
+                        wider = true;
+                    }
+                }
+            }
+            // Undo the measuring pass either way; the next one builds against the widths it found,
+            // and the last one builds against widths that stopped changing.
+            placements.truncate(restore.0);
+            via_faces.truncate(restore.1);
+            drcfill.truncate(restore.2);
+            via_ok.truncate(restore.3);
+            written = restore.4;
+            if !wider {
+                measuring = false;
+            }
             }
 
             // ── this via's metal, merged back into the two shapes it landed on ────────────

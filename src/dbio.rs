@@ -86,6 +86,13 @@ pub(crate) fn enclosure_candidates_with_swap(
     // narrowest bucket therefore wins, which is the point: a split array is a single cut placed
     // many times and has no business claiming the enclosure a full-width array would earn.
     split: bool,
+    // 🔑 **`getLowerWidth`/`getUpperWidth` are `max(the rect, the MERGED shape on that layer)`.**
+    // Where a stack passes through a layer, the metal actually drawn there is the union of the pad
+    // from the cut below and the pad from the cut above, and a width-conditioned tier is chosen
+    // against that — it is what a DRC deck measures. `None` where nothing else lands on the layer.
+    // ⚠️ **`getSharedLayerWidth` answers nothing for a split-cut array**, whose metal is separate
+    // islands with no merged shape; `split` below already forces the width to zero for those.
+    shared_width: Option<i32>,
 ) -> Vec<(vyges_pdn::viagen::Enclosure, bool)> {
     use vyges_pdn::viagen::{enclosure_from_rule, rect_direction, EncType, Enclosure};
     let dir = direction_of(db, layer);
@@ -157,7 +164,7 @@ pub(crate) fn enclosure_candidates_with_swap(
     let shape_width = if split {
         0
     } else {
-        (area.2 - area.0).min(area.3 - area.1)
+        ((area.2 - area.0).min(area.3 - area.1)).max(shared_width.unwrap_or(0))
     };
     if let Some((_, chosen)) = buckets
         .iter()
@@ -185,8 +192,11 @@ pub(crate) fn enclosure_candidates(
     above: bool,
     from_rule: Option<(i32, i32)>,
     split: bool,
+    shared_width: Option<i32>,
 ) -> Vec<vyges_pdn::viagen::Enclosure> {
-    enclosure_candidates_with_swap(db, cut_layer, cut, area, layer, above, from_rule, split)
+    enclosure_candidates_with_swap(
+        db, cut_layer, cut, area, layer, above, from_rule, split, shared_width,
+    )
         .into_iter()
         .map(|(e, _)| e)
         .collect()
