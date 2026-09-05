@@ -2049,8 +2049,142 @@ fn make_pad_connection(
     )
 }
 
+/// `pdngen -ripup` — take an existing power grid back out of the design.
+///
+/// 🔑 **The whole call sequence, from `PdnGen::ripUp(nullptr)`:**
+///
+/// ```cpp
+/// resetShapes();                       // in-memory only
+/// ensureCoreDomain();                  // a Core domain if none was declared
+/// for (domain : getDomains()) nets.insert(domain->getNets());
+/// for (grid : getGrids()) grid->ripup();   // in-memory only
+/// for (net : nets) ripUp(net);
+/// ```
+///
+/// and per net:
+///
+/// ```cpp
+/// // remove bterms that connect to swires
+/// for (bterm : net->getBTerms())
+///   for (pin : bterm->getBPins())
+///     if any of the pin's boxes INTERSECTS one of this net's swire shapes -> destroy(pin);
+///   if (bterm->getBPins().empty()) destroy(bterm);
+/// for (swire : net->getSWires()) destroy(swire);
+/// ```
+///
+/// ⚠️ **Only the DOMAIN's nets**, not every special net in the design. With no
+/// `set_voltage_domain`, `ensureCoreDomain` builds one and `findDomainNet` picks the single net of
+/// each sig type — erroring where there is none or more than one. A design with an `IOVDD` on its
+/// own keeps it.
+///
+/// ⚠️ **`resetShapes()` and `Grid::ripup()` touch the generator's in-memory state, not the
+/// database.** `pdngen -ripup` is mutually exclusive with every other flag, so nothing is built in
+/// the same run and neither has an observable effect on the DEF. They are transcribed here as
+/// comments rather than as code because there is no state to reset.
+///
+/// ## ◐ Two parts NOT modelled, and neither is exercised by the corpus
+///
+/// ⛔ **Upstream destroys EVERY swire; we keep the ones marked FIXED.** `dbSWire::destroy` is
+/// called with no wire-type test, while `clear_routed_swires` skips `dbWireType::FIXED` — a
+/// deliberate safety contract in our bindings, shared with `bterm_clear_unfixed_bpins`, so that an
+/// ECO tool never deletes what was placed on purpose. `ripup.tcl`'s input has **0** FIXED and 2
+/// ROUTED swires in `SPECIALNETS`, so the two agree on the only case that asks. ⟹ A design that
+/// arrives with FIXED power routing would keep it here and lose it upstream. Closing that needs a
+/// new binding in `vyges-tools-opendb-lib`.
+///
+/// ⛔ **The bterm/bpin removal is not implemented.** It needs a per-BPIN destroy keyed on
+/// intersection with the net's swires, and our bindings expose whole-terminal destroy and
+/// "clear unfixed bpins" only — neither is that rule. `ripup.tcl` keeps all 54 of its pins across
+/// the operation, so the corpus does not distinguish them.
+fn ripup(path: &str, out: &str, opts: &Opts) -> ExitCode {
+    let mut db = match Db::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            vyges_events::log(
+                "vyges-pdn",
+                vyges_events::Severity::Error,
+                format!("cannot open {path}: {e}"),
+            );
+            return ExitCode::from(2);
+        }
+    };
+    // ⚠️ **`findDomainNet` errors on none AND on more than one**, so a design with two power nets
+    // and no explicit domain is a diagnostic, not a guess. An explicit `--power`/`--ground` stands
+    // in for `set_voltage_domain`, which `ensureCoreDomain` leaves alone.
+    let discover = |want: &str| -> Result<String, String> {
+        let found: Vec<String> = db
+            .block_get_nets()
+            .into_iter()
+            .filter(|n| db.net_sigtype(n).eq_ignore_ascii_case(want))
+            .collect();
+        match found.len() {
+            0 => Err(format!("Unable to find {want} net for Core domain.")),
+            1 => Ok(found.into_iter().next().unwrap()),
+            _ => Err(format!("Found multiple possible nets for {want} net for Core domain.")),
+        }
+    };
+    let mut nets: Vec<String> = Vec::new();
+    for (explicit, want) in [(opts.one("power"), "POWER"), (opts.one("ground"), "GROUND")] {
+        match explicit {
+            Some(n) if !n.is_empty() => nets.push(n.to_string()),
+            _ => match discover(want) {
+                Ok(n) => nets.push(n),
+                Err(e) => {
+                    vyges_events::log("vyges-pdn", vyges_events::Severity::Error, e);
+                    return ExitCode::from(2);
+                }
+            },
+        }
+    }
+    // 🔑 **The secondary nets of the domain go too**, in `getNets()` order after power and ground.
+    for n in opts.all("secondary").iter().flat_map(|s| s.split(',')) {
+        if !n.is_empty() && !nets.iter().any(|h| h == n) {
+            nets.push(n.to_string());
+        }
+    }
+
+    let mut removed = 0usize;
+    for net in &nets {
+        match db.clear_routed_swires(net) {
+            Ok(n) => removed += n,
+            Err(e) => {
+                vyges_events::log(
+                    "vyges-pdn",
+                    vyges_events::Severity::Error,
+                    format!("cannot rip up {net}: {e}"),
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if let Err(e) = db.write_def(out) {
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Error,
+            format!("cannot write {out}: {e}"),
+        );
+        return ExitCode::from(2);
+    }
+    println!(
+        "{{\n  \"tool\": \"vyges-pdn\",\n  \"status\": \"generated\",\n  \"mode\": \"ripup\",\n  \"nets\": {},\n  \"swires_removed\": {},\n  \"def_written\": \"{}\"\n}}",
+        nets.len(),
+        removed,
+        out
+    );
+    ExitCode::SUCCESS
+}
+
 fn generate(args: &[String]) -> ExitCode {
     let opts = Opts::parse(args);
+    // ⛔ **`-ripup` is mutually exclusive with every other flag** (`PDN-1038`), and it needs
+    // neither a grid nor a declared domain — `ripup.tcl` declares no grid at all, which is why
+    // this cannot be a step inside the ordinary build.
+    if opts.one("ripup").is_some() {
+        let (Some(path), Some(out)) = (args.first(), opts.one("out-def")) else {
+            return usage();
+        };
+        return ripup(path, out, &opts);
+    }
     let (Some(path), Some(out), Some(power), Some(ground)) = (
         args.first(),
         opts.one("out-def"),
