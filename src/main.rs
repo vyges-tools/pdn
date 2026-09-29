@@ -811,6 +811,9 @@ fn find_channels(
     highest: i32,
     core: Rect,
     net_order: &[String],
+    // The grid's connect statements and its OWN shapes: what can feed a repair strap.
+    connects: &[vyges_pdn::vias::Connect],
+    grid_emitted: &[(String, String, Rect, &'static str)],
 ) -> Vec<Channel> {
     let overlaps = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
     let mut out = Vec::new();
@@ -934,6 +937,37 @@ fn find_channels(
             let Some(obs) = intersect_rect(obs, core) else {
                 continue;
             };
+            // 🔑 **Grow the channel until each net can be FED** — upstream `extendChannelToFeed`,
+            // after the core clip and before the available area is trimmed. The feed is the
+            // lowest layer a connect joins ABOVE the repair layer; at the top of the stack it is
+            // the repaired layer itself, below (`getFeedLayer`).
+            let feed_above = connects
+                .iter()
+                .filter(|c| c.lower == target_layer)
+                .min_by_key(|c| db.layer_get_number(&c.upper))
+                .map(|c| c.upper.clone());
+            let (feed_layer, feed_is_above) = match feed_above {
+                Some(l) => (l, true),
+                None => (layer.clone(), false),
+            };
+            let feed: Vec<(String, Rect, bool)> = grid_emitted
+                .iter()
+                .filter(|(_, l, _, _)| *l == feed_layer)
+                .map(|(n, l, r, _)| {
+                    let above = placed
+                        .iter()
+                        .any(|v| v.net == *n && v.lower == *l && v.lower_rect == *r);
+                    (n.clone(), *r, above)
+                })
+                .collect();
+            let area = vyges_pdn::channels::extend_to_feed(
+                area,
+                &nets,
+                target_horizontal,
+                feed_is_above,
+                &feed,
+                core,
+            );
             // What is already standing on the target layer takes room away from the channel.
             let blocking: Vec<Rect> = emitted
                 .iter()
@@ -3280,6 +3314,12 @@ fn generate(args: &[String]) -> ExitCode {
 
         // Where this grid's own shapes begin in the accumulated list.
         let grid_shapes_from = emitted.len();
+        // 🔑 **This grid's own strap sets start here.** `strap_sets` runs across every grid, but
+        // repair channels are a per-grid search: `getHighestStrapLayer(grid)` and
+        // `getTargetStrap(grid, layer)` see only the grid's own straps. Reading all of them let a
+        // macro grid inherit the core grid's metal7 and "repair" its own top straps into it —
+        // measured on `macros_flipped_right_angle`, where the reference reports 0 channels there.
+        let strap_sets_from = strap_sets.len();
         // `getConnectableShapes` — the pads' own pins, gathered as the connections are built and
         // handed to the via search alongside the grid's shapes. See the pad component below.
         let mut pad_connectable: Vec<vyges_pdn::vias::Shape> = Vec::new();
@@ -4544,7 +4584,7 @@ fn generate(args: &[String]) -> ExitCode {
             let db_net_order = db.block_get_nets();
             // The highest layer any declared strap set uses: nothing above it can be connected to, so
             // shapes there are not orphans.
-            let highest = strap_sets
+            let highest = strap_sets[strap_sets_from..]
                 .iter()
                 .map(|(l, ..)| routing_level(&db, l))
                 .max()
@@ -4557,7 +4597,7 @@ fn generate(args: &[String]) -> ExitCode {
                     &db,
                     &emitted,
                     &placed,
-                    &strap_sets,
+                    &strap_sets[strap_sets_from..],
                     &followpin_layer,
                     followpin_pitch,
                     highest,
@@ -4569,6 +4609,8 @@ fn generate(args: &[String]) -> ExitCode {
                     // repair strap stops short of the rail it is meant to reach.
                     strap_boundary,
                     &db_net_order,
+                    &connects,
+                    &emitted[grid_shapes_from..],
                 );
                 if channels.is_empty() {
                     break;

@@ -239,6 +239,76 @@ pub fn determine_offset(
     )
 }
 
+/// **C6** — grow a channel along its repair strap until every net reaches something that can feed
+/// it (upstream `extendChannelToFeed`, in the pin since `8b310a7`).
+///
+/// 🔑 **A channel sized to the orphaned shapes can be too short to be fed.** An isolated pocket of
+/// rows is smaller than the pitch of the layer that feeds the repair, so a strap confined to it
+/// connects the pocket to itself and to nothing. Each net that crosses NO feeding shape of its own
+/// inside the channel is extended, on both sides, to the far edge of the nearest feeding shape of
+/// that net that crosses the strap — the same reach an ordinary strap of that length would have.
+///
+/// `feed` is `(net, rect, has_connection_above)` for the grid's own shapes on the feed layer.
+/// ⚠️ **When the feed is BELOW** (the repair layer is the top of the stack, so nothing above can
+/// feed it) only a shape that is itself connected upward counts: one with nothing above it has no
+/// power to pass on — which also excludes the orphans being repaired.
+///
+/// ⚠️ An extension is only taken while it stays inside `core` on the length axis; a net whose
+/// nearest feed lies outside does not move that end.
+pub fn extend_to_feed(
+    area: Rect,
+    nets: &[String],
+    horizontal: bool,
+    feed_is_above: bool,
+    feed: &[(String, Rect, bool)],
+    core: Rect,
+) -> Rect {
+    // The repair strap runs along the LENGTH axis and is crossed by what feeds it.
+    let len = |r: Rect| if horizontal { (r.0, r.2) } else { (r.1, r.3) };
+    let cross = |r: Rect| if horizontal { (r.1, r.3) } else { (r.0, r.2) };
+    let (area_lo, area_hi) = len(area);
+    let (area_x_lo, area_x_hi) = cross(area);
+    let (core_lo, core_hi) = len(core);
+    let (mut extend_lo, mut extend_hi) = (area_lo, area_hi);
+    for net in nets {
+        let mut fed = false;
+        let (mut nearest_lo, mut nearest_hi) = (i32::MIN, i32::MAX);
+        for (n, rect, above) in feed {
+            if n != net || (!feed_is_above && !above) {
+                continue;
+            }
+            let (c_lo, c_hi) = cross(*rect);
+            if c_hi < area_x_lo || c_lo > area_x_hi {
+                continue; // never crosses the strap
+            }
+            let (l_lo, l_hi) = len(*rect);
+            if l_hi >= area_lo && l_lo <= area_hi {
+                fed = true;
+                break;
+            }
+            if l_hi < area_lo {
+                nearest_lo = nearest_lo.max(l_lo);
+            } else {
+                nearest_hi = nearest_hi.min(l_hi);
+            }
+        }
+        if fed {
+            continue;
+        }
+        if nearest_lo != i32::MIN && nearest_lo >= core_lo {
+            extend_lo = extend_lo.min(nearest_lo);
+        }
+        if nearest_hi != i32::MAX && nearest_hi <= core_hi {
+            extend_hi = extend_hi.max(nearest_hi);
+        }
+    }
+    if horizontal {
+        (extend_lo, area.1, extend_hi, area.3)
+    } else {
+        (area.0, extend_lo, area.2, extend_hi)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,4 +435,39 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn an_unfed_channel_grows_to_the_far_edge_of_its_nearest_feed_on_both_sides() {
+        // Vertical repair strap in x 100..200, y 400..600; horizontal feeders of net VDD above.
+        let area = (100, 400, 200, 600);
+        let nets = vec!["VDD".to_string()];
+        let feed = vec![
+            ("VDD".to_string(), (0, 200, 1000, 250), true),   // below: far edge = its LOW y 200
+            ("VDD".to_string(), (0, 100, 1000, 150), true),   // further below: not the nearest
+            ("VDD".to_string(), (0, 800, 1000, 850), true),   // above: far edge = its HIGH y 850
+            ("VSS".to_string(), (0, 650, 1000, 700), true),   // other net: never feeds VDD
+            ("VDD".to_string(), (300, 620, 400, 640), true),  // does not cross the strap
+        ];
+        let core = (0, 0, 1000, 1000);
+        assert_eq!(extend_to_feed(area, &nets, false, true, &feed, core), (100, 200, 200, 850));
+    }
+
+    #[test]
+    fn a_channel_already_crossed_by_a_feed_of_every_net_is_left_alone() {
+        let area = (100, 400, 200, 600);
+        let feed = vec![("VDD".to_string(), (0, 500, 1000, 520), true), ("VDD".to_string(), (0, 800, 1000, 850), true)];
+        let got = extend_to_feed(area, &["VDD".to_string()], false, true, &feed, (0, 0, 1000, 1000));
+        assert_eq!(got, area);
+    }
+
+    #[test]
+    fn a_feed_below_must_itself_be_connected_upward_and_the_core_bounds_the_reach() {
+        let area = (100, 400, 200, 600);
+        let feed = vec![
+            ("VDD".to_string(), (0, 200, 1000, 250), false), // nothing above it: carries no power
+            ("VDD".to_string(), (0, 900, 1000, 1200), true), // connected, but reaches past the core
+        ];
+        let got = extend_to_feed(area, &["VDD".to_string()], false, false, &feed, (0, 0, 1000, 1000));
+        assert_eq!(got, area, "neither candidate may move an end");
+    }
+
 }
