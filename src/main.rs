@@ -1393,6 +1393,26 @@ fn repair_vias(
     for (l, r, ..) in blockages {
         obstructions_by_layer.entry(l.as_str()).or_default().push(*r);
     }
+    // 🔑 **The shapes already made obstruct too** — `extendTo` queries the grid's LOCAL
+    // obstruction tree, and `GridComponent::make` ends every component with `getObstructions`,
+    // which inserts each of its shapes indexed by its obstruction box; `buildGrids` adds each
+    // finished grid's shapes the same way for the grids after it. Only the via's own ORIGINAL
+    // shape is excluded (`other.get() != orig_shape`). The tree is not updated inside
+    // `repairVias` (replacements are applied after the loop), so a snapshot taken here is it.
+    //
+    // Found by the stage dumps (`PDN_STAGE_DUMP` against `pdn-pad-obs-trace.py`) on
+    // `asap7_repair_channel_macro_gap`: identical shapes before `makeVias`, identical first vias,
+    // and then the reference's `repairVias` moved NOTHING where ours stretched 80 M5 straps
+    // 60 up to an M6 shape — through the obstruction box of the VDD strap 72 beside each, which
+    // odb's inclusive `intersects` counts as touching.
+    let mut shape_obstructions: std::collections::HashMap<String, Vec<(usize, Rect)>> =
+        Default::default();
+    for (j, (_, l, r, _)) in emitted.iter().enumerate() {
+        shape_obstructions
+            .entry(l.clone())
+            .or_default()
+            .push((j, obstruction_of(db, l, *r)));
+    }
     for v in placed {
         // Either end unowned and the via is not repairable at all — not merely at that end.
         if is_fixed(&v.lower, v.lower_rect) || is_fixed(&v.upper, v.upper_rect) {
@@ -1410,10 +1430,22 @@ fn repair_vias(
             }) else {
                 continue;
             };
-            let obstructions: &[Rect] = obstructions_by_layer
+            let obstructions: Vec<Rect> = obstructions_by_layer
                 .get(layer.as_str())
                 .map(Vec::as_slice)
-                .unwrap_or(&[]);
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+                .chain(
+                    shape_obstructions
+                        .get(layer.as_str())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter(|(j, _)| *j != i)
+                        .map(|(_, r)| *r),
+                )
+                .collect();
             let others: Vec<Rect> = emitted
                 .iter()
                 .enumerate()
@@ -1422,7 +1454,7 @@ fn repair_vias(
                 .collect();
             let halo = db.layer_get_spacing(layer).max(1);
             if let Some(grown) =
-                vyges_pdn::shapes::extend_to(emitted[i].2, toward, obstructions, &others, halo)
+                vyges_pdn::shapes::extend_to(emitted[i].2, toward, &obstructions, &others, halo)
             {
                 if std::env::var_os("PDN_TRACE").is_some() && grown != emitted[i].2 {
                     eprintln!(
@@ -4512,6 +4544,18 @@ fn generate(args: &[String]) -> ExitCode {
                 .map(|(l, r, ..)| (l.clone(), *r))
                 .chain(emitted.iter().map(|(_, l, r, _)| (l.clone(), obstruction_of(&db, l, *r))))
                 .collect();
+            // 🔑 **STAGE DUMP — the grid as the 3-argument `Grid::makeVias` finds it** (components
+            // made, refined, cleaned up; no via yet). `PDN_STAGE_DUMP=1`, the reference's
+            // `VYGP|preshape` from `pdn-pad-obs-trace.py`.
+            if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+                for (net, layer, r, kind) in &emitted[grid_shapes_from..] {
+                    let kind = if *kind == "REPAIR" { "STRIPE" } else { *kind };
+                    eprintln!(
+                        "VYGP|preshape|{}|{layer}|{net}|{kind}|{},{},{},{}",
+                        grid.name, r.0, r.1, r.2, r.3
+                    );
+                }
+            }
             trace("Making vias", "start");
             let (placed, dropped) = if std::env::var_os("PDN_VIA_TIMING").is_some() {
                 let t0 = std::time::Instant::now();
@@ -4532,6 +4576,16 @@ fn generate(args: &[String]) -> ExitCode {
                 vyges_pdn::vias::place(&connects, &via_shapes, &via_obstructions)
             };
             trace("Making vias", &format!("end, {} placed", placed.len()));
+            // STAGE DUMP — vias after the FIRST build (the reference's `VYGP|via1`).
+            if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+                for v in &placed {
+                    let a = v.area;
+                    eprintln!(
+                        "VYGP|via1|{}|{}|{}|{}|{},{},{},{}",
+                        grid.name, v.net, v.lower, v.upper, a.0, a.1, a.2, a.3
+                    );
+                }
+            }
 
             stage_time("repairVias");
             // ── repairVias ───────────────────────────────────────────────────────────────────────
@@ -4575,6 +4629,17 @@ fn generate(args: &[String]) -> ExitCode {
                 &fixed_via_shapes,
             )
             {
+                // STAGE DUMP — shapes after `repairVias` moved something (the reference's
+                // `VYGP|rvshape`, printed inside its `if (repairVias(...))`).
+                if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+                    for (net, layer, r, kind) in &emitted[grid_shapes_from..] {
+                        let kind = if *kind == "REPAIR" { "STRIPE" } else { *kind };
+                        eprintln!(
+                            "VYGP|rvshape|{}|{layer}|{net}|{kind}|{},{},{},{}",
+                            grid.name, r.0, r.1, r.2, r.3
+                        );
+                    }
+                }
                 // 🔑 **The search area is recomputed on EVERY pass, not once per grid.**
                 // `Grid::makeVias` takes it from `getDomainBoundary()` merged with the grid's
                 // shapes AS THEY STAND, and the outer `makeVias` calls the inner one twice —
@@ -4757,6 +4822,28 @@ fn generate(args: &[String]) -> ExitCode {
                 let next = vyges_pdn::vias::place(&connects, &via_shapes, &via_obstructions);
                 placed = next.0;
                 dropped = next.1;
+            }
+
+            // 🔑 **STAGE DUMP — the grid as `Grid::makeShapes` leaves it** (components, refine,
+            // cleanup, vias, repair channels; before `buildGrids` trims). `PDN_STAGE_DUMP=1` prints
+            // the same `VYGP|shape` / `VYGP|via` records as `pdn-pad-obs-trace.py` makes the
+            // reference print at that point, so a divergence is located by STAGE in the reference's
+            // call order instead of by chasing a symptom in the final DEF.
+            if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+                for (net, layer, r, kind) in &emitted[grid_shapes_from..] {
+                    let kind = if *kind == "REPAIR" { "STRIPE" } else { *kind };
+                    eprintln!(
+                        "VYGP|shape|{}|{layer}|{net}|{kind}|{},{},{},{}",
+                        grid.name, r.0, r.1, r.2, r.3
+                    );
+                }
+                for v in &placed {
+                    let a = v.area;
+                    eprintln!(
+                        "VYGP|via|{}|{}|{}|{}|{},{},{},{}",
+                        grid.name, v.net, v.lower, v.upper, a.0, a.1, a.2, a.3
+                    );
+                }
             }
 
             if opts.one("report-vias").is_some() {
@@ -5055,6 +5142,14 @@ fn generate(args: &[String]) -> ExitCode {
     }
 
     stage_time("via geometry");
+    // STAGE DUMP — shapes after trim + cleanupVias, before writing (the reference's
+    // `VYGP|tshape`). Grid is not tracked past the grid loop, so the grid field is "ALL".
+    if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+        for (net, layer, r, kind) in &emitted {
+            let kind = if *kind == "REPAIR" { "STRIPE" } else { *kind };
+            eprintln!("VYGP|tshape|ALL|{layer}|{net}|{kind}|{},{},{},{}", r.0, r.1, r.2, r.3);
+        }
+    }
     // ── via geometry ─────────────────────────────────────────────────────────────────────────
     // 🔑 **After trimming, because that is where `PdnGen::writeToDb` sits.** Each grid's crossings
     // were found against the shapes as they stood; each grid's vias are SIZED against the shapes as
@@ -5319,6 +5414,14 @@ fn generate(args: &[String]) -> ExitCode {
                 || !still_there(&v.net, &v.upper, v.upper_rect)
             {
                 continue;
+            }
+            // STAGE DUMP — a via that survives trim + cleanupVias (the reference's `VYGP|tvia`).
+            if std::env::var_os("PDN_STAGE_DUMP").is_some() {
+                let a = v.area;
+                eprintln!(
+                    "VYGP|tvia|ALL|{}|{}|{}|{},{},{},{}",
+                    v.net, v.lower, v.upper, a.0, a.1, a.2, a.3
+                );
             }
             let lower_rect = current(&v.net, &v.lower, v.lower_rect);
             let upper_rect = current(&v.net, &v.upper, v.upper_rect);
