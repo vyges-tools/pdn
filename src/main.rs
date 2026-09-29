@@ -5066,6 +5066,58 @@ fn generate(args: &[String]) -> ExitCode {
                 placed.len(), sizes.len()
             );
         }
+        // ⚡ **The technology's own answers, read ONCE for the loop.** Every crossing asked the
+        // database again — `direction_of` alone walked every tech layer over FFI to answer one —
+        // and that, not building stacks, was the loop's time: sampled 2026-09-28 on
+        // `pads_connect_from_non_pref_edge` (22,876 crossings, 30 s), 16 of 20 samples sat in these
+        // lookups and 0 in stack construction. Nothing here changes during the loop (it creates
+        // block vias, never tech layers), so the tables are exactly what the calls returned.
+        let layer_direction: std::collections::HashMap<String, Direction> = db
+            .layers_with_direction()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(n, _)| {
+                let d = direction_of(&db, &n);
+                (n, d)
+            })
+            .collect();
+        let dir_of = |layer: &str| layer_direction.get(layer).copied().unwrap_or(Direction::None);
+        let layer_level: std::collections::HashMap<String, i32> = layer_direction
+            .keys()
+            .map(|n| (n.clone(), routing_level(&db, n)))
+            .collect();
+        // A name the technology does not have is level 0 — `routing_level`'s own answer for it.
+        let level_of = |layer: &str| layer_level.get(layer).copied().unwrap_or(0);
+        let stack_memo: std::cell::RefCell<
+            std::collections::HashMap<(String, String), Vec<String>>,
+        > = Default::default();
+        let stack_of = |db: &Db, lower: &str, upper: &str| -> Vec<String> {
+            stack_memo
+                .borrow_mut()
+                .entry((lower.to_string(), upper.to_string()))
+                .or_insert_with(|| stack_layers(db, lower, upper))
+                .clone()
+        };
+        let cut_between_memo: std::cell::RefCell<
+            std::collections::HashMap<(String, String), Option<String>>,
+        > = Default::default();
+        let cut_between = |db: &Db, lower: &str, upper: &str| -> Option<String> {
+            cut_between_memo
+                .borrow_mut()
+                .entry((lower.to_string(), upper.to_string()))
+                .or_insert_with(|| cut_layer_between(db, lower, upper))
+                .clone()
+        };
+        let cut_classes_memo: std::cell::RefCell<
+            std::collections::HashMap<String, Vec<vyges_pdn::viagen::CutClass>>,
+        > = Default::default();
+        let cut_classes_of = |db: &Db, cut_layer: &str| -> Vec<vyges_pdn::viagen::CutClass> {
+            cut_classes_memo
+                .borrow_mut()
+                .entry(cut_layer.to_string())
+                .or_insert_with(|| via_cut_classes(db, cut_layer))
+                .clone()
+        };
         let via_loop_start = std::time::Instant::now();
         for v in &placed {
             // The two shapes AS THEY STAND, which is not as they started.
@@ -5233,7 +5285,7 @@ fn generate(args: &[String]) -> ExitCode {
                 continue; // off grid: the reference builds a dummy via, which places nothing
             };
 
-            let stack = stack_layers(&db, &v.lower, &v.upper);
+            let stack = stack_of(&db, &v.lower, &v.upper);
             // The layers THIS connect snaps to. Empty for every other connect, which is the point.
             let ongrid: &[String] = on_grid
                 .iter()
@@ -5308,7 +5360,7 @@ fn generate(args: &[String]) -> ExitCode {
                 .collect();
             let horizontal: Vec<bool> = intermediate
                 .iter()
-                .map(|l| direction_of(&db, l) == Direction::Horizontal)
+                .map(|l| dir_of(l) == Direction::Horizontal)
                 .collect();
             // ⚠️ **Per connect and per intermediate LAYER**, which is how `min_width_layers_` is
             // stored: the same layer may be held to its width by one connect and left free by
@@ -5383,7 +5435,7 @@ fn generate(args: &[String]) -> ExitCode {
                 let named = opts
                     .one(&format!("cut-{lo}-{hi}"))
                     .filter(|c| !c.is_empty());
-                let Some(cut_layer) = named.map(str::to_string).or(cut_layer_between(&db, lo, hi))
+                let Some(cut_layer) = named.map(str::to_string).or(cut_between(&db, lo, hi))
                 else {
                     continue; // no cut layer between these two, so nothing can be built
                 };
@@ -5445,7 +5497,7 @@ fn generate(args: &[String]) -> ExitCode {
                         None => v,
                     };
                     let (x_from_upper, y_from_upper) = vyges_pdn::vias::snap_sources(
-                        direction_of(&db, lo) == Direction::Horizontal,
+                        dir_of(lo) == Direction::Horizontal,
                     );
                     (
                         snap_x(if x_from_upper { hi } else { lo }, place_at.0),
@@ -5688,7 +5740,7 @@ fn generate(args: &[String]) -> ExitCode {
                             (None, Some(p)) => p,
                             (None, None) => {
                                 let cut_rect = (0, 0, cut.0, cut.1);
-                                let classes = via_cut_classes(&db, cut_layer);
+                                let classes = cut_classes_of(&db, cut_layer);
                                 let cls = vyges_pdn::viagen::cut_class(&classes, cut)
                                     .map(|c| c.name.clone())
                                     .unwrap_or_else(|| cut_layer.to_string());
@@ -5706,19 +5758,20 @@ fn generate(args: &[String]) -> ExitCode {
                         let area = vyges_pdn::vias::via_area(lower_rect, upper_rect);
                         // The metal each shape has outside that intersection — see `E30`.
                         //
-                        // ⛔ **Upstream marks a via admitted this way UNCACHEABLE** (`can_cache_ =
-                        // false`, added in the same commit) because its `Connect::makeVia` caches
-                        // the BUILT VIA keyed by the crossing's size, and the spare depends on
-                        // where the shapes are rather than how big the overlap is.
+                        // ⚠️ **Upstream sets `can_cache_ = false` on a via admitted this way, and
+                        // it has NO EFFECT on the stack cache.** `Connect::makeVia` caches the
+                        // `DbGenerateStackedVia`, whose `generator_` is never set (`setGenerator`
+                        // is called on the single-level via only), so `DbVia::canCache()` is true
+                        // for every stack. OBSERVED at `da9f29f` with the reference's own
+                        // `PDN Via`/`ViaEnclosure` debug over the whole suite: 2,409 cache HITS on
+                        // a stack whose build applied spare — `asap7_M1_M2_followpin_enclosure`
+                        // builds its one stack and reuses it for all 52 later crossings
+                        // (`correlation/instruments/pdn-via-cache.py`).
                         //
-                        // ✅ **No bypass is needed here, and the reason is not "we got away with
-                        // it".** This engine's `via_cache` holds the two ends' CONSTRAINTS and
-                        // nothing else — no geometry — so the enclosure, spare included, is still
-                        // recomputed from each crossing's own rects. A crossing of the same size
-                        // with no spare computes zero spare and fails its own check.
-                        //
-                        // ⚠️ **That stops being true the moment the cache holds geometry.** If it
-                        // is ever widened, this via must not be cached.
+                        // ℹ️ This engine's `via_cache` holds the two ends' CONSTRAINTS only, so
+                        // the enclosure, spare included, is recomputed per crossing; the suite
+                        // agrees either way. ⚠️ A geometry cache that transcribes the reference
+                        // must therefore NOT exempt a spare-enclosure stack.
                         let (spare_b, spare_t) =
                             vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
 
@@ -5737,20 +5790,20 @@ fn generate(args: &[String]) -> ExitCode {
                         let (shared_lo, shared_hi) =
                             (shared_widths[level], shared_widths[level + 1]);
                         let bottoms = enclosure_candidates(
-                            &db, cut_layer, cut, area, lo, false, Some(rule_bot), split.is_some(),
+                            &db, cut_layer, cut, area, dir_of(lo), false, Some(rule_bot), split.is_some(),
                             shared_lo,
                         );
                         let tops = enclosure_candidates(
-                            &db, cut_layer, cut, area, hi, true, Some(rule_top), split.is_some(),
+                            &db, cut_layer, cut, area, dir_of(hi), true, Some(rule_top), split.is_some(),
                             shared_hi,
                         );
                         // 🔑 **What `checkMinEnclosure` is asked against** — the cut layer's
                         // own rules, WITHOUT the generate rule's stated enclosure among them.
                         let bot_rules = enclosure_candidates_with_swap(
-                            &db, cut_layer, cut, area, lo, false, None, split.is_some(), shared_lo,
+                            &db, cut_layer, cut, area, dir_of(lo), false, None, split.is_some(), shared_lo,
                         );
                         let top_rules = enclosure_candidates_with_swap(
-                            &db, cut_layer, cut, area, hi, true, None, split.is_some(), shared_hi,
+                            &db, cut_layer, cut, area, dir_of(hi), true, None, split.is_some(), shared_hi,
                         );
 
                         // 🔑 **`PDN_VIA_TRACE=1` prints what the reference's `Via` and
@@ -5802,8 +5855,8 @@ fn generate(args: &[String]) -> ExitCode {
                         let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
                             &bottoms,
                             &tops,
-                            direction_of(&db, lo),
-                            direction_of(&db, hi),
+                            dir_of(lo),
+                            dir_of(hi),
                             &fit,
                             // 🔑 **`checkConstraints`: no cuts, then minimum enclosure.** The
                             // enclosure judged is the one the via would be BUILT with, not the
@@ -5978,7 +6031,7 @@ fn generate(args: &[String]) -> ExitCode {
                             // naming a class applies only to a via of that class, and a via
                             // with none matches every rule.
                             let my_cut_class = vyges_pdn::viagen::cut_class(
-                                &via_cut_classes(&db, cut_layer),
+                                &cut_classes_of(&db, cut_layer),
                                 cut,
                             )
                             .map(|c| c.name.clone());
@@ -6080,11 +6133,9 @@ fn generate(args: &[String]) -> ExitCode {
                         // ⚠️ **Before the snap and after the split-cut override**, which is where
                         // the reference puts it — the block sits outside `if (isSplitCutArray())`
                         // and above the two `->snap(getTech())` calls.
-                        // ℹ️ Upstream also clears `can_cache_` here. Our `via_cache` holds the
-                        // two ends' CONSTRAINTS and no geometry, so there is nothing to
-                        // invalidate — but ⛔ **the moment it is widened to hold geometry, a via
-                        // that took the spare must not be cached**, which is exactly what
-                        // `can_cache_ = false` is for. Read this before doing the stack cache.
+                        // ℹ️ Upstream also clears `can_cache_` here, and it is dead for the stack
+                        // cache — see the spare note above (observed, 2,409 hits on such stacks).
+                        // Our `via_cache` holds constraints only, so nothing to invalidate.
                         let spare_for = |built: vyges_pdn::viagen::Enclosure,
                                          at_end: bool,
                                          minimum: vyges_pdn::viagen::Enclosure,
@@ -6147,8 +6198,8 @@ fn generate(args: &[String]) -> ExitCode {
                                 cut_area: cut.0 * cut.1 * total.0 * total.1,
                                 bottom: (span.0 + 2 * bot_enc.0, span.1 + 2 * bot_enc.1),
                                 top: (span.0 + 2 * top_enc.0, span.1 + 2 * top_enc.1),
-                                bottom_direction: direction_of(&db, lo),
-                                top_direction: direction_of(&db, hi),
+                                bottom_direction: dir_of(lo),
+                                top_direction: dir_of(hi),
                             },
                         };
                         // ⚠️ **Only a STRICT preference displaces the incumbent.** A tie returns
@@ -6215,7 +6266,7 @@ fn generate(args: &[String]) -> ExitCode {
                                 area,
                                 shift(metal),
                                 c,
-                                direction_of(&db, layer),
+                                dir_of(layer),
                             )
                         };
                         if !fits(g.bottom_metal, rects[level], level == 0, lo)
@@ -6252,7 +6303,7 @@ fn generate(args: &[String]) -> ExitCode {
                         // 🔑 The cut's class decides which column of the spacing table applies.
                         // ASAP7 states every class at the same value, but the lookup is per class
                         // and a technology that differentiates them would be built wrong without.
-                        let classes = via_cut_classes(&db, &g.cut_layer);
+                        let classes = cut_classes_of(&db, &g.cut_layer);
                         let cls = vyges_pdn::viagen::cut_class(&classes, cut)
                             .map(|c| c.name.clone())
                             .unwrap_or_else(|| g.cut_layer.clone());
@@ -6290,7 +6341,7 @@ fn generate(args: &[String]) -> ExitCode {
                         // wins, which is how VIA34's M4 face came out 1126 against 1148.
                         let rules: Vec<(i32, i32)> =
                             enclosure_candidates(
-                                &db, &g.cut_layer, cut, area, layer, above, None, split.is_some(),
+                                &db, &g.cut_layer, cut, area, dir_of(layer), above, None, split.is_some(),
                                 // The side this call is asking about picks its own layer's width.
                                 if above { shared_widths[level + 1] } else { shared_widths[level] },
                             )
@@ -6328,8 +6379,8 @@ fn generate(args: &[String]) -> ExitCode {
                     let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
                         &bottoms,
                         &tops,
-                        direction_of(&db, lo),
-                        direction_of(&db, hi),
+                        dir_of(lo),
+                        dir_of(hi),
                         &fit,
                         &|_, _, cuts| cuts > 0,
                     ) else {
@@ -6439,14 +6490,14 @@ fn generate(args: &[String]) -> ExitCode {
                             .flatten()
                     };
                     let (x_up, y_up) = vyges_pdn::vias::techvia_snap_sources(
-                        direction_of(&db, hi) == Direction::Vertical,
+                        dir_of(hi) == Direction::Vertical,
                     );
                     // ⚠️ **A layer's track interval is read off the axis its OWN direction
                     // names**, not the axis being pitched — `snapToGridInterval` picks the X
                     // pattern for a vertical layer and the Y pattern for a horizontal one.
                     let step_of = |layer: &str| -> Option<i32> {
                         let g = tv_grid(layer)?;
-                        let v = if direction_of(&db, layer) == Direction::Vertical {
+                        let v = if dir_of(layer) == Direction::Vertical {
                             &g.0
                         } else {
                             &g.1
@@ -6582,7 +6633,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     &[metal_at(*spot, bot)],
                                     prev_array || needs_patch,
                                     db.layer_min_area(lo).unwrap_or(0),
-                                    direction_of(&db, lo),
+                                    dir_of(lo),
                                     grid_mfg,
                                 ) {
                                     drcfill.push((
@@ -6645,8 +6696,8 @@ fn generate(args: &[String]) -> ExitCode {
                     // right rect.
                     let name = format!(
                         "via{}_{}_{}_{}_{rows_p}_{cols_p}_{}_{}",
-                        routing_level(&db, lo),
-                        routing_level(&db, hi),
+                        level_of(lo),
+                        level_of(hi),
                         area.2 - area.0,
                         area.3 - area.1,
                         pitch.0,
@@ -6778,7 +6829,7 @@ fn generate(args: &[String]) -> ExitCode {
                                 &bots,
                                 prev_array || needs_patch,
                                 db.layer_min_area(lo).unwrap_or(0),
-                                direction_of(&db, lo),
+                                dir_of(lo),
                                 grid_mfg,
                             ) {
                                 drcfill.push((
@@ -6866,11 +6917,11 @@ fn generate(args: &[String]) -> ExitCode {
                 }
                 let dir = if emitted[si].3 == "FOLLOWPIN" {
                     match vyges_pdn::viagen::rect_direction(emitted[si].2) {
-                        Direction::None => direction_of(&db, layer),
+                        Direction::None => dir_of(layer),
                         d => d,
                     }
                 } else {
-                    direction_of(&db, layer)
+                    dir_of(layer)
                 };
                 let obstructions: &[Rect] = blockages_on!(layer);
                 // ⚠️ **Into `emitted` itself, which is what `check_shapes` does.** It calls

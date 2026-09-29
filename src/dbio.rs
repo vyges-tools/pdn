@@ -72,7 +72,9 @@ pub(crate) fn enclosure_candidates_with_swap(
     cut_layer: &str,
     cut: (i32, i32),
     area: Rect,
-    layer: &str,
+    // ⚡ The layer's preferred direction, passed in rather than looked up: `direction_of`
+    // walks every tech layer over FFI, and this runs twice per level per crossing.
+    dir: Direction,
     above: bool,
     // ⚠️ **`None` means the rules alone.** A generate rule states its own enclosure and that is a
     // candidate like any other; a technology-declared via has none, and `getMinimumEnclosures`
@@ -95,7 +97,6 @@ pub(crate) fn enclosure_candidates_with_swap(
     shared_width: Option<i32>,
 ) -> Vec<(vyges_pdn::viagen::Enclosure, bool)> {
     use vyges_pdn::viagen::{enclosure_from_rule, rect_direction, EncType, Enclosure};
-    let dir = direction_of(db, layer);
     let rect_dir = rect_direction(area);
     // ⚠️ A generate rule's own enclosure is built by `Enclosure(dbTechViaLayerRule*, layer)`,
     // which calls `swap` — so it may be met in either orientation.
@@ -188,14 +189,14 @@ pub(crate) fn enclosure_candidates(
     cut_layer: &str,
     cut: (i32, i32),
     area: Rect,
-    layer: &str,
+    dir: Direction,
     above: bool,
     from_rule: Option<(i32, i32)>,
     split: bool,
     shared_width: Option<i32>,
 ) -> Vec<vyges_pdn::viagen::Enclosure> {
     enclosure_candidates_with_swap(
-        db, cut_layer, cut, area, layer, above, from_rule, split, shared_width,
+        db, cut_layer, cut, area, dir, above, from_rule, split, shared_width,
     )
         .into_iter()
         .map(|(e, _)| e)
