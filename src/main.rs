@@ -814,6 +814,8 @@ fn find_channels(
     // The grid's connect statements and its OWN shapes: what can feed a repair strap.
     connects: &[vyges_pdn::vias::Connect],
     grid_emitted: &[(String, String, Rect, &'static str)],
+    // `(index into emitted, bloat)` for every repair strap an earlier round laid.
+    repair_bloat: &[(usize, i32)],
 ) -> Vec<Channel> {
     let overlaps = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
     let mut out = Vec::new();
@@ -846,7 +848,8 @@ fn find_channels(
         };
         // The orphans on this layer, each bloated by its component's pitch across its direction.
         let mut bloated: Vec<Rect> = Vec::new();
-        let mut orphans: Vec<(&String, Rect, bool)> = Vec::new();
+        // `(net, rect, class)`: 0 followpin, 1 strap, 2 an earlier REPAIR strap.
+        let mut orphans: Vec<(&String, Rect, u8)> = Vec::new();
         for (i, (net, l, rect, kind)) in emitted.iter().enumerate() {
             if l != &layer || *kind == "RING" {
                 continue;
@@ -869,18 +872,33 @@ fn find_channels(
                     continue;
                 }
             }
-            let _ = i;
+            // 🔑 **Bloat by the pitch of the shape's OWN component** (upstream `7899a27`), across
+            // the strap, so neighbours merge and the gaps between them are the channels. A
+            // component with no pitch — every repair strap, and a count-only strap set — bloats
+            // by its own `width + spacing` instead, so the nets of one group land in ONE channel.
+            // ⚠️ Looking the pitch up by LAYER gave an earlier repair strap the grid's pitch on
+            // that layer: on `asap7_repair_channel_blocked_extend` that grew the next round's
+            // channel to x 1080–9312 where the reference's is 1320–7032.
+            let repair = repair_bloat.iter().find(|(ri, _)| *ri == i).map(|(_, b)| *b);
             let (pitch, horizontal) = if is_followpin && l == followpin_layer {
                 (followpin_pitch, true)
             } else {
                 match strap_sets.iter().find(|(sl, ..)| sl == l) {
-                    Some((_, p, _, _, h)) => (*p, *h),
+                    Some((_, p, w, sp, h)) => (if *p == 0 { w + sp } else { *p }, *h),
                     None => (0, direction_of(db, l) == Direction::Horizontal),
                 }
             };
-            let (bx, by) = if horizontal { (0, pitch) } else { (pitch, 0) };
+            let bloat = repair.unwrap_or(pitch);
+            let (bx, by) = if horizontal { (0, bloat) } else { (bloat, 0) };
             bloated.push((rect.0 - bx, rect.1 - by, rect.2 + bx, rect.3 + by));
-            orphans.push((net, *rect, is_followpin));
+            let class = if is_followpin {
+                0
+            } else if repair.is_some() {
+                2
+            } else {
+                1
+            };
+            orphans.push((net, *rect, class));
         }
         if orphans.is_empty() {
             continue;
@@ -891,8 +909,8 @@ fn find_channels(
             };
             let mut obs: Option<Rect> = None;
             let mut nets: Vec<String> = Vec::new();
-            let (mut followpin_count, mut strap_count) = (0, 0);
-            for (net, rect, is_fp) in &orphans {
+            let (mut followpin_count, mut strap_count, mut repair_count) = (0, 0, 0);
+            for (net, rect, class) in &orphans {
                 if !overlaps(area, *rect) {
                     continue;
                 }
@@ -914,15 +932,17 @@ fn find_channels(
                 if !nets.contains(*net) {
                     nets.push((*net).clone());
                 }
-                if *is_fp {
-                    followpin_count += 1;
-                } else {
-                    strap_count += 1;
+                match class {
+                    0 => followpin_count += 1,
+                    2 => repair_count += 1,
+                    _ => strap_count += 1,
                 }
             }
             // ⚠️ **Every follow pin must be repaired, a lone strap need not be.** One orphaned
-            // strap is tolerated; two are a gap in the grid.
-            if followpin_count < 1 && strap_count <= 1 {
+            // strap is tolerated; two are a gap in the grid. And an earlier REPAIR that never
+            // reached the layer above leaves what it connects floating, so it is a channel ON ITS
+            // OWN (upstream `7899a27`).
+            if followpin_count < 1 && repair_count < 1 && strap_count <= 1 {
                 continue;
             }
             // ⚠️ **The nets come out in the order the DATABASE holds them**, not the order the
@@ -1031,7 +1051,7 @@ fn build_repair(
     core: Rect,
     die: Rect,
     grid_mfg: i32,
-) -> Option<Vec<(String, Rect)>> {
+) -> Option<(Vec<(String, Rect)>, i32, i32)> {
     let first = build_repair_at(
         db,
         ch,
@@ -1044,7 +1064,7 @@ fn build_repair(
         grid_mfg,
     )?;
     if !first.straps.is_empty() {
-        return Some(first.straps);
+        return Some((first.straps, first.width, first.spacing));
     }
     // ⚠️ `isAtEndOfRepairOptions` — nothing narrower to try.
     let min_width = db.layer_get_min_width(&ch.target_layer) as i32;
@@ -1064,7 +1084,7 @@ fn build_repair(
     let second = build_repair_at(
         db, ch, next, spacing, emitted, blockages, core, die, grid_mfg,
     )?;
-    (!second.straps.is_empty()).then_some(second.straps)
+    (!second.straps.is_empty()).then_some((second.straps, second.width, second.spacing))
 }
 
 /// What one `determineParameters` + `testBuild` attempt produced.
@@ -1075,6 +1095,9 @@ struct RepairAttempt {
     straps: Vec<(String, Rect)>,
     /// The width the search settled on, which is what the next one is halved from.
     width: i32,
+    /// And the spacing it settled on: a later round's channel search bloats a repair strap by
+    /// `width + spacing`, since a repair strap has no pitch of its own.
+    spacing: i32,
 }
 
 fn build_repair_at(
@@ -1269,6 +1292,7 @@ fn build_repair_at(
     Some(RepairAttempt {
         straps: survivors,
         width: settled,
+        spacing,
     })
 }
 
@@ -4592,6 +4616,9 @@ fn generate(args: &[String]) -> ExitCode {
             // ⚠️ Bounded. The reference recurses without a limit and relies on each pass strictly
             // reducing the channels; a bound is cheap insurance against a channel that repairs into
             // itself, and 8 is far past any real design's depth.
+            // Which of this grid's shapes are REPAIR straps, by index into `emitted`, and the
+            // bloat each takes in the next round's channel search (its own width + spacing).
+            let mut repair_bloat: Vec<(usize, i32)> = Vec::new();
             for _round in 0..8 {
                 let channels = find_channels(
                     &db,
@@ -4611,6 +4638,7 @@ fn generate(args: &[String]) -> ExitCode {
                     &db_net_order,
                     &connects,
                     &emitted[grid_shapes_from..],
+                    &repair_bloat,
                 );
                 if channels.is_empty() {
                     break;
@@ -4635,12 +4663,20 @@ fn generate(args: &[String]) -> ExitCode {
                     }) {
                         continue;
                     }
-                    let Some(straps) = build_repair(&db, ch, &emitted, &blockages, core, die, grid_mfg)
+                    let Some((straps, width, spacing)) =
+                        build_repair(&db, ch, &emitted, &blockages, core, die, grid_mfg)
                     else {
                         continue;
                     };
                     for (net, rect) in straps {
-                        emitted.push((net, ch.target_layer.clone(), rect, "STRIPE"));
+                        repair_bloat.push((emitted.len(), width + spacing));
+                        // 🔑 **Kind `REPAIR`, written as `STRIPE`.** A repair-channel strap is a
+                        // STRIPE in the DEF but not a grid strap: `RepairChannelStraps` overrides
+                        // `allowDbPins()` to false, so on a `-pins` layer it is neither a pin nor
+                        // exempt from trimming. Tagged `STRIPE`, ours was both — on
+                        // `asap7_repair_channel_blocked_extend` the M6 repairs kept the whole
+                        // channel length and were published as block pins.
+                        emitted.push((net, ch.target_layer.clone(), rect, "REPAIR"));
                     }
                     repaired.push(ch.area);
                 }
@@ -4858,7 +4894,9 @@ fn generate(args: &[String]) -> ExitCode {
                 kept.push((net, layer, rect, shape));
                 continue;
             }
-            let is_pin_layer = pin_layers.iter().any(|l| l == &layer);
+            // A repair strap is never a pin (`allowDbPins()` is false for it), so it trims like
+            // any strap even on a `-pins` layer.
+            let is_pin_layer = shape != "REPAIR" && pin_layers.iter().any(|l| l == &layer);
             // `Shape::isRemovable`: removable exactly when it has fewer connections than it needs.
             // `getNumberOfConnections` counts vias, iterm and bterm connections; `held` is ours.
             let removable = held.len() < if is_pin_layer { 1 } else { 2 };
@@ -7374,6 +7412,8 @@ fn generate(args: &[String]) -> ExitCode {
         if *shape == "SWITCH" {
             continue; // the switch cell's own pin, not this engine's metal
         }
+        // `REPAIR` is our tag for a repair-channel strap; the DEF knows it as STRIPE.
+        let shape = if *shape == "REPAIR" { "STRIPE" } else { *shape };
         match db.add_swire_box_shaped(net, layer, *rect, false, shape) {
             Ok(()) => written += 1,
             Err(e) => {
@@ -7450,7 +7490,9 @@ fn generate(args: &[String]) -> ExitCode {
         // ⚠️ A `SWITCH` shape is the cell's own metal and is never written, so it cannot name the
         // via's type either; anything unfound falls back with the mismatch case.
         let ty = match (kind_at(net, lo, *area), kind_at(net, hi, *area)) {
-            (Some(a), Some(b)) if a == b && a != "SWITCH" => a,
+            (Some(a), Some(b)) if a == b && a != "SWITCH" => {
+                if a == "REPAIR" { "STRIPE" } else { a }
+            }
             _ => "STRIPE",
         };
         match db.add_swire_via(net, name, *centre, false, ty) {
@@ -7478,7 +7520,8 @@ fn generate(args: &[String]) -> ExitCode {
     let mut pin_boxes = 0;
     let mut edge_boxes = 0;
     for (net, layer, rect, shape) in &emitted {
-        if *shape == "SWITCH" {
+        // A switch's own pin is the cell's metal; a repair strap is never a pin.
+        if *shape == "SWITCH" || *shape == "REPAIR" {
             continue;
         }
         let Some(bterm) = bterm_of.get(net) else {
