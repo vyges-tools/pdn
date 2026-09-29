@@ -871,18 +871,28 @@ pub(crate) fn pad_connections(
     // 🔑 `nets` arrives in the domain's own order (power first, then ground), which is what
     // `getNets()` yields. A stable sort by net keeps the within-net order this loop produced.
     out.sort_by_key(|c| nets.iter().position(|n| *n == c.net).unwrap_or(usize::MAX));
+    // 🔑 **One connection TYPE per grid** — `PadDirectConnectionStraps::unifyConnectionTypes`,
+    // called by `setupDirectConnect` over every connection it kept. Each pad chose alone (pins
+    // facing the core → EDGE, else pins forming a ring → OVER PADS); if the grid holds BOTH kinds
+    // the reference forces EDGE on all of them, re-initialises the over-pad ones with
+    // `getPinsFacingCore` — which they failed already, so they end with no pins — and removes every
+    // connection that can no longer connect. Observed with the reference's own `PDN Pad` debug on
+    // `pads_connect_from_non_pref_edge`: `IO_FILL_IO_EAST_10_285/DVSS has 10 pins`, then
+    // `has 0 pins`; ours built those 30 east fill-cell straps on Metal5.
+    let has_edge = out.iter().any(|c| c.over_pads.is_none());
+    let has_over = out.iter().any(|c| c.over_pads.is_some());
+    if has_edge && has_over {
+        out.retain(|c| c.over_pads.is_none());
+    }
     out
 }
 
 /// The pad instances a `-connect_to_pads` grid holds a direct connection for.
 ///
-/// 🔑 **These contribute no obstruction at all.** `Grid::getInstances()` collects exactly the
-/// instances carrying a `kPadConnect` component, `PdnGen::buildGrids` unions them across every
-/// grid, and `makeInitialObstructions` takes that as `skip_insts`.
-///
-/// So a connected pad's OBS boxes and its pins are both invisible — a ring or a strap crossing the
-/// pad is not cut by it. Treating a connected pad as an ordinary obstruction breaks a top-metal
-/// ring into fragments at every pad it passes, and trimming then deletes the short ones.
+/// ℹ️ **Trace only since upstream a49dde4.** These used to contribute no obstruction at all
+/// (`makeInitialObstructions` skipped `Grid::getInstances()`); the skip list is now
+/// `getObstructionExemptInstances()`, empty for a core grid, so a connected pad obstructs like any
+/// padframe cell (see `instance_obstructions`).
 ///
 /// ⚠️ **Membership is having the component, not having built anything.** A pad whose connection
 /// produces no shape is still in the set, so this must not depend on the geometry succeeding.
