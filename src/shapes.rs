@@ -428,6 +428,82 @@ fn contains(outer: Rect, inner: Rect) -> bool {
     outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
 }
 
+/// **The region where `covered` holds, sliced into rectangles** — boost `get_rectangles` on the
+/// result of a boolean between rectilinear sets, as `odb::geom::extractRectangles` returns it for
+/// a default (HORIZONTAL) `polygon_90_set_data`.
+///
+/// `edges` are the rects whose sides bound the region (every operand of the boolean); `covered`
+/// says whether an elementary cell of that grid is in the result.
+///
+/// 🔑 **Boost's scanline, not a band-by-band slicing.** It sweeps up in y; a rectangle opened at
+/// one y keeps growing until a boundary edge at a later y TOUCHES its x-interval (endpoints
+/// included), and only then closes — the covered runs above start new rectangles there. So a
+/// rectangle untouched by the change beside it continues straight through (the rule of
+/// `scan_line_to_rectangles`, ported faithfully in drt's `polygon90::form_rectangles`). Measured
+/// against the reference's pad obstruction pieces (`pdn-pad-obs-trace.py`), which are sliced
+/// horizontally: `(140000,140000)-(320000,147000)`, `(140000,147000)-(318000,172500)`, …
+pub fn rectangles_where(edges: &[Rect], covered: impl Fn(Rect) -> bool) -> Vec<Rect> {
+    let live: Vec<Rect> = edges.iter().copied().filter(|r| r.0 < r.2 && r.1 < r.3).collect();
+    if live.is_empty() {
+        return Vec::new();
+    }
+    let mut xs: Vec<i32> = live.iter().flat_map(|r| [r.0, r.2]).collect();
+    let mut ys: Vec<i32> = live.iter().flat_map(|r| [r.1, r.3]).collect();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
+    let (nx, ny) = (xs.len() - 1, ys.len() - 1);
+    let row: Vec<Vec<bool>> = (0..ny)
+        .map(|yi| (0..nx).map(|xi| covered((xs[xi], ys[yi], xs[xi + 1], ys[yi + 1]))).collect())
+        .collect();
+    // Maximal runs of `true` in a row of cells, as x-intervals.
+    let runs = |cells: &dyn Fn(usize) -> bool| -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        let mut xi = 0;
+        while xi < nx {
+            if !cells(xi) {
+                xi += 1;
+                continue;
+            }
+            let start = xi;
+            while xi < nx && cells(xi) {
+                xi += 1;
+            }
+            out.push((xs[start], xs[xi]));
+        }
+        out
+    };
+    let empty = vec![false; nx];
+    let mut open: Vec<(i32, i32, i32)> = Vec::new(); // (xl, xh, yl)
+    let mut out: Vec<Rect> = Vec::new();
+    for yi in 0..=ny {
+        let y = ys[yi];
+        let below = if yi == 0 { &empty } else { &row[yi - 1] };
+        let above = if yi == ny { &empty } else { &row[yi] };
+        // The boundary at this y: where coverage changes from below to above.
+        let edges_here = runs(&|xi| below[xi] != above[xi]);
+        let touches = |(xl, xh): (i32, i32)| edges_here.iter().any(|&(lo, hi)| xl <= hi && xh >= lo);
+        let mut continuing: Vec<(i32, i32, i32)> = Vec::new();
+        for (xl, xh, yl) in open.drain(..) {
+            if touches((xl, xh)) {
+                if yl < y {
+                    out.push((xl, yl, xh, y));
+                }
+            } else {
+                continuing.push((xl, xh, yl));
+            }
+        }
+        for (lo, hi) in runs(&|xi| above[xi]) {
+            if !continuing.iter().any(|&(xl, xh, _)| xl == lo && xh == hi) {
+                continuing.push((lo, hi, y));
+            }
+        }
+        open = continuing;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,5 +999,35 @@ mod cut_sequence_tests {
             None,
             "a zero-halo obstruction accepts a lane the reference refuses"
         );
+    }
+
+    #[test]
+    fn an_obstruction_minus_a_pin_is_sliced_as_boosts_horizontal_scan() {
+        // OBS (0,0)-(100,100) with a pin (40,0)-(60,50) removed: a U. Vertical slabs: the two
+        // full-height sides, and the part above the pin in the middle band.
+        let obs = (0, 0, 100, 100);
+        let pin = (40, 0, 60, 50);
+        let inside = |c: Rect, r: Rect| r.0 <= c.0 && c.2 <= r.2 && r.1 <= c.1 && c.3 <= r.3;
+        let got = rectangles_where(&[obs, pin], |c| inside(c, obs) && !inside(c, pin));
+        // Boost closes the two lower legs where the pin's top edge touches them, and the full
+        // width continues above as one rectangle.
+        assert_eq!(got, vec![(0, 0, 40, 50), (60, 0, 100, 50), (0, 50, 100, 100)]);
+        // and the part of the OBS the pin covers
+        let owned = rectangles_where(&[obs, pin], |c| inside(c, obs) && inside(c, pin));
+        assert_eq!(owned, vec![(40, 0, 60, 50)]);
+    }
+
+    #[test]
+    fn an_untouched_rectangle_continues_while_its_neighbour_changes() {
+        // Two separate columns; the right one narrows at y=50, the left one is never touched by an
+        // edge above y=0 until the top: it must come out as ONE rectangle, not split at y=50.
+        let left = (0, 0, 10, 100);
+        let right_low = (20, 0, 40, 50);
+        let right_high = (20, 50, 30, 100);
+        let inside = |c: Rect, r: Rect| r.0 <= c.0 && c.2 <= r.2 && r.1 <= c.1 && c.3 <= r.3;
+        let all = [left, right_low, right_high];
+        let mut got = rectangles_where(&all, |c| all.iter().any(|r| inside(c, *r)));
+        got.sort();
+        assert_eq!(got, vec![(0, 0, 10, 100), (20, 0, 40, 50), (20, 50, 30, 100)]);
     }
 }

@@ -1315,6 +1315,30 @@ pub(crate) fn select_instances(
 /// `getInstanceObstructions` then flips them to `kBlockObs`, which is exactly the pair
 /// `Shape::cut`'s exemption tests for: same net, and a type other than `kShape`. A macro's OBS
 /// boxes belong to no net and always cut.
+/// 🔑 **Pad metal, marked in the obstruction's NET field** — the reference's `kPadObs`.
+///
+/// A padframe cell's pins are `kPadObs` carrying their net (upstream a49dde4), and `Shape::cut`
+/// lets a shape overlap pad metal of its OWN net however the two overlap — a connection is meant to
+/// land there — where any other same-net obstruction must lie wholly inside the shape. The net
+/// field is read only by `cut_shapes`, so the marker lives there rather than in a fifth field
+/// threaded through every obstruction list.
+pub(crate) const PAD_OBS: &str = "\u{1}pad-obs:";
+
+/// The net a pad-metal obstruction belongs to, if this obstruction net is one.
+pub(crate) fn pad_obs_net(obs_net: &str) -> Option<&str> {
+    obs_net.strip_prefix(PAD_OBS)
+}
+
+/// A PADFRAME cell: a pad master, or a pad-corner endcap (`makeInitialObstructions`).
+pub(crate) fn is_padframe(db: &Db, master: &str) -> bool {
+    db.master_is_pad(master)
+        || (db.master_is_end_cap(master)
+            && matches!(
+                db.master_get_type(master).unwrap_or_default().as_str(),
+                "ENDCAP TOPLEFT" | "ENDCAP TOPRIGHT" | "ENDCAP BOTTOMLEFT" | "ENDCAP BOTTOMRIGHT"
+            ))
+}
+
 pub(crate) fn instance_obstructions(
     db: &Db,
     halos: &[(String, [i32; 4])],
@@ -1328,11 +1352,16 @@ pub(crate) fn instance_obstructions(
 ) -> Vec<(String, String, Rect, Option<String>, Rect)> {
     let mut out = Vec::new();
     for inst in db.block_get_insts() {
-        if !db.inst_is_fixed(&inst) {
-            continue;
-        }
         let master = db.inst_get_master(&inst);
         if db.master_is_core(&master) {
+            continue;
+        }
+        // 🔑 **A PADFRAME cell — a pad, or a pad-corner endcap — obstructs as soon as it is
+        // PLACED; anything else only when FIXED** (upstream a49dde4, `makeInitialObstructions`).
+        // A padring is routinely handed over PLACED and the core grid connects to it anyway.
+        let padframe = is_padframe(db, &master);
+        let positioned = if padframe { db.inst_is_placed(&inst) } else { db.inst_is_fixed(&inst) };
+        if !positioned {
             continue;
         }
         // 🔑 **A pad CORNER is kept; a standard-cell endcap is not.** The reference switches on
@@ -1369,30 +1398,98 @@ pub(crate) fn instance_obstructions(
             .find(|(i, _)| *i == inst)
             .map(|(_, h)| *h)
             .unwrap_or([0; 4]);
+        // 🔑 **A padframe cell's pin metal, per layer and per net** (master coordinates) — what
+        // `getPadObstructions` splits its OBS against. Only terminals with a net: metal that
+        // belongs to nothing the grid can claim stays opaque.
+        let pin_metal: Vec<(i64, String, Rect)> = if padframe {
+            db.master_get_m_terms(&master)
+                .into_iter()
+                .filter_map(|term| {
+                    let net = db.iterm_get_net(&inst, &term);
+                    (!net.is_empty()).then_some((term, net))
+                })
+                .flat_map(|(term, net)| {
+                    db.mterm_pin_boxes(&master, &term)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |(l, a, b, c, d)| (l, net.clone(), (a, b, c, d)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (layer, x0, y0, x1, y1) in db.master_obstruction_boxes(&master).unwrap_or_default() {
             let name = db.layer_name_by_number(layer);
-            // ◐ **The layer's plain spacing, NOT its table.** `generateObstruction` bloats by
-            // the spacing the technology states, which for a layer declaring only a
-            // `SPACINGTABLE PARALLELRUNLENGTH` — Nangate45 metal9 — is more than this gives.
-            //
-            // ⚠️ **Measured: indexing the table here instead costs four designs.** So the
-            // reference is not simply applying the table to a master's OBS boxes, whatever
-            // `generateObstruction` reads like, and the difference is not the small under-bloat it
-            // appears to be. Left alone until what it does apply is known rather than guessed.
-            let s = db.layer_get_spacing(&name);
-            let bloated = (
-                x0 - s.max(halo[0]),
-                y0 - s.max(halo[1]),
-                x1 + s.max(halo[2]),
-                y1 + s.max(halo[3]),
-            );
-            out.push((
-                inst.clone(),
-                name,
-                vyges_pdn::orient::transform_rect(bloated, &orient, offset),
-                None,
-                vyges_pdn::orient::transform_rect((x0, y0, x1, y1), &orient, offset),
-            ));
+            // One piece of this OBS (master coordinates), with the net it belongs to if any.
+            let mut push_piece = |piece: Rect, net: Option<String>| {
+                let (px0, py0, px1, py1) = piece;
+                // ◐ **The layer's plain spacing, NOT its table**, for an ordinary instance.
+                // `generateObstruction` bloats by the spacing the technology states, which for a
+                // layer declaring only a `SPACINGTABLE PARALLELRUNLENGTH` — Nangate45 metal9 — is
+                // more than this gives.
+                //
+                // ⚠️ **Measured: indexing the table here instead costs four designs.** So the
+                // reference is not simply applying the table to a master's OBS boxes, whatever
+                // `generateObstruction` reads like. Left alone until what it does apply is known.
+                //
+                // 🔑 **A padframe cell's OBS piece is sized from ITS OWN metal** —
+                // `getPadObstructions` calls `generateObstruction` on each piece, whose spacing is
+                // the layer's `getSpacing(width, length)` (with the two-widths table). Measured
+                // with `pdn-pad-obs-trace.py` on `pads_via_repair_through_pads`: 2,445 of 330,268
+                // pad shapes take 600 there where the plain spacing gave 460/560.
+                let s = if padframe {
+                    let (w, len) = ((px1 - px0).min(py1 - py0), (px1 - px0).max(py1 - py0));
+                    obstruction_spacing(db, &name, w, len)
+                } else {
+                    db.layer_get_spacing(&name)
+                };
+                let bloated = (
+                    px0 - s.max(halo[0]),
+                    py0 - s.max(halo[1]),
+                    px1 + s.max(halo[2]),
+                    py1 + s.max(halo[3]),
+                );
+                out.push((
+                    inst.clone(),
+                    name.clone(),
+                    vyges_pdn::orient::transform_rect(bloated, &orient, offset),
+                    net,
+                    vyges_pdn::orient::transform_rect(piece, &orient, offset),
+                ));
+            };
+            let obs = (x0, y0, x1, y1);
+            let pins: Vec<&(i64, String, Rect)> =
+                pin_metal.iter().filter(|(l, ..)| *l == layer).collect();
+            if pins.is_empty() {
+                push_piece(obs, None);
+                continue;
+            }
+            // 🔑 **A pad's OBS is split by its own pin metal** (upstream a49dde4
+            // `getPadObstructions`): the part no pin covers blocks every net, and the part a pin
+            // of net N covers is N's own metal — pad metal (`kPadObs`) N's straps may land on.
+            // Witnessed on `pads_straps_through_pads` (ihp sg13g2 pads), where 1,484 reference
+            // obstruction pieces were missing from ours unsplit.
+            let inside = |c: Rect, r: Rect| r.0 <= c.0 && c.2 <= r.2 && r.1 <= c.1 && c.3 <= r.3;
+            let mut edges = vec![obs];
+            edges.extend(pins.iter().map(|(_, _, r)| *r));
+            for piece in vyges_pdn::shapes::rectangles_where(&edges, |c| {
+                inside(c, obs) && !pins.iter().any(|(_, _, p)| inside(c, *p))
+            }) {
+                push_piece(piece, None);
+            }
+            let mut nets: Vec<&String> = Vec::new();
+            for (_, n, _) in &pins {
+                if !nets.contains(&n) {
+                    nets.push(n);
+                }
+            }
+            for net in nets {
+                for piece in vyges_pdn::shapes::rectangles_where(&edges, |c| {
+                    inside(c, obs) && pins.iter().any(|(_, n, p)| n == net && inside(c, *p))
+                }) {
+                    push_piece(piece, Some(format!("{PAD_OBS}{net}")));
+                }
+            }
         }
         // 🔑 **An instance obstructs through its PINS as well as its OBS**, and the second half is
         // the larger one on a macro that declares no obstruction layer at all.
@@ -1429,7 +1526,10 @@ pub(crate) fn instance_obstructions(
                     vyges_pdn::orient::transform_rect(haloed, &orient, offset),
                     // ⚠️ An unconnected terminal answers with an empty name, which must not be
                     // read as a net — every such pin would then share one and exempt each other.
-                    Some(db.iterm_get_net(&inst, &term)).filter(|n| !n.is_empty()),
+                    // A padframe cell's pin is PAD metal (`kPadObs`) — see [`PAD_OBS`].
+                    Some(db.iterm_get_net(&inst, &term))
+                        .filter(|n| !n.is_empty())
+                        .map(|n| if padframe { format!("{PAD_OBS}{n}") } else { n }),
                     vyges_pdn::orient::transform_rect(raw, &orient, offset),
                 ));
             }

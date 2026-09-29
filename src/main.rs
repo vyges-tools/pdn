@@ -1738,8 +1738,24 @@ fn cut_shapes(
             // the obstruction's raw rect. Without it a stripe is cut by its own block pin,
             // and with it applied to the wrong axis the wrong stripe is cut: of two pins on
             // one net, the contained one must not cut and the overhanging one must.
-            .filter(|(_, _, obs_net, r)| {
-                if obs_net.as_deref() != Some(shape_net.as_str()) {
+            .filter(|(_, stored, obs_net, r)| {
+                // 🔑 **Pad metal of the shape's own net (`kPadObs`) cuts only across the GAP**
+                // (upstream a49dde4 + 395f69a, as pinned): touching it merges rather than shorts,
+                // and a full spacing away is legal, so the shape is exempt when its metal touches
+                // the pad's real metal, or does not reach the pad metal's obstruction box at all.
+                // In between it falls through to the ordinary same-net test below. Pad metal of
+                // another net blocks like any obstruction. `intersects` is odb's: edges touching
+                // count.
+                let touches = |a: Rect, b: Rect| a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3;
+                let pad_net = obs_net.as_deref().and_then(pad_obs_net);
+                if let Some(pad_net) = pad_net {
+                    if pad_net != shape_net.as_str() {
+                        return true;
+                    }
+                    if touches(*rect, *r) || !touches(*rect, *stored) {
+                        return false;
+                    }
+                } else if obs_net.as_deref() != Some(shape_net.as_str()) {
                     return true;
                 }
                 let (slo, shi) = if horizontal {
@@ -2501,17 +2517,30 @@ fn generate(args: &[String]) -> ExitCode {
     // ℹ️ It has already paid for itself once: it is what distinguished "the skip is correct" from
     // "the skip never fired", which a suite of matching cases cannot tell apart.
     let mut skipped_gridded: Vec<&String> = Vec::new();
-    for (inst, layer, rect, _net, _raw) in &inst_obs {
-        if pad_connected.iter().any(|i| i == inst) {
-            continue;
-        }
+    for (inst, layer, rect, net, raw) in &inst_obs {
+        // ⛔ **A pad with a direct connection is NOT skipped any more.** Upstream a49dde4
+        // replaced the skip list `getInstances()` with `getObstructionExemptInstances()`: a
+        // core grid exempts NOTHING, an instance grid only its own instance.
+        // `pad_connected` stays for the trace.
         if inst_halos.iter().any(|(i, _)| i == inst) {
             if !skipped_gridded.contains(&inst) {
                 skipped_gridded.push(inst);
             }
             continue;
         }
-        blockages.push((layer.clone(), *rect, None, *rect));
+        // Only PAD metal carries its net here (`kPadObs`, a49dde4). Another instance's pin is a
+        // `kBlockObs` with its net in the reference too, but honouring that is measured to cost a
+        // flip-chip case (see above) and is a separate rule; it stays `None` for now.
+        let net = net.clone().filter(|n| pad_obs_net(n).is_some());
+        // 🔑 **Pad metal is charged its spacing ONCE.** `getPadObstructions` keeps `rect_` as the
+        // REAL metal and puts one spacing in the obstruction box; `Shape::cut` then grows the
+        // real rect by the larger halo. Passing the bloated rect as raw charged it twice, and a
+        // pad-connection strap stopped 560 short of the reference's end on
+        // `pads_via_repair_through_pads` (traced against `pdn-pad-obs-trace.py`). Other
+        // instances keep the bloated rect in both fields: `getInstanceObstructions` is a
+        // different path, measured separately.
+        let raw = if is_padframe(&db, &db.inst_get_master(inst)) { *raw } else { *rect };
+        blockages.push((layer.clone(), *rect, net, raw));
     }
     if !skipped_gridded.is_empty() {
         vyges_events::log(
