@@ -312,6 +312,23 @@ pub fn still_held(area: Rect, layer: &str, net: &str, shapes: &[(String, String,
         .any(|(n, l, r)| n == net && l == layer && intersects(area, *r))
 }
 
+/// **V-snap** — the two shapes' intersection snapped the way `Connect::makeVia` snaps it before
+/// anything else looks at it: the low edges UP and the high edges DOWN onto twice the
+/// manufacturing grid.
+///
+/// 🔑 **The via-stack cache is keyed on THIS rect's size**, `(dx, dy)` of the snapped
+/// intersection — so two raw overlaps of the same size at different positions can land on
+/// different keys. Keyed on the raw overlap, a power-switch design's 1590-wide crossings all
+/// shared the 1600 key and reused one stack where the reference rebuilds each (measured by
+/// diffing `PDN_VIA_CACHE_TRACE` against the reference's own `Cache hit|miss` lines).
+pub fn snapped_intersection(lower: Rect, upper: Rect, manufacturing_grid: i32) -> Rect {
+    let i = intersect(lower, upper);
+    let snap = |v: i32, up: bool| {
+        crate::straps::snap_to_manufacturing_grid(v, manufacturing_grid * 2, up)
+    };
+    (snap(i.0, true), snap(i.1, true), snap(i.2, false), snap(i.3, false))
+}
+
 /// **V12** — where a via is actually placed, which is not the centre of what it is sized from.
 ///
 /// 🔑 **Two different rects.** [`via_area`] gives the rect the via is BUILT in — each axis from the
@@ -342,12 +359,7 @@ pub fn still_held(area: Rect, layer: &str, net: &str, shapes: &[(String, String,
 /// own area instead puts the metal exactly inside the rail, nothing is ripped, and the design ends
 /// up carrying vias the reference does not.
 pub fn placement_point(lower: Rect, upper: Rect, manufacturing_grid: i32) -> Option<(i32, i32)> {
-    let i = intersect(lower, upper);
-    let snap = |v: i32, up: bool| {
-        crate::straps::snap_to_manufacturing_grid(v, manufacturing_grid * 2, up)
-    };
-    let (x0, y0) = (snap(i.0, true), snap(i.1, true));
-    let (x1, y1) = (snap(i.2, false), snap(i.3, false));
+    let (x0, y0, x1, y1) = snapped_intersection(lower, upper, manufacturing_grid);
     // `std::round` on a half is away from zero, which integer division is not.
     let mid = |a: i32, b: i32| {
         let s = a + b;

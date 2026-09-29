@@ -5201,9 +5201,48 @@ fn generate(args: &[String]) -> ExitCode {
         // shape is modifiable and whether it carries terminal connections. Recomputing those per
         // crossing — instead of taking the first one's — moved two vias on
         // `pads_ihp_sg13g2_balance` from the reference's 1315 to a minimum of 500.
-        let mut via_cache: std::collections::HashMap<
+        // 🔑 **The BUILT stack, cached per `(connect, net where split cuts, dx, dy)`** —
+        // `Connect::makeVia`'s `vias_`. The first crossing of a size builds every level from ITS
+        // shapes (enclosures, spare, cut counts, the shared-width rebuild); every later crossing of
+        // that size reuses the definitions and only PLACES them (`DbGenerateStackedVia::generate`:
+        // per-level snap, split spots, metal at the point). Not cached when either end is
+        // unmodifiable or carries terminal connections (`skip_caching`). ⚠️ `can_cache_` never
+        // stops it: a stack has no generator, so `canCache()` is true (observed: 2,409 hits on
+        // spare-enclosure stacks). Witness: `asap7_repair_channel_macro_gap`, whose 48 M5–M6 vias
+        // are one stack built for the first 120x204 crossing and ripped at write for the rest.
+        #[derive(Clone)]
+        enum BuiltLevel {
+            Gen {
+                rule: Option<String>,
+                cut: (i32, i32),
+                pitch: (i32, i32),
+                /// The winner's area, relative to the level's placement point.
+                area_rel: Rect,
+                rows: i32,
+                columns: i32,
+                array: Option<vyges_pdn::viagen::ArrayFit>,
+                bot_enc: (i32, i32),
+                top_enc: (i32, i32),
+            },
+            Tech {
+                name: String,
+                cut_layer: String,
+                single: (i32, i32),
+                spacing: (i32, i32),
+                bot: (i32, i32),
+                top: (i32, i32),
+                rows: i32,
+                columns: i32,
+                built_pitch: (i32, i32),
+                origin: (i32, i32),
+                is_array: bool,
+                /// The level's area, relative to the level's placement point.
+                area_rel: Rect,
+            },
+        }
+        let mut stack_cache: std::collections::HashMap<
             (usize, Option<String>, i32, i32),
-            (vyges_pdn::viagen::Constraint, vyges_pdn::viagen::Constraint),
+            Vec<Option<BuiltLevel>>,
         > = std::collections::HashMap::new();
         let mut placed = placed;
         placed.sort_by_key(|v| {
@@ -5435,17 +5474,18 @@ fn generate(args: &[String]) -> ExitCode {
             // The two ends' orientations, which is all the cache actually decides — see above.
             // ⚠️ **Consulted after the placement point**, which the reference takes from the real
             // shapes; only the geometry comes from the first crossing of this size.
-            let inter = vyges_pdn::vias::via_area(lower_rect, upper_rect);
             let split_here = !split_by_connect
                 .iter()
                 .find(|((l, u), _)| *l == v.lower && *u == v.upper)
                 .map(|(_, sp)| sp.is_empty())
                 .unwrap_or(true);
+            // The SNAPPED intersection's size — see `vias::snapped_intersection`.
+            let snapped = vyges_pdn::vias::snapped_intersection(lower_rect, upper_rect, grid_mfg);
             let cache_key = (
                 v.connect,
                 split_here.then(|| v.net.clone()),
-                inter.2 - inter.0,
-                inter.3 - inter.1,
+                snapped.2 - snapped.0,
+                snapped.3 - snapped.1,
             );
             // ⛔ **A shape that cannot be MODIFIED, or that already carries TERMINAL
             // connections, must fit on BOTH axes.** `Connect::makeVia`:
@@ -5480,7 +5520,17 @@ fn generate(args: &[String]) -> ExitCode {
                 let is_fixed = fixed_via_shapes
                     .iter()
                     .chain(connectable_pins.iter())
-                    .any(|f| f.net == v.net && f.layer == layer && f.rect == rect);
+                    .any(|f| f.net == v.net && f.layer == layer && f.rect == rect)
+                    // 🔑 **A power switch's own pin metal is `kFixed` too.**
+                    // `GridSwitchedPower::getShapes` hands the always-on pins over from
+                    // `InstanceGrid::getInstancePins`, which types every box `kFixed` — so a via
+                    // landing on one has an unmodifiable end: it must fit on both axes and its
+                    // stack is never cached (`skip_caching`). Seen by diffing the via-cache
+                    // sequence on `power_switch_daisy`: the reference misses on every 1590x280
+                    // met1-switch-pin crossing, ours reused one stack.
+                    || emitted.iter().any(|(n, l, r, k)| {
+                        *k == "SWITCH" && n == &v.net && l == layer && *r == rect
+                    });
                 let locked_ring = locked_layers.iter().any(|l| l == layer)
                     && emitted.iter().any(|(n, l, r, k)| {
                         n == &v.net && l == layer && *r == rect && *k == "RING"
@@ -5495,18 +5545,40 @@ fn generate(args: &[String]) -> ExitCode {
                 });
                 (!is_fixed && !locked_ring, has_iterms)
             };
-            let ends = *via_cache.entry(cache_key).or_insert_with(|| {
-                let (mb, ib) = end_flags(&v.lower, lower_rect);
-                let (mt, it) = end_flags(&v.upper, upper_rect);
-                (
-                    vyges_pdn::viagen::constraint_for(
-                        vyges_pdn::viagen::rect_direction(lower_rect), mb, ib,
-                    ),
-                    vyges_pdn::viagen::constraint_for(
-                        vyges_pdn::viagen::rect_direction(upper_rect), mt, it,
-                    ),
-                )
-            });
+            // The two ends' constraints, from THIS crossing's shapes — they matter only when the
+            // stack is built here (a cache hit reuses the definitions whole).
+            let (mb, ib) = end_flags(&v.lower, lower_rect);
+            let (mt, it) = end_flags(&v.upper, upper_rect);
+            let ends = (
+                vyges_pdn::viagen::constraint_for(
+                    vyges_pdn::viagen::rect_direction(lower_rect), mb, ib,
+                ),
+                vyges_pdn::viagen::constraint_for(
+                    vyges_pdn::viagen::rect_direction(upper_rect), mt, it,
+                ),
+            );
+            // `skip_caching`: either end not modifiable, or carrying terminal connections.
+            let skip_caching = !mb || ib || !mt || it;
+            // `PDN_NO_STACK_CACHE=1` builds every crossing afresh — the pre-cache behaviour, kept so
+            // a difference can be attributed to the cache alone.
+            let hit: Option<Vec<Option<BuiltLevel>>> =
+                if std::env::var_os("PDN_NO_STACK_CACHE").is_some() {
+                    None
+                } else {
+                    stack_cache.get(&cache_key).cloned()
+                };
+            // `PDN_VIA_CACHE_TRACE=1` prints the reference's own `PDN Via` line for this lookup —
+            // `Cache {hit|miss} at {net|null} / {dx} / {dy}` — in the same write order, so the two
+            // sequences diff line for line (`pdn-via-cache.py` reads the reference's).
+            if std::env::var_os("PDN_VIA_CACHE_TRACE").is_some() {
+                eprintln!(
+                    "[DEBUG PDN-Via] Cache {} at {} / {} / {}",
+                    if hit.is_some() { "hit" } else { "miss" },
+                    cache_key.1.as_deref().unwrap_or("null"),
+                    cache_key.2,
+                    cache_key.3
+                );
+            }
             // ⚠️ **A connect spanning several routing layers is a STACK, not one via.** metal1 to
             // metal6 needs a cut at each of five levels, and the reference's own counts show it:
             // via1_2 through via5_6 all carry the same number. Building one via for the pair leaves
@@ -5660,7 +5732,9 @@ fn generate(args: &[String]) -> ExitCode {
                 via_ok.len(),
                 written,
             );
-            let mut measuring = stack.len() > 2;
+            // A cache hit places the stored definitions once; only a build measures.
+            let mut measuring = hit.is_none() && stack.len() > 2;
+            let mut built_levels: Vec<Option<BuiltLevel>> = vec![None; stack.len().saturating_sub(1)];
             loop {
             let mut merged_widths: Vec<Option<i32>> = vec![None; stack.len()];
             let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
@@ -5824,8 +5898,15 @@ fn generate(args: &[String]) -> ExitCode {
                         vyges_pdn::split::positions(place_at, n, (sp, sp), off, &|v| v, &|v| v)
                     }
                 };
-                let spots = spots_in(area);
+                // Relative to / back from the level's placement point — how a cached definition's
+                // area travels between crossings.
+                let rel = |r: Rect| (r.0 - place_at.0, r.1 - place_at.1, r.2 - place_at.0, r.3 - place_at.1);
+                let abs = |r: Rect| (r.0 + place_at.0, r.1 + place_at.1, r.2 + place_at.0, r.3 + place_at.1);
 
+                // ════ BUILD — only on a cache miss (`Connect::makeVia`'s `if (via == nullptr)`) ════
+                let built: Option<BuiltLevel> = if let Some(h) = &hit {
+                    h.get(level).cloned().flatten()
+                } else { 'build: {
                 // ── a via the technology already declares ────────────────────────────────────
                 // 🔑 **Only the GEOMETRY is the technology's.** How many cuts fit, and what
                 // enclosure the via is finally built with, are decided by the same machinery a
@@ -6003,10 +6084,10 @@ fn generate(args: &[String]) -> ExitCode {
                         // builds its one stack and reuses it for all 52 later crossings
                         // (`correlation/instruments/pdn-via-cache.py`).
                         //
-                        // ℹ️ This engine's `via_cache` holds the two ends' CONSTRAINTS only, so
-                        // the enclosure, spare included, is recomputed per crossing; the suite
-                        // agrees either way. ⚠️ A geometry cache that transcribes the reference
-                        // must therefore NOT exempt a spare-enclosure stack.
+                        // 🔑 **So neither does ours.** `stack_cache` stores the built stack whatever
+                        // enclosure it took, and a later crossing of the same snapped size reuses
+                        // it — spare included. Witness: `asap7_repair_channel_macro_gap`, one
+                        // 120x204 stack with M6 spare reused 47 times and ripped at write.
                         let (spare_b, spare_t) =
                             vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
 
@@ -6370,7 +6451,7 @@ fn generate(args: &[String]) -> ExitCode {
                         // and above the two `->snap(getTech())` calls.
                         // ℹ️ Upstream also clears `can_cache_` here, and it is dead for the stack
                         // cache — see the spare note above (observed, 2,409 hits on such stacks).
-                        // Our `via_cache` holds constraints only, so nothing to invalidate.
+                        // `stack_cache` therefore caches this via like any other.
                         let spare_for = |built: vyges_pdn::viagen::Enclosure,
                                          at_end: bool,
                                          minimum: vyges_pdn::viagen::Enclosure,
@@ -6517,7 +6598,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     "[via]   TECH REFUSED {area:?} {lo}->{hi} {via_name}"
                                 );
                             }
-                            continue;
+                            break 'build None;
                         }
                     }
                     // ⚠️ **Two different cut rects, and they are not interchangeable.** How many
@@ -6552,7 +6633,7 @@ fn generate(args: &[String]) -> ExitCode {
                         if std::env::var_os("PDN_VIA_TRACE").is_some() {
                             eprintln!("[via]   TECH NO PITCH {area:?} {lo}->{hi} {via_name}");
                         }
-                        continue; // no pitch stated anywhere, so no array can be laid out
+                        break 'build None; // no pitch stated anywhere, so no array can be laid out
                     };
                     // 🔑 The split pitch overrides the technology's, exactly as on the generate
                     // path — `generateDbVia` sets it on every generator before any is built.
@@ -6619,7 +6700,7 @@ fn generate(args: &[String]) -> ExitCode {
                         &fit,
                         &|_, _, cuts| cuts > 0,
                     ) else {
-                        continue; // nothing buildable at this level
+                        break 'build None; // nothing buildable at this level
                     };
                     // A split array holds ONE cut and is placed repeatedly, so the fit is not asked.
                     let (columns, rows) = if split.is_some() {
@@ -6760,25 +6841,92 @@ fn generate(args: &[String]) -> ExitCode {
                     };
                     let spacing =
                         vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
+                    let origin = vyges_pdn::techvia::centre(g.cut_extent);
+                    break 'build Some(BuiltLevel::Tech {
+                        name,
+                        cut_layer: g.cut_layer.clone(),
+                        single,
+                        spacing,
+                        bot,
+                        top,
+                        rows,
+                        columns,
+                        built_pitch,
+                        origin,
+                        is_array,
+                        area_rel: rel(area),
+                    });
+                }
+
+                let Some(best) = best else {
+                    break 'build None; // nothing buildable at this level, on any pair
+                };
+                Some(BuiltLevel::Gen {
+                    rule: best.rule.map(|r| r.name.clone()),
+                    cut: best.cut,
+                    pitch: best.pitch,
+                    area_rel: rel(best.area),
+                    rows: best.rows,
+                    columns: best.columns,
+                    array: best.array,
+                    bot_enc: best.bot_enc,
+                    top_enc: best.top_enc,
+                })
+                }};
+                // ════ PLACE — every crossing (`via->generate(block, wire, type, x, y, ongrid)`) ════
+                if hit.is_none() && !measuring {
+                    built_levels[level] = built.clone();
+                }
+                let Some(built) = built else {
+                    continue; // refused level: nothing placed (the reference's dummy via)
+                };
+                let (rule, cut, pitch, area, rows, columns, array, bot_enc, top_enc) = match built {
+                    BuiltLevel::Tech {
+                        name,
+                        cut_layer: tech_cut,
+                        single,
+                        spacing,
+                        bot,
+                        top,
+                        rows,
+                        columns,
+                        built_pitch,
+                        origin,
+                        is_array,
+                        area_rel,
+                    } => {
+                    let area = abs(area_rel);
+                    let spots = spots_in(area);
+                    let g_cut_layer = tech_cut.as_str();
                     if is_array
                         && !measuring
                         && db
                             .create_generated_via(
                                 &name,
                                 "", // a tech via answers to no generate rule
-                                (lo, g.cut_layer.as_str(), hi),
+                                (lo, g_cut_layer, hi),
                                 single,
                                 spacing,
                                 bot,
                                 top,
                                 rows,
                                 columns,
-                                vyges_pdn::techvia::centre(g.cut_extent),
+                                origin,
                             )
                             .is_err()
                     {
                         continue;
                     }
+                    let tv_grid = |layer: &str| {
+                        ongrid
+                            .iter()
+                            .any(|l| l == layer)
+                            .then(|| track_grids.get(layer))
+                            .flatten()
+                    };
+                    let (x_up, y_up) = vyges_pdn::vias::techvia_snap_sources(
+                        dir_of(hi) == Direction::Vertical,
+                    );
                     // 🔑 **A tech via is placed by its ORIGIN, not by its cut array's centre**,
                     // and for a via whose cuts do not straddle the origin those are different
                     // points. `DbTechVia::generate` subtracts `via_center_` — the centre of the
@@ -6792,7 +6940,6 @@ fn generate(args: &[String]) -> ExitCode {
                     // against. A via with three cuts running 90 units to one side of its origin
                     // places 45 out of position with no other symptom -- same name, same count,
                     // same metal.
-                    let origin = vyges_pdn::techvia::centre(g.cut_extent);
                     // 🔑 **A TECH via honours `-ongrid` on a single-level connect; a generated
                     // one does not.** `DbGenerateVia::generate` takes the set and ignores it, so
                     // for a generate rule the snapping really does live only in the stacked via
@@ -6889,21 +7036,18 @@ fn generate(args: &[String]) -> ExitCode {
                         needs_patch,
                     ));
                     continue;
-                }
-
-                let Some(best) = best else {
-                    continue; // nothing buildable at this level, on any pair
+                    }
+                    BuiltLevel::Gen { rule, cut, pitch, area_rel, rows, columns, array, bot_enc, top_enc } => {
+                        (rule, cut, pitch, abs(area_rel), rows, columns, array, bot_enc, top_enc)
+                    }
                 };
-                let (rule, cut, pitch, area) = (best.rule, best.cut, best.pitch, best.area);
-                let (rows, columns) = (best.rows, best.columns);
-                let (bot_enc, top_enc) = (best.bot_enc, best.top_enc);
                 // The array the winner's own area lays out, which is not the level's.
                 let spots = spots_in(area);
                 // 🔑 **An ARRAYSPACING via is several base vias on a grid**, so one spot becomes
                 // several placements and the definitions differ by cut count alone. Without a
                 // rule this is the single via at the spot itself, which is the same shape of
                 // answer and needs no branch below.
-                let grid: Vec<vyges_pdn::viagen::ArrayPlacement> = match &best.array {
+                let grid: Vec<vyges_pdn::viagen::ArrayPlacement> = match &array {
                     Some(f) => vyges_pdn::viagen::array_placements(f, cut),
                     None => vec![vyges_pdn::viagen::ArrayPlacement {
                         cuts: (columns, rows),
@@ -6944,7 +7088,7 @@ fn generate(args: &[String]) -> ExitCode {
                         && db
                         .create_generated_via(
                             &name,
-                            rule.map(|r| r.name.as_str()).unwrap_or(""),
+                            rule.as_deref().unwrap_or(""),
                             (lo, cut_layer, hi),
                             params.cut,
                             params.cut_spacing,
@@ -7016,7 +7160,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // 🔑 **A `DbArrayVia` overrides it to `true` unconditionally** — `via.h:348` —
                 // so an array asks for a patch even where one group holds a single cut.
                 let needs_patch =
-                    split.is_none() && (best.array.is_some() || rows > 1 || columns > 1);
+                    split.is_none() && (array.is_some() || rows > 1 || columns > 1);
                 if let Some((shared, prev_tops, prev_array)) = previous_top.take() {
                     if shared == lo && !prev_tops.is_empty() && !bots.is_empty() {
                         // 🔑 **`Connect::updateSharedLayerWidths`, measured here because this is
@@ -7110,6 +7254,9 @@ fn generate(args: &[String]) -> ExitCode {
             if !wider {
                 measuring = false;
             }
+            }
+            if hit.is_none() && !skip_caching {
+                stack_cache.insert(cache_key.clone(), built_levels);
             }
 
             // ── this via's metal, merged back into the two shapes it landed on ────────────
