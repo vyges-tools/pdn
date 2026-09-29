@@ -58,16 +58,27 @@ pub struct Stripe {
 /// the last track. A strap can therefore sit off-grid, and that is the reference's answer rather
 /// than a failure to handle the case.
 pub fn snap_to_grid(pos: i32, greater_than: i32, grid: &[i32]) -> i32 {
-    if grid.is_empty() {
-        return pos;
-    }
+    snap_to_grid_within(pos, greater_than, i32::MAX, grid)
+}
+
+/// **S1b** — [`snap_to_grid`] with an upper bound as well: the nearest track in
+/// `[greater_than, less_than]`, the LOWER of two equally near, and `pos` unsnapped when no track
+/// lies in the range.
+///
+/// 🔑 **The upper bound exists for the mirrored sweep.** A strap group laid downwards from a
+/// flipped macro's high edge must keep each net off the track the previous net took, which is now
+/// ABOVE it — the same guard the upward sweep gets from `greater_than`.
+pub fn snap_to_grid_within(pos: i32, greater_than: i32, less_than: i32, grid: &[i32]) -> i32 {
     let mut best: Option<i32> = None;
-    let mut delta = i32::MAX;
+    let mut delta = i64::MAX;
     for &g in grid {
         if g < greater_than {
             continue;
         }
-        let d = (pos - g).abs();
+        if g > less_than {
+            break; // sorted: nothing further is in range
+        }
+        let d = (pos as i64 - g as i64).abs();
         if d < delta {
             best = Some(g);
             delta = d;
@@ -144,10 +155,12 @@ pub enum Stopped {
 /// ⚠️ `strap_end` is `strap_start + width`, and `strap_start` is `pos - width / 2`. For an odd
 /// width that is **not** symmetric about the position — the extra unit falls on the high side, and
 /// writing `pos + width / 2` instead loses it.
+#[allow(clippy::too_many_arguments)]
 pub fn make_straps(
     spec: &Spec,
     nets: &[String],
     span: Rect,
+    sweep: (i32, i32),
     abs: (i32, i32),
     grid: &[i32],
     avoid: &[Rect],
@@ -166,26 +179,39 @@ pub fn make_straps(
     }
     let half_width = spec.width / 2;
     let group_pitch = spec.spacing + spec.width;
-    // `pos` walks the STEPPING axis: y for horizontal stripes, x for vertical ones.
-    let (start, end) = if horizontal { (y0, y1) } else { (x0, x1) };
+    // `pos` walks the STEPPING axis — y for horizontal stripes, x for vertical ones — from `origin`
+    // towards `limit`.
+    //
+    // 🔑 **The direction falls out of the two bounds.** A flipped macro's grid is swept DOWN from
+    // its high edge (see [`sweep`]); then the offset, the pitch and the group pitch all step
+    // downwards, so the nets of a group come out in the opposite spatial order, and the snap is
+    // bounded ABOVE by the previous net's track instead of below.
+    let (origin, limit) = sweep;
+    let mirror = limit < origin;
+    let step = if mirror { -1 } else { 1 };
+    let beyond = |p: i32| if mirror { p < limit } else { p > limit };
+    let at_or_beyond = |p: i32| if mirror { p <= limit } else { p >= limit };
 
     let mut out = Vec::new();
     let mut groups = 0;
-    let mut next_minimum_track = i32::MIN;
-    let mut pos = start + spec.offset;
+    let mut next_track = if mirror { i32::MAX } else { i32::MIN };
+    let mut pos = origin + step * spec.offset;
 
-    while pos <= end {
+    while !beyond(pos) {
         let mut group_pos = pos;
         for net in nets {
-            group_pos = if spec.snap {
-                snap_to_grid(group_pos, next_minimum_track, grid)
-            } else {
+            group_pos = if !spec.snap {
                 group_pos
+            } else if mirror {
+                snap_to_grid_within(group_pos, i32::MIN, next_track, grid)
+            } else {
+                snap_to_grid(group_pos, next_track, grid)
             };
             let strap_start = group_pos - half_width;
             let strap_end = strap_start + spec.width;
 
-            if strap_start >= end || group_pos > end {
+            // No part of the strap inside the limit, or its centre past it: the set is done.
+            if at_or_beyond(if mirror { strap_end } else { strap_start }) || beyond(group_pos) {
                 return (out, Stopped::PastEnd);
             }
 
@@ -196,8 +222,8 @@ pub fn make_straps(
             };
 
             // ⚠️ Before the tests below, deliberately. See the note on the function.
-            group_pos += group_pitch;
-            next_minimum_track = group_pos;
+            group_pos += step * group_pitch;
+            next_track = group_pos;
 
             if avoid.iter().any(|a| intersects(rect, *a)) {
                 continue;
@@ -220,9 +246,27 @@ pub fn make_straps(
         if spec.number_of_straps != 0 && groups == spec.number_of_straps {
             return (out, Stopped::Enough);
         }
-        pos += spec.pitch;
+        pos += step * spec.pitch;
     }
     (out, Stopped::Exhausted)
+}
+
+/// **S2b** — where a strap set's sweep starts and where it must stop, on the stepping axis.
+///
+/// Normally from the core's LOW edge up to its high edge (the die's with `allow_out_of_core`).
+/// 🔑 **On a macro grid mirrored along the stepping axis it runs the other way** — from the core's
+/// HIGH edge down to its low edge (the die's with `allow_out_of_core`) — because the offset is
+/// written against the macro as drawn, and mirroring moved the edge it is measured from. A repair
+/// channel's straps never mirror (their position is computed, not user-written).
+pub fn sweep(core: Rect, die: Rect, horizontal: bool, allow_out_of_core: bool, mirror: bool) -> (i32, i32) {
+    let (core_lo, core_hi, die_lo, die_hi) = if horizontal {
+        (core.1, core.3, die.1, die.3)
+    } else {
+        (core.0, core.2, die.0, die.2)
+    };
+    let far = if allow_out_of_core { die_hi } else { core_hi };
+    let near = if allow_out_of_core { die_lo } else { core_lo };
+    if mirror { (core_hi, near) } else { (core_lo, far) }
 }
 
 /// **S3** — the span a strap set is laid into.
@@ -292,6 +336,7 @@ mod tests {
             &["VDD".into(), "VSS".into()],
             (0, 0, 10000, 10000),
             (0, 10000),
+            (0, 10000),
             &[],
             &[],
             true,
@@ -317,6 +362,7 @@ mod tests {
             &spec,
             &["VDD".into(), "VSS".into()],
             (0, 0, 10000, 10000),
+            (0, 10000),
             (0, 10000),
             &[],
             &[],
@@ -386,7 +432,7 @@ mod tests {
     #[test]
     fn one_stripe_per_net_at_each_step_of_the_pitch() {
         let s = spec(10, 10, 100);
-        let (out, why) = make_straps(&s, &nets(2), (0, 0, 1000, 400), WIDE, &[], &[], true);
+        let (out, why) = make_straps(&s, &nets(2), (0, 0, 1000, 400), (0, 400), WIDE, &[], &[], true);
         // ⚠️ Groups at 0, 100, 200, 300 give two stripes each; at 400 the first net still fits and
         // the second runs past the end. **A multi-net set almost always ends this way** rather than
         // by the loop condition, so `Exhausted` is the exception and not the rule.
@@ -399,7 +445,7 @@ mod tests {
     #[test]
     fn the_nets_of_a_group_sit_one_group_pitch_apart() {
         let s = spec(10, 10, 100);
-        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), WIDE, &[], &[], true);
+        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), (0, 100), WIDE, &[], &[], true);
         assert_eq!(
             out[0].rect,
             (0, -5, 1000, 5),
@@ -417,7 +463,7 @@ mod tests {
         // ⚠️ `strap_end = strap_start + width`, not `pos + width / 2`. For width 11 the stripe runs
         // from pos-5 to pos+6. Writing it symmetrically loses a unit and every stripe is wrong.
         let s = spec(11, 10, 100);
-        let (out, _) = make_straps(&s, &nets(1), (0, 100, 1000, 100), WIDE, &[], &[], true);
+        let (out, _) = make_straps(&s, &nets(1), (0, 100, 1000, 100), (100, 100), WIDE, &[], &[], true);
         assert_eq!(out[0].rect, (0, 95, 1000, 106));
     }
 
@@ -427,7 +473,7 @@ mod tests {
         // pitch, not once per stripe.
         let mut s = spec(10, 10, 100);
         s.number_of_straps = 1;
-        let (out, why) = make_straps(&s, &nets(3), (0, 0, 1000, 900), WIDE, &[], &[], true);
+        let (out, why) = make_straps(&s, &nets(3), (0, 0, 1000, 900), (0, 900), WIDE, &[], &[], true);
         assert_eq!(why, Stopped::Enough);
         assert_eq!(out.len(), 3);
     }
@@ -437,7 +483,7 @@ mod tests {
         // ⚠️ `return`, not `continue`. Once a group runs past the end nothing later is attempted,
         // even where a later position would have fitted.
         let s = spec(10, 10, 100);
-        let (out, why) = make_straps(&s, &nets(3), (0, 0, 1000, 30), WIDE, &[], &[], true);
+        let (out, why) = make_straps(&s, &nets(3), (0, 0, 1000, 30), (0, 30), WIDE, &[], &[], true);
         assert_eq!(why, Stopped::PastEnd);
         assert_eq!(
             out.len(),
@@ -453,7 +499,7 @@ mod tests {
         // back would put the second net at the first one's place.
         let s = spec(10, 10, 100);
         let avoid = [(0, -100, 1000, 5)];
-        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), WIDE, &[], &avoid, true);
+        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), (0, 100), WIDE, &[], &avoid, true);
         assert_eq!(out[0].net, "VDD", "the first net's stripe was dropped");
         assert_eq!(
             out[0].rect,
@@ -466,7 +512,7 @@ mod tests {
     fn a_stripe_outside_the_die_is_dropped_rather_than_clipped() {
         let s = spec(10, 10, 100);
         // The die stops at 20, so the second net's stripe (15..25) falls outside it.
-        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), (-100, 20), &[], &[], true);
+        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), (0, 100), (-100, 20), &[], &[], true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].net, "VSS");
         assert_eq!(
@@ -480,7 +526,7 @@ mod tests {
     fn the_offset_moves_the_first_group_only() {
         let mut s = spec(10, 10, 100);
         s.offset = 50;
-        let (out, _) = make_straps(&s, &nets(1), (0, 0, 1000, 200), WIDE, &[], &[], true);
+        let (out, _) = make_straps(&s, &nets(1), (0, 0, 1000, 200), (0, 200), WIDE, &[], &[], true);
         let centres: Vec<i32> = out.iter().map(|o| o.rect.1 + 5).collect();
         assert_eq!(
             centres,
@@ -492,7 +538,7 @@ mod tests {
     #[test]
     fn vertical_stripes_step_along_x_and_run_along_y() {
         let s = spec(10, 10, 100);
-        let (out, _) = make_straps(&s, &nets(1), (0, 40, 200, 900), WIDE, &[], &[], false);
+        let (out, _) = make_straps(&s, &nets(1), (0, 40, 200, 900), (0, 200), WIDE, &[], &[], false);
         assert_eq!(
             out[0].rect,
             (-5, 40, 5, 900),
@@ -505,7 +551,7 @@ mod tests {
         let mut s = spec(10, 10, 100);
         s.snap = true;
         let grid: Vec<i32> = (0..40).map(|i| i * 25).collect();
-        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), WIDE, &grid, &[], true);
+        let (out, _) = make_straps(&s, &nets(2), (0, 0, 1000, 100), (0, 100), WIDE, &grid, &[], true);
         let centres: Vec<i32> = out.iter().map(|o| o.rect.1 + 5).collect();
         // ⚠️ Three, not two: the second group at pitch 100 still fits, and its first net snaps to
         // the track at 100. The floor from the previous group is what pushes each net off its
@@ -615,5 +661,57 @@ mod tests {
     fn the_absolute_bound_is_the_die_on_the_across_axis() {
         assert_eq!(absolute((0, 10, 1000, 990), true), (10, 990));
         assert_eq!(absolute((0, 10, 1000, 990), false), (0, 1000));
+    }
+
+    #[test]
+    fn a_mirrored_sweep_runs_down_from_the_high_edge_and_inverts_the_group() {
+        // 🔑 Upstream rule (straps on a flipped macro grid): the offset is measured from the edge
+        // mirroring moved, the sweep heads the other way, and pitch, group pitch and hence the
+        // net order inside a group all step downwards.
+        let s = Spec {
+            layer: "m".into(),
+            width: 100,
+            spacing: 100,
+            pitch: 400,
+            offset: 100,
+            number_of_straps: 0,
+            snap: false,
+            allow_out_of_core: false,
+        };
+        let (out, why) =
+            make_straps(&s, &nets(2), (0, 0, 1000, 1000), (1000, 0), (0, 1000), &[], &[], true);
+        let got: Vec<(String, i32)> = out.iter().map(|t| (t.net.clone(), t.rect.1 + 50)).collect();
+        let want: Vec<(String, i32)> = [("VSS", 900), ("VDD", 700), ("VSS", 500), ("VDD", 300), ("VSS", 100)]
+            .iter()
+            .map(|(n, y)| (n.to_string(), *y))
+            .collect();
+        assert_eq!(got, want);
+        // The next strap would end at -50, on the far side of the limit 0: the set stops there.
+        assert_eq!(why, Stopped::PastEnd);
+    }
+
+    #[test]
+    fn the_mirrored_snap_is_bounded_above_by_the_previous_nets_track() {
+        // In the upward sweep a net may not take a track below the previous net's; mirrored, the
+        // same guard holds from ABOVE — the nearest track at or below it, ties to the lower.
+        assert_eq!(snap_to_grid_within(37, i32::MIN, 30, &[0, 10, 20, 30, 40, 50]), 30);
+        assert_eq!(snap_to_grid_within(15, i32::MIN, i32::MAX, &[0, 10, 20, 30]), 10);
+        assert_eq!(snap_to_grid_within(15, 40, 60, &[0, 10, 20, 30]), 15, "no track in range");
+        // With no upper bound it is exactly the one-sided snap.
+        for p in [-5, 0, 7, 15, 33, 99] {
+            assert_eq!(snap_to_grid_within(p, 10, i32::MAX, &[0, 10, 20, 30]), snap_to_grid(p, 10, &[0, 10, 20, 30]));
+        }
+    }
+
+    #[test]
+    fn a_mirrored_sweep_starts_at_the_core_high_edge_and_only_its_limit_moves_out() {
+        let core = (100, 200, 900, 800);
+        let die = (0, 0, 1000, 1000);
+        assert_eq!(sweep(core, die, true, false, false), (200, 800));
+        assert_eq!(sweep(core, die, true, true, false), (200, 1000));
+        assert_eq!(sweep(core, die, true, false, true), (800, 200));
+        // allow_out_of_core moves the LIMIT to the die's near edge; the origin stays at the core.
+        assert_eq!(sweep(core, die, true, true, true), (800, 0));
+        assert_eq!(sweep(core, die, false, false, true), (900, 100));
     }
 }

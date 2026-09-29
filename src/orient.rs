@@ -95,9 +95,89 @@ pub fn canonical(orient: &str) -> &str {
     }
 }
 
+/// **O4** — four per-edge distances `[left, bottom, right, top]`, stated against a macro as it was
+/// DRAWN, moved to the edges they land on once the macro is placed in `orient`.
+///
+/// 🔑 **`-halo` and a ring's `-core_offsets` name the macro's own edges**, so a mirror carries a
+/// value to the opposite edge and a quarter turn carries every label round with the cell. The
+/// reference applies this to the instance grid's halo and to its rings' offsets (added upstream in
+/// "pdn: account for macro orientations when placing straps and other connectivity"); a core grid
+/// is always `R0` and passes through unchanged.
+///
+/// ⚠️ For the four axis-swapping orientations the label that ends up on each placed edge is the
+/// one the turn brings there — e.g. `R90` puts the drawn TOP on the placed left. Reading them as
+/// "the same four, reordered like the mirrors" swaps left for right on half of them.
+pub fn edges_in_placed_frame(e: [i32; 4], orient: &str) -> [i32; 4] {
+    let [l, b, r, t] = e;
+    match canonical(orient) {
+        "MY" => [r, b, l, t],
+        "MX" => [l, t, r, b],
+        "R180" => [r, t, l, b],
+        "R90" => [t, l, b, r],
+        "MXR90" => [b, l, t, r],
+        "MYR90" => [t, r, b, l],
+        "R270" => [b, r, t, l],
+        _ => e,
+    }
+}
+
+/// **O5** — whether a placed orientation mirrors the placed `(x, y)` axes relative to the frame a
+/// grid's strap offsets are written in.
+///
+/// 🔑 **That frame is `R0` for the four orientations that keep the axes, and `R90` for the four
+/// that swap them.** A strap's direction belongs to its LAYER, which does not turn with the macro,
+/// so a grid meant for a right-angle macro is written for the turned frame already; measured
+/// against it, each family of four is identity, mirror x, mirror y and both. Hence `R270` mirrors
+/// BOTH axes (it is `R90` turned half way round) and `R90` mirrors neither.
+pub fn axis_mirror(orient: &str) -> (bool, bool) {
+    match canonical(orient) {
+        "MY" | "MXR90" => (true, false),
+        "MX" | "MYR90" => (false, true),
+        "R180" | "R270" => (true, true),
+        _ => (false, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mirror_carries_an_edge_value_to_the_opposite_edge() {
+        // left 1, bottom 2, right 3, top 4 as drawn.
+        let e = [1, 2, 3, 4];
+        assert_eq!(edges_in_placed_frame(e, "R0"), [1, 2, 3, 4]);
+        assert_eq!(edges_in_placed_frame(e, "MY"), [3, 2, 1, 4], "FN: left and right swap");
+        assert_eq!(edges_in_placed_frame(e, "FS"), [1, 4, 3, 2], "MX: bottom and top swap");
+        assert_eq!(edges_in_placed_frame(e, "S"), [3, 4, 1, 2], "R180: both pairs swap");
+    }
+
+    #[test]
+    fn a_quarter_turn_carries_every_edge_label_round_with_the_cell() {
+        let e = [1, 2, 3, 4];
+        // R90 (CCW): the drawn top faces placed left, drawn left faces placed bottom, ...
+        assert_eq!(edges_in_placed_frame(e, "R90"), [4, 1, 2, 3]);
+        assert_eq!(edges_in_placed_frame(e, "E"), [2, 3, 4, 1], "R270 is the inverse turn");
+        assert_eq!(edges_in_placed_frame(e, "MXR90"), [2, 1, 4, 3]);
+        assert_eq!(edges_in_placed_frame(e, "FE"), [4, 3, 2, 1]);
+        // Composing a turn with its inverse is the identity, which a transcription typo breaks.
+        let back = |v: [i32; 4]| edges_in_placed_frame(v, "R270");
+        assert_eq!(back(edges_in_placed_frame(e, "R90")), e);
+    }
+
+    #[test]
+    fn strap_mirroring_is_measured_against_r0_or_r90_by_family() {
+        assert_eq!(axis_mirror("N"), (false, false));
+        assert_eq!(axis_mirror("FN"), (true, false));
+        assert_eq!(axis_mirror("FS"), (false, true));
+        assert_eq!(axis_mirror("S"), (true, true));
+        // The right-angle family is measured from R90, so R90 itself mirrors nothing.
+        assert_eq!(axis_mirror("W"), (false, false));
+        assert_eq!(axis_mirror("FW"), (true, false));
+        assert_eq!(axis_mirror("FE"), (false, true));
+        assert_eq!(axis_mirror("E"), (true, true));
+        assert_eq!(axis_mirror("bogus"), (false, false));
+    }
 
     #[test]
     fn the_quarter_turn_mirrors_compose_as_odb_composes_them() {

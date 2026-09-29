@@ -1390,6 +1390,8 @@ fn make_ring(
     build_nets: &[String],
     core: Rect,
     die: Rect,
+    // The grid's orientation: the instance's for a macro grid, `R0` for the core grid.
+    orient: &str,
     per_micron: f64,
 ) -> (Vec<rings::Segment>, Option<String>) {
     let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
@@ -1455,6 +1457,10 @@ fn make_ring(
     } else {
         off4
     };
+    // 🔑 **The offsets name the macro's edges as DRAWN**, so on a mirrored or turned instance each
+    // value moves to the edge it now faces — upstream's `Rings::setOffset`, which both the core
+    // and the pad form end in. Measured: `macros_flipped_180` puts `{1 2 3 4}` at `{3 4 1 2}`.
+    let off4 = vyges_pdn::orient::edges_in_placed_frame(off4, orient);
     let outline = rings::inner_outline(core, off4);
     // ⚠️ A ring extended to the boundary reaches the DIE along each side, and stops growing per net
     // on that axis — the loops still nest, they just all reach the same distance.
@@ -1744,6 +1750,9 @@ struct StrapBounds {
     die: Rect,
     strap: Rect,
     ring: Rect,
+    /// `(x, y)`: whether this grid's frame is mirrored along each placed axis — the instance's
+    /// orientation for a macro grid (`orient::axis_mirror`), never for the core grid.
+    mirror: (bool, bool),
 }
 
 /// Build one `-stripe` declaration — a `Straps` component.
@@ -1880,10 +1889,14 @@ fn make_strap(
                 .filter(|(l, _)| *l == spec.layer)
                 .map(|(_, r)| *r)
                 .collect();
+            // The mirror that matters is along the axis the stripes STEP on: y for horizontal ones.
+            let mirror = if horizontal { b.mirror.1 } else { b.mirror.0 };
+            let sweep = straps::sweep(b.core, b.die, horizontal, spec.allow_out_of_core, mirror);
             let (stripes, _) = straps::make_straps(
                 &spec,
                 &build_nets,
                 span,
+                sweep,
                 abs,
                 &grid_axis,
                 &avoid,
@@ -3213,6 +3226,15 @@ fn generate(args: &[String]) -> ExitCode {
             })
             .max()
             .unwrap_or(0);
+        // 🔑 **A macro grid's straps are written against the macro as DRAWN.** On an instance
+        // placed mirrored, the sweep starts from the edge the mirror moved — upstream's
+        // "account for macro orientations when placing straps". The core grid never mirrors.
+        let grid_orient = if grid.instance.is_empty() {
+            "R0".to_string()
+        } else {
+            db.inst_get_orient(&grid.instance)
+        };
+        let grid_mirror = vyges_pdn::orient::axis_mirror(&grid_orient);
         let strap_boundary = if grid.instance.is_empty() {
             vyges_pdn::grid::domain_boundary(core, widest_followpin)
         } else {
@@ -3409,7 +3431,7 @@ fn generate(args: &[String]) -> ExitCode {
             match comp {
                 components::Component::Ring(spec) => {
                     let (segments, locked) =
-                        make_ring(&db, spec, &build_nets, core, die, per_micron);
+                        make_ring(&db, spec, &build_nets, core, die, &grid_orient, per_micron);
                     // ⚠️ Not on the retry, for the same reason `strap_sets` is not: our bookkeeping,
                     // recorded once per declaration.
                     if let (Some(layer), false) = (locked, is_retry) {
@@ -3867,6 +3889,7 @@ fn generate(args: &[String]) -> ExitCode {
                             die,
                             strap: strap_boundary,
                             ring: ring_area,
+                            mirror: grid_mirror,
                         },
                         per_micron,
                     );
