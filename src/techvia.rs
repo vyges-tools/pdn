@@ -347,6 +347,21 @@ pub fn class_cut_spacing(cut: Rect, rules: &[SpacingTableRule]) -> Option<(i32, 
     (max_x != 0 && max_y != 0).then_some((max_x, max_y))
 }
 
+/// The enclosures a placement's metal is checked with, per face: this build's own and — where the
+/// name was already defined with a different one — the FOUND definition's too.
+///
+/// 🔑 `DbTechVia::generate` creates the array `dbVia` only when `block->findVia(name)` misses, and
+/// `add_via` measures `getLayerShapes(via)` (the found definition's boxes) together with this
+/// build's `required_{bottom,top}_rect_`. The name carries rows, columns and pitch, not the
+/// enclosure, so the first build of a name decides the metal every later one is checked with.
+pub fn checked_enclosures(own: (i32, i32), found: (i32, i32)) -> Vec<(i32, i32)> {
+    if found == own {
+        vec![own]
+    } else {
+        vec![own, found]
+    }
+}
+
 fn merge(a: Rect, b: Rect) -> Rect {
     (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
@@ -354,6 +369,23 @@ fn merge(a: Rect, b: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── which definition a placement's metal comes from ─────────────────────────────────────
+    //
+    // Witness: `asap7_repair_channel_macro_gap`. `VIA56_3_2_66_58` is first built with M6 spare
+    // (enclosure y 32, face ±114); 48 later crossings build the same name with y 20 (±102). The
+    // reference checks the FOUND ±114 against a 288-wide horizontal M6 stripe it overhangs by 12,
+    // and rips all 48 (PDN-0195).
+
+    #[test]
+    fn a_name_built_again_is_checked_with_the_first_definitions_metal_too() {
+        assert_eq!(checked_enclosures((0, 20), (0, 32)), vec![(0, 20), (0, 32)]);
+    }
+
+    #[test]
+    fn a_name_built_the_same_way_is_checked_once() {
+        assert_eq!(checked_enclosures((0, 32), (0, 32)), vec![(0, 32)]);
+    }
 
     // ── folding a tech via's own cut array ───────────────────────────────────────────────────
     //

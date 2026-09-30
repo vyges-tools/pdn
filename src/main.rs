@@ -5244,6 +5244,14 @@ fn generate(args: &[String]) -> ExitCode {
             (usize, Option<String>, i32, i32),
             Vec<Option<BuiltLevel>>,
         > = std::collections::HashMap::new();
+        // 🔑 **An array tech via's metal is its FIRST definition's, whoever builds it later.**
+        // `DbTechVia::generate` looks the name up with `block->findVia` and creates the `dbVia`
+        // only when it is missing, and `add_via` then measures `getLayerShapes(via)` — the boxes
+        // of the definition FOUND, not of the one this build computed. The name carries rows,
+        // columns and pitch but not the enclosure, so two builds of one name can differ and the
+        // first one's metal is what every placement is checked with. Name -> (bottom, top).
+        let mut tech_via_defs: std::collections::HashMap<String, ((i32, i32), (i32, i32))> =
+            std::collections::HashMap::new();
         let mut placed = placed;
         placed.sort_by_key(|v| {
             (
@@ -6732,18 +6740,12 @@ fn generate(args: &[String]) -> ExitCode {
                     // constrained by nothing and takes minimums on both.
                     let at_bottom_end = level == 0;
                     let at_top_end = level + 2 == stack.len();
-                    let bot_c = if at_bottom_end {
-                        let d = vyges_pdn::viagen::rect_direction(rects[level]);
-                        vyges_pdn::viagen::constraint_for(d, true, false)
-                    } else {
-                        Default::default()
-                    };
-                    let top_c = if at_top_end {
-                        let d = vyges_pdn::viagen::rect_direction(rects[level + 1]);
-                        vyges_pdn::viagen::constraint_for(d, true, false)
-                    } else {
-                        Default::default()
-                    };
+                    // 🔑 **The crossing's own constraints, as on the generate path.** Both
+                    // generators are handed the same `lower_constraint`/`upper_constraint` by
+                    // `Connect::makeVia`, built from the two SHAPES (modifiable, iterms) — not
+                    // re-derived from the level's rect as if every end were modifiable.
+                    let bot_c = if at_bottom_end { ends.0 } else { Default::default() };
+                    let top_c = if at_top_end { ends.1 } else { Default::default() };
                     let span = (
                         (columns - 1) * pitch.0 + cut.0,
                         (rows - 1) * pitch.1 + cut.1,
@@ -6766,6 +6768,52 @@ fn generate(args: &[String]) -> ExitCode {
                         (chosen.bottom, chosen.top)
                     } else {
                         (b, t)
+                    };
+                    // ⛔ **The SPARE pass is SHARED — a tech via takes it too.** It is the tail of
+                    // `ViaGenerator::determineRowsAndColumns`, which `TechViaGenerator` inherits
+                    // unchanged, so a failing end is given the metal outside the intersection
+                    // exactly as on the generate path above.
+                    // 🔑 **Asked against the RULES ONLY.** `checkMinEnclosure` calls
+                    // `getMinimumEnclosures(.., rules_only = true)`, and `TechViaGenerator`'s
+                    // override returns straight after the base call when that is set — the via's
+                    // own margins (the floor) never enter the question.
+                    // Witness: `asap7_repair_channel_macro_gap`'s first 120x204 M5–M6 build —
+                    // reference `Top layer M6 .. spare 13.8480`, VIA56 M6 face 228 tall, ours 204.
+                    let (bot, top) = {
+                        let (spare_b, spare_t) =
+                            vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
+                        let rules_of = |layer: &str, above: bool, shared: Option<i32>| {
+                            enclosure_candidates_with_swap(
+                                &db, &g.cut_layer, cut, area, dir_of(layer), above, None,
+                                split.is_some(), shared,
+                            )
+                        };
+                        let bot_rules = rules_of(lo, false, shared_widths[level]);
+                        let top_rules = rules_of(hi, true, shared_widths[level + 1]);
+                        let spare_for = |built: vyges_pdn::viagen::Enclosure,
+                                         at_end: bool,
+                                         minimum: vyges_pdn::viagen::Enclosure,
+                                         spare: vyges_pdn::viagen::Enclosure,
+                                         rules: &[(vyges_pdn::viagen::Enclosure, bool)],
+                                         c: vyges_pdn::viagen::Constraint| {
+                            if at_end
+                                && (spare.x > 0 || spare.y > 0)
+                                && !vyges_pdn::viagen::enclosure_satisfies(built, rules)
+                            {
+                                vyges_pdn::viagen::built_enclosure(
+                                    false,
+                                    minimum,
+                                    vyges_pdn::viagen::spare_applied(built, minimum, spare),
+                                    c,
+                                )
+                            } else {
+                                built
+                            }
+                        };
+                        (
+                            spare_for(bot, at_bottom_end, chosen.bottom, spare_b, &bot_rules, bot_c),
+                            spare_for(top, at_top_end, chosen.top, spare_t, &top_rules, top_c),
+                        )
                     };
                     let bot = vyges_pdn::viagen::snap_enclosure(bot, grid_mfg);
                     let top = vyges_pdn::viagen::snap_enclosure(top, grid_mfg);
@@ -6999,10 +7047,25 @@ fn generate(args: &[String]) -> ExitCode {
                     // via and offset by the same origin, so it sits at the PLACED point plus
                     // that origin — which is the crossing centre only while nothing snapped.
                     let base_pi = placements.len() - placed_at.len();
+                    // ⚠️ **Two metals per face, both checked.** `add_via` inserts the found
+                    // definition's boxes AND this build's `required_{bottom,top}_rect_` — the
+                    // enclosure it computed — into the same `via_shapes`, and `check_shapes`
+                    // judges each. Witness: `asap7_repair_channel_macro_gap`, where a 120x204
+                    // build with M6 spare named `VIA56_3_2_66_58` first, and 48 later crossings
+                    // built the same name without spare: their M6 face is the first one's ±114,
+                    // 12 past a horizontal stripe, and the reference rips all 48 (PDN-0195).
+                    let (def_bot, def_top) = if is_array && !measuring {
+                        *tech_via_defs.entry(name.clone()).or_insert((bot, top))
+                    } else {
+                        tech_via_defs.get(&name).copied().unwrap_or((bot, top))
+                    };
                     for (k, at) in placed_at.iter().enumerate() {
                         let centre = (at.0 + origin.0, at.1 + origin.1);
-                        via_faces.push((base_pi + k, lo.to_string(), metal_at(centre, bot), area));
-                        via_faces.push((base_pi + k, hi.to_string(), metal_at(centre, top), area));
+                        for (layer, own, found) in [(lo, bot, def_bot), (hi, top, def_top)] {
+                            for enc in vyges_pdn::techvia::checked_enclosures(own, found) {
+                                via_faces.push((base_pi + k, layer.to_string(), metal_at(centre, enc), area));
+                            }
+                        }
                     }
                     // ⚠️ **A split-cut array does NOT require a patch** — `DbSplitCutVia` leaves
                     // `requiresPatch()` at its default however many cuts it places.
