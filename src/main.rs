@@ -139,7 +139,7 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
-const USAGE: &str = concat!(
+const USAGE: &str =
         "usage: vyges-pdn generate <db> --out-def <def> --power <net> --ground <net>\n\
          \x20        [--starts-with power|ground]   (default ground)\n\
          \x20        [--domain <region>:<power>:<ground>]  (per grid; region domain)\n\
@@ -161,8 +161,7 @@ const USAGE: &str = concat!(
          \x20  vyges-pdn --describe | --help | --version\n\
          \n\
          ⚠️ Shapes are emitted BEFORE trimming, which belongs with the via stage. Compare against\n\
-         the reference run with `pdngen -skip_trim`."
-);
+         the reference run with `pdngen -skip_trim`.";
 
 #[derive(Clone)]
 struct Opts {
@@ -1100,6 +1099,7 @@ struct RepairAttempt {
     spacing: i32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_repair_at(
     db: &Db,
     ch: &Channel,
@@ -1867,6 +1867,7 @@ struct StrapBounds {
 /// with the obstructions every earlier component contributed. Returns the set's descriptor (kept
 /// even when the strap builds nothing) and its stripes.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn make_strap(
     db: &Db,
     spec_text: &str,
@@ -2059,6 +2060,7 @@ fn make_strap(
 /// Returns the layer, the set's pitch, and the rails. `None` means the width could not be
 /// determined from the standard cells and none was stated.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn make_followpins(
     db: &Db,
     spec: &str,
@@ -2121,6 +2123,7 @@ fn make_followpins(
 ///
 /// Returns `(net, layer, strap, holding pin)` per strap made — empty when there is nothing to
 /// reach yet, which is exactly what makes the component defer and try again later.
+#[allow(clippy::too_many_arguments)]
 fn make_pad_connection(
     db: &Db,
     opts: &Opts,
@@ -2799,21 +2802,6 @@ fn generate(args: &[String]) -> ExitCode {
     // then appears to grow enormously, the direction guard refuses it, and every via on it is
     // ripped up — and measurably so, on real designs.
     let mut via_faces: Vec<(usize, String, Rect, Rect)> = Vec::new();
-    // 🔑 **A via grows the shape it lands on BEFORE the next crossing is measured.**
-    // `Via::writeToDb` builds one via, merges its metal into the two shapes it touches, and only
-    // then moves to the next via — so a strap reached down by an early via is LONGER by the time a
-    // later connect intersects it, and that later crossing is measured against the longer strap.
-    //
-    // ⚠️ **Not the same thing as the absorb pass below.** That one runs once, after every via
-    // exists, and reproduces the final shapes correctly; what it cannot do is feed a growth back
-    // into a crossing that was measured before it. A rail via reaching an M5 strap 14 units past
-    // its end moves every M5-M6 crossing on that strap by 7, and picks a different via with it.
-    //
-    // ⚠️ Kept SEPARATE from `emitted` on purpose. The reference trims before any of this, so
-    // letting the growth into `emitted` here would hand trimming a strap the reference trims
-    // short and then extends -- see the absorb pass for why the order is the whole of the effect.
-    let mut grown_rects: std::collections::HashMap<(String, String, Rect), Rect> =
-        std::collections::HashMap::new();
 
     // Patch metal left on layers a via stack only passes through, written as DRCFILL.
     //
@@ -2824,6 +2812,7 @@ fn generate(args: &[String]) -> ExitCode {
     // Where each via goes, applied only once the boxes are in — see the note at the placement.
     // Each carries the STACK's two end layers and the stack's own area, which is what decides
     // whether trimming has left it standing.
+    #[allow(clippy::type_complexity)]
     let mut placements: Vec<(String, String, (i32, i32), String, String, Rect)> = Vec::new();
 
     // `(layer, rect)` — the layer matters: a strap avoids only the rings on its OWN layer.
@@ -2907,7 +2896,7 @@ fn generate(args: &[String]) -> ExitCode {
                 vyges_events::Severity::Error,
                 format!("PDN-{:04} {}", d.code, d.message),
             )
-            .with_code(&format!("PDN-{:04}", d.code)),
+            .with_code(format!("PDN-{:04}", d.code)),
         );
         eprintln!("{d}");
         return ExitCode::from(1);
@@ -3100,7 +3089,7 @@ fn generate(args: &[String]) -> ExitCode {
                 let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
                 let h = obstruction_spacing(&db, &l, w, len);
                 out.push((i, l.clone(), (r.0 - h, r.1 - h, r.2 + h, r.3 + h), r));
-                if instance_grid && !layers.iter().any(|x| *x == l) {
+                if instance_grid && !layers.contains(&l) {
                     out.push((i, l, grid_area, grid_area));
                 }
             }
@@ -3162,6 +3151,7 @@ fn generate(args: &[String]) -> ExitCode {
         opts: &'a Opts,
         placed: Vec<vyges_pdn::vias::Via>,
         dropped: Vec<(vyges_pdn::vias::Via, vyges_pdn::vias::Failed)>,
+        #[allow(clippy::type_complexity)]
         fixed: Vec<(
             String,
             String,
@@ -3171,6 +3161,7 @@ fn generate(args: &[String]) -> ExitCode {
         )>,
         on_grid: Vec<((String, String), Vec<String>)>,
         max_cuts: Vec<((String, String), (i32, i32))>,
+        #[allow(clippy::type_complexity)]
         split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)>,
         min_width_by_connect: Vec<((String, String), Vec<String>)>,
         ground: String,
@@ -3308,9 +3299,7 @@ fn generate(args: &[String]) -> ExitCode {
                 .collect();
             (area, nets)
         };
-        let boundary = if grid.instance.is_empty() {
-            core
-        } else if grid.to_boundary {
+        let boundary = if grid.instance.is_empty() || grid.to_boundary {
             core
         } else {
             instance_pin_outline(&db, &grid.instance).unwrap_or(core)
@@ -4403,6 +4392,7 @@ fn generate(args: &[String]) -> ExitCode {
             let mut max_cuts: Vec<((String, String), (i32, i32))> = Vec::new();
             // `-split_cuts`, by layer pair: the layers whose crossings are spread rather than
             // packed, with the pitch and stagger each asks for.
+            #[allow(clippy::type_complexity)]
             let mut split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)> = Vec::new();
             // `-min_width_layers`, by layer pair: the intermediate layers this connect must not
             // widen past their own minimum.
@@ -5240,6 +5230,7 @@ fn generate(args: &[String]) -> ExitCode {
                 area_rel: Rect,
             },
         }
+        #[allow(clippy::type_complexity)]
         let mut stack_cache: std::collections::HashMap<
             (usize, Option<String>, i32, i32),
             Vec<Option<BuiltLevel>>,
@@ -5250,6 +5241,7 @@ fn generate(args: &[String]) -> ExitCode {
         // of the definition FOUND, not of the one this build computed. The name carries rows,
         // columns and pitch but not the enclosure, so two builds of one name can differ and the
         // first one's metal is what every placement is checked with. Name -> (bottom, top).
+        #[allow(clippy::type_complexity)]
         let mut tech_via_defs: std::collections::HashMap<String, ((i32, i32), (i32, i32))> =
             std::collections::HashMap::new();
         let mut placed = placed;
@@ -7381,7 +7373,7 @@ fn generate(args: &[String]) -> ExitCode {
                         &metals,
                         dir,
                         !(emitted[si].3 == "RING" && locked_layers.contains(layer)),
-                        &obstructions,
+                        obstructions,
                     )
                 {
                     emitted[si].2 = g;
@@ -7443,7 +7435,7 @@ fn generate(args: &[String]) -> ExitCode {
                     &[*metal],
                     direction_of(&db, layer),
                     false, // kFixed is never modifiable
-                    &obstructions,
+                    obstructions,
                 ) {
                     if std::env::var_os("PDN_TRACE").is_some() {
                         eprintln!(
@@ -7476,7 +7468,7 @@ fn generate(args: &[String]) -> ExitCode {
             // this engine locks is a SINGLE-LAYER ring — `Rings::makeShapes` calls `setLocked()`
             // just in that case.
             !(emitted[si].3 == "RING" && locked_layers.contains(layer)),
-            &obstructions,
+            obstructions,
         ) {
             vyges_pdn::shapes::ViaCheck::Fits => {}
             vyges_pdn::shapes::ViaCheck::Extend(grown) => {
@@ -7989,7 +7981,7 @@ fn generate(args: &[String]) -> ExitCode {
 ///       - on a do-not-touch net          -> left alone;
 ///       - on some OTHER net, without force -> counted as a CONFLICT and skipped;
 ///       - otherwise                      -> connect, and `setSpecial()` on the iterm when the
-///                                           net is special.
+///         net is special.
 ///
 /// ⛔ **`std::regex_match` is a FULL match; Rust's `is_match` is a SEARCH.** Both patterns are
 /// therefore anchored here. Leaving them unanchored would make `-pin_pattern {^VDD$}` behave the

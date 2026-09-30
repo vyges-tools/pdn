@@ -86,6 +86,8 @@ pub fn locations(
 }
 
 #[cfg(test)]
+// The arithmetic is written out as the rule reads (`4500 - 4500 % 20`, `at + 0`).
+#[allow(clippy::identity_op)]
 mod tests {
     use super::*;
 

@@ -753,6 +753,8 @@ pub fn techvia_snap_sources(upper_is_vertical: bool) -> (bool, bool) {
 }
 
 #[cfg(test)]
+// Test names carry the rule's emphasis in CAPITALS, as the reference comments do.
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 
@@ -1361,7 +1363,7 @@ mod tests {
             let y = rng.in_range(-5_000, 100_000);
             // ⚠️ A deliberate mix of sizes: pin-sized rects, and a few far larger than a cell so
             // the `oversized` path is exercised rather than merely present.
-            let (w, h) = if rng.next() % 50 == 0 {
+            let (w, h) = if rng.next().is_multiple_of(50) {
                 (rng.in_range(20_000, 60_000), rng.in_range(20_000, 60_000))
             } else {
                 (rng.in_range(0, 400), rng.in_range(0, 400))

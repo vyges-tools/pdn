@@ -67,6 +67,7 @@ pub(crate) fn followpin_width(db: &Db) -> Option<i32> {
 /// both, and the choice is made across all of them rather than by preferring one source. Where
 /// neither says anything the only candidate is zero, which is why some vias legitimately carry no
 /// overhang at all.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn enclosure_candidates_with_swap(
     db: &Db,
     cut_layer: &str,
@@ -169,8 +170,7 @@ pub(crate) fn enclosure_candidates_with_swap(
     };
     if let Some((_, chosen)) = buckets
         .iter()
-        .filter(|(w, _)| **w <= shape_width)
-        .next_back()
+        .rfind(|(w, _)| **w <= shape_width)
     {
         out.extend(chosen.iter().copied());
     }
@@ -184,6 +184,7 @@ pub(crate) fn enclosure_candidates_with_swap(
 }
 
 /// The enclosure candidates alone, which is what the selection compares.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn enclosure_candidates(
     db: &Db,
     cut_layer: &str,
@@ -401,7 +402,7 @@ pub(crate) fn macro_outlines(db: &Db) -> Vec<(String, Rect)> {
         let outline = (b[0], b[1], b[2], b[3]);
         let master = db.inst_get_master(&inst);
         let mut layers: Vec<String> = Vec::new();
-        let mut note = |layers: &mut Vec<String>, n: String| {
+        let note = |layers: &mut Vec<String>, n: String| {
             if !layers.contains(&n) {
                 layers.push(n);
             }
@@ -437,7 +438,7 @@ pub(crate) fn instance_has_supply(db: &Db, inst: &str, nets: &[String]) -> bool 
     let master = db.inst_get_master(inst);
     db.master_get_m_terms(&master).into_iter().any(|term| {
         let net = db.iterm_get_net(inst, &term);
-        !net.is_empty() && nets.iter().any(|n| *n == net)
+        !net.is_empty() && nets.contains(&net)
     })
 }
 
@@ -721,7 +722,7 @@ pub(crate) fn pad_connections(
         );
         for term in db.master_get_m_terms(&master) {
             let net = db.iterm_get_net(&inst, &term);
-            if net.is_empty() || !nets.iter().any(|n| *n == net) {
+            if net.is_empty() || !nets.contains(&net) {
                 continue;
             }
             // ⚠️ **ROUTING layers only**, and filtered to the layers the flag named where it did.
@@ -733,7 +734,7 @@ pub(crate) fn pad_connections(
                 .filter(|(l, ..)| {
                     let name = db.layer_name_by_number(*l);
                     db.layer_get_type(&name).unwrap_or_default() == "ROUTING"
-                        && (layers.is_empty() || layers.iter().any(|k| *k == name))
+                        && (layers.is_empty() || layers.contains(&name))
                 })
                 .map(|(_, x0, y0, x1, y1)| (x0, y0, x1, y1))
                 .collect();
@@ -746,7 +747,7 @@ pub(crate) fn pad_connections(
                     if db.layer_get_type(&name).unwrap_or_default() != "ROUTING" {
                         return None;
                     }
-                    if !layers.is_empty() && !layers.iter().any(|k| *k == name) {
+                    if !layers.is_empty() && !layers.contains(&name) {
                         return None;
                     }
                     let direction = direction_of(db, &name);

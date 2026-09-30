@@ -893,6 +893,8 @@ mod tests {
 }
 
 #[cfg(test)]
+// Test names carry the rule's emphasis in CAPITALS, as the reference comments do.
+#[allow(non_snake_case)]
 mod cut_sequence_tests {
     use super::*;
 

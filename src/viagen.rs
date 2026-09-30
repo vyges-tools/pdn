@@ -1475,6 +1475,8 @@ pub fn array_placements(fit: &ArrayFit, cut: (i32, i32)) -> Vec<ArrayPlacement> 
 }
 
 #[cfg(test)]
+// Test names carry the rule's emphasis in CAPITALS, as the reference comments do.
+#[allow(non_snake_case)]
 mod tests {
     use super::*;
 
@@ -2129,7 +2131,7 @@ mod tests {
             cut_class: None,
         };
         assert!(
-            !check_min_cuts(&[below.clone()], None, 100, 4, true),
+            !check_min_cuts(std::slice::from_ref(&below), None, 100, 4, true),
             "applies below"
         );
         assert!(
@@ -2148,7 +2150,7 @@ mod tests {
             cut_class: Some("VA".into()),
         };
         assert!(
-            check_min_cuts(&[r.clone()], Some("VB"), 100, 1, true),
+            check_min_cuts(std::slice::from_ref(&r), Some("VB"), 100, 1, true),
             "different class"
         );
         assert!(
@@ -2171,15 +2173,15 @@ mod tests {
             cut_class: None,
         };
         assert!(
-            check_min_cuts(&[r.clone()], None, 20000, 36, false),
+            check_min_cuts(std::slice::from_ref(&r), None, 20000, 36, false),
             "36 vias against a need of 2"
         );
         assert!(
-            check_min_cuts(&[r.clone()], None, 20000, 21, false),
+            check_min_cuts(std::slice::from_ref(&r), None, 20000, 21, false),
             "the other observed count"
         );
         // ⚠️ The same rule on the layer BELOW does not apply, because it is an `above` rule.
-        assert!(check_min_cuts(&[r.clone()], None, 20000, 1, true));
+        assert!(check_min_cuts(std::slice::from_ref(&r), None, 20000, 1, true));
         // ⚠️ And it would reject a via with too few cuts, which the suite never exercises.
         assert!(!check_min_cuts(&[r], None, 20000, 1, false));
     }
