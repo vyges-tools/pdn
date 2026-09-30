@@ -172,6 +172,7 @@ pub fn determine_offset(
     manufacturing_grid: i32,
     clear: &dyn Fn(Rect) -> bool,
 ) -> Option<i32> {
+    #[allow(clippy::too_many_arguments)]
     fn search(
         available: Rect,
         vertical: bool,

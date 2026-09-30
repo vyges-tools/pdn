@@ -67,6 +67,7 @@ pub fn determine_width(boxes: &[(bool, bool, bool, i32)]) -> Option<i32> {
 /// on the core's**, tested by equality. A row starting one unit inside the core keeps its own edge,
 /// so a design whose rows are inset by any amount gets no extension at all — this is not a
 /// tolerance, it is an identity.
+#[allow(clippy::too_many_arguments)]
 pub fn make(
     layer: &str,
     power: &str,

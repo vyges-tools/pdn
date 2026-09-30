@@ -585,7 +585,7 @@ pub struct CutClass {
 ///
 /// ⚠️ **The first match wins** and the search stops, so the order the technology declares its
 /// classes in decides the answer where two could match.
-pub fn cut_class<'a>(classes: &'a [CutClass], cut: (i32, i32)) -> Option<&'a CutClass> {
+pub fn cut_class(classes: &[CutClass], cut: (i32, i32)) -> Option<&CutClass> {
     classes.iter().find(|r| {
         let length = r.length.unwrap_or(r.width);
         (cut.0 == length && cut.1 == r.width) || (cut.0 == r.width && cut.1 == length)
@@ -1149,11 +1149,11 @@ fn connected_groups(rects: &[crate::Rect]) -> Vec<Vec<crate::Rect>> {
         }
     }
     let mut groups: Vec<(usize, Vec<crate::Rect>)> = Vec::new();
-    for i in 0..rects.len() {
+    for (i, &rect) in rects.iter().enumerate() {
         let root = find(&mut owner, i);
         match groups.iter_mut().find(|(r, _)| *r == root) {
-            Some((_, v)) => v.push(rects[i]),
-            None => groups.push((root, vec![rects[i]])),
+            Some((_, v)) => v.push(rect),
+            None => groups.push((root, vec![rect])),
         }
     }
     groups.into_iter().map(|(_, v)| v).collect()

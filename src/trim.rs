@@ -212,6 +212,7 @@ pub fn shift_inside(shape: Rect, want: Rect, direction: Direction) -> Rect {
 ///
 /// ⚠️ **A pin layer is never modified**, only removed — a pin's shape is its contract with whatever
 /// connects from outside.
+#[allow(clippy::too_many_arguments)]
 pub fn decide(
     shape: Rect,
     min_rect: Option<Rect>,
