@@ -88,10 +88,10 @@ const DESCRIBE: &str = r#"{
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "MEASURED 2026-09-03 against the upstream pdn goldens at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34: 106 of 114 comparable cases exact on shapes, vias and block terminals, of 151 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
-    "Of the 8 failures, SIX are cases upstream added in the same window and this engine has never supported: core_grid_mirrored_rows, core_grid_multiheight_rows, core_grid_multiheight_rows_pitch, core_grid_multiheight_site_order, stacked_via_merged_enclosure and pads_ihp_sg13g2_balance. HYBRID AND MULTI-HEIGHT ROWS are the gap they name. Only TWO are regressions against goldens upstream changed: pads_black_parrot_flipchip_connect_overpads and power_switch_cut_rows.",
-    "The previous reading was 104 of 104 at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c on 2026-08-30. An earlier `110 of 110` carried in this descriptor was NOT reproducible and is withdrawn.",
-    "36 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 29 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
+    "MEASURED 2026-09-30 against the upstream pdn goldens at pin da9f29f18b6487825aa880597176e0fa97110b31: 130 of 130 comparable cases exact on shapes, vias and block terminals, of 168 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
+    "No comparable case fails at that pin. The eight the previous reading failed -- hybrid and multi-height rows, mirrored rows, a merged stacked-via enclosure, a pad balance case, over-pad connections and power-switch cut rows -- all match.",
+    "Previous readings: 106 of 114 at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34 on 2026-09-03; 104 of 104 at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c on 2026-08-30. An earlier `110 of 110` carried in this descriptor was NOT reproducible and is withdrawn.",
+    "38 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 30 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch and 1 its -instances in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
     "Diagnostics implemented so far: PDN-0003, 0004, 0005 (connect rules), 0106, 0107, 0108, 0114, 0117, 0118, 0191 (argument validation), 0185 and 0215 (runtime). A case whose golden names any other code is skipped with that code named, never silently passed.",
     "status is one of generated, vacuous or error. VACUOUS IS NOT GENERATED: it means the run laid no metal at all, and this assertion passes only on generated, so a no-op fails it rather than reporting a grid that was never built. Zero can still be the right answer for the design; read shapes and decide.",
     "The engine validates inside the ordinary build path, as the reference does inside addRing and addStrap, so every design it accepts has passed those checks too -- the diagnostics are not a separate check mode.",
@@ -146,8 +146,10 @@ const USAGE: &str =
          \x20        [--followpins <layer>[:<extend>[:<width>]]]   (micron, repeatable)\n\
          \x20        [--stripe <layer>:<width>:<pitch>:<offset>[:<extend>[:<count>[:<snap>[:<spacing>]]]]]\n\
          \x20        [--ring <layer0>,<layer1>:<width>:<spacing>:<offset>[:boundary]]\n\
+         \x20        [--connect <layer0>,<layer1>[:<via>[+<via>...][:...]]]   (repeatable)\n\
          \x20        [--pins <layer>[,<layer>...]]  (shapes there are never shrunk)\n\
          \x20        [--split-cuts <layer>:<pitch>[:stagger]]   (micron, repeatable)\n\
+         \x20        [--trim 0|1]   (default 0: shapes are written untrimmed)\n\
          \n\
          \x20  vyges-pdn global-connect <db> --connect NET:PINPAT:INSTPAT:power|ground|signal\n\
          \x20        [--connect ...]  [--force]  [--out-odb FILE]\n\
@@ -160,8 +162,9 @@ const USAGE: &str =
          \n\
          \x20  vyges-pdn --describe | --help | --version\n\
          \n\
-         ⚠️ Shapes are emitted BEFORE trimming, which belongs with the via stage. Compare against\n\
-         the reference run with `pdngen -skip_trim`.";
+         ⚠️ Without `--trim 1`, shapes are emitted BEFORE trimming: each keeps its full built\n\
+         extent, and one that nothing connects to is kept rather than removed. Compare such a run\n\
+         against the reference run with `pdngen -skip_trim`.";
 
 #[derive(Clone)]
 struct Opts {

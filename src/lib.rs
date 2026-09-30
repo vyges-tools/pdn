@@ -12,6 +12,9 @@
 //!   comparison meaningless.
 //! - **[`straps`]** — the repeating stripes that carry power across the die, one per net at each
 //!   step of a pitch. The bulk of a grid by area and by shape count.
+//! - **[`orient`]** — placing a macro's geometry where its instance sits. A macro grid is stated
+//!   against the macro as drawn, so on a mirrored instance the straps step from the other edge and
+//!   the ring offsets follow the edges they face once placed.
 //! - **[`followpins`]** — the rails along every standard-cell row. Not laid on a pitch of their
 //!   own: the rows decide where they go, and they take their width from the cells themselves.
 //! - **[`grid`]** — the order the components of a grid are built in, the one retry a component
@@ -23,6 +26,8 @@
 //!   the next test sees.
 //! - **[`viagen`]** — which via to build there. Two preference orders that look alike, are spelled
 //!   alike, and run in opposite directions: enclosures pick the smallest, generators the largest.
+//! - **[`techvia`]** — vias the technology already declares, fitted to a crossing with the same
+//!   row, column and enclosure machinery as a generated via.
 //! - **[`validate`]** — the checks a component's stated dimensions must pass to be accepted at
 //!   all. Run when the component is declared rather than when the grid is built, and the FIRST
 //!   rule to fire is the whole answer.
