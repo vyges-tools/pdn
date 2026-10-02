@@ -789,9 +789,24 @@ struct Channel {
     nets: Vec<String>,
     /// The layer that was left unconnected, and the one the repair straps go on.
     connect_to: String,
+    /// The direction the orphaned layer runs in, as the repair asks it: the grid's own strap
+    /// component on that layer (the last one; a follow pin runs along the rows), else the layer's
+    /// LEF direction — unset counting as horizontal.
+    connect_direction: Direction,
     target_layer: String,
     target_width: i32,
     target_spacing: i32,
+}
+
+/// The direction a repair channel's orphaned layer runs in (the `RepairChannelStraps` constructor):
+/// its LEF direction, replaced by the direction of the grid's last strap component on the layer
+/// (a follow pin runs along the rows, horizontally; a strap runs its layer's LEF way); unset counts
+/// as horizontal.
+fn repaired_layer_direction(last_component: Option<&str>, lef: Direction) -> Direction {
+    match (last_component, lef) {
+        (Some("FOLLOWPIN"), _) | (_, Direction::None) => Direction::Horizontal,
+        (_, d) => d,
+    }
 }
 
 /// **Stage 6f, part one** — `RepairChannelStraps::findRepairChannels`.
@@ -1008,6 +1023,14 @@ fn find_channels(
                 obs,
                 nets,
                 connect_to: layer.clone(),
+                connect_direction: repaired_layer_direction(
+                    grid_emitted
+                        .iter()
+                        .filter(|(_, l, _, k)| *l == layer && matches!(*k, "FOLLOWPIN" | "STRIPE" | "REPAIR"))
+                        .last()
+                        .map(|(_, _, _, k)| *k),
+                    direction_of(db, &layer),
+                ),
                 target_layer: target_layer.clone(),
                 target_width,
                 target_spacing,
@@ -1117,7 +1140,11 @@ fn build_repair_at(
     let horizontal = direction_of(db, &ch.target_layer) == Direction::Horizontal;
     // ⚠️ **A repair strap must cross what it repairs.** Two layers running the same way never
     // meet, so the channel is rejected rather than filled with parallel metal.
-    if direction_of(db, &ch.connect_to) == direction_of(db, &ch.target_layer) {
+    // Rule (the RepairChannelStraps constructor): the repaired layer's direction is its GRID
+    // COMPONENT's — follow pins run along the rows whatever the LEF says — and the repair strap's
+    // is its layer's LEF direction. IHP's Metal1 is declared vertical and repaired as follow pins.
+    if ch.connect_direction == direction_of(db, &ch.target_layer) {
+        trace("Channel", &format!("repair rejected: {} and {} run the same way", ch.connect_to, ch.target_layer));
         return None;
     }
     let vertical = !horizontal;
@@ -1233,6 +1260,7 @@ fn build_repair_at(
             continue;
         }
         if width <= min_width {
+            trace("Channel", &format!("repair rejected: no offset clears at any width down to {width} (area width {area_width})"));
             return None;
         }
         width = vyges_pdn::channels::next_width(width, min_width, grid_mfg);
@@ -1274,6 +1302,7 @@ fn build_repair_at(
         out.push((net.clone(), rect));
     }
     if out.is_empty() {
+        trace("Channel", &format!("repair rejected: every strap at offset {offset} lies outside the die"));
         return None;
     }
     let settled = width;
@@ -8391,5 +8420,21 @@ mod maturity_guard {
                 "`{m}` is not a legal maturity; an unrecognised one suppresses the verdict");
         assert!(!v["provenance_limitations"].as_array().expect("required").is_empty(),
                 "provenance_limitations is required and states what the hash does not cover");
+    }
+}
+
+#[cfg(test)]
+mod channel_direction_tests {
+    use super::{repaired_layer_direction, Direction};
+
+    // Rule (RepairChannelStraps constructor): the repaired layer runs as its grid component does —
+    // follow pins horizontally, whatever the LEF says; a strap as its LEF direction; unset is
+    // horizontal. (IHP declares Metal1 vertical; its follow pins are repaired by vertical Metal5.)
+    #[test]
+    fn a_repaired_layer_runs_as_its_grid_component_does() {
+        assert_eq!(repaired_layer_direction(Some("FOLLOWPIN"), Direction::Vertical), Direction::Horizontal);
+        assert_eq!(repaired_layer_direction(Some("STRIPE"), Direction::Vertical), Direction::Vertical);
+        assert_eq!(repaired_layer_direction(None, Direction::Vertical), Direction::Vertical);
+        assert_eq!(repaired_layer_direction(Some("STRIPE"), Direction::None), Direction::Horizontal);
     }
 }
