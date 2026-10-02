@@ -638,6 +638,147 @@ fn validate_grids(
 /// ⚠️ **A switched domain has three, not two.** The count decides how far a ring keep-out reaches
 /// and what a strap set's derived spacing is, so one net too few moves geometry rather than just
 /// miscounting.
+/// The nets a grid builds (`Grid::getNets`): its region domain's, else the nets its macro is wired
+/// to, else the block's.
+fn grid_nets(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> Vec<String> {
+    if let Some(spec) = o.one("domain") {
+        let f: Vec<&str> = spec.split(':').collect();
+        let mut nets = vec![f.get(1).unwrap_or(&"").to_string(), f.get(2).unwrap_or(&"").to_string()];
+        if let Some(sw) = f.get(4).filter(|s| !s.is_empty()) {
+            nets.push(sw.to_string());
+        }
+        nets.extend(f.get(3).unwrap_or(&"").split(',').filter(|x| !x.is_empty()).map(str::to_string));
+        return nets;
+    }
+    if !g.instance.is_empty() {
+        let master = db.inst_get_master(&g.instance);
+        let connected: Vec<String> = db
+            .master_get_m_terms(&master)
+            .iter()
+            .map(|term| db.iterm_get_net(&g.instance, term))
+            .filter(|n| !n.is_empty())
+            .collect();
+        return build_nets.iter().filter(|n| connected.contains(n)).cloned().collect();
+    }
+    build_nets.to_vec()
+}
+
+/// `Grid::checkSetup`, per grid in declaration order, at `pdngen` — after every declaration.
+///
+/// Rules, in the reference's order:
+/// - ⚠️ a grid with NO follow pins is not checked at all (the function returns first);
+/// - the follow-pin connects are those joining two follow-pin layers: none among several follow
+///   pins is PDN-0192; fewer than one per gap is PDN-0193; two that overlap (raw layer numbers,
+///   the lower-starting first) is PDN-0194;
+/// - a `-pins` layer no ring or strap of the grid uses is PDN-0111;
+/// - a connect whose lower layer (PDN-0112), then upper (PDN-0113), holds no shape — the grid's
+///   rings and straps, the fixed instances' pins on its nets, the power-switch cells' pins, its
+///   nets' special wires and their FIXED block pins — in declaration order.
+fn check_setup(db: &Db, grids: &[(GridSpec, Opts)], build_nets: &[String], all_insts: &[String]) -> Option<validate::Diag> {
+    let layer_of = |spec: &str| spec.split(':').next().unwrap_or("").to_string();
+    for (g, o) in grids {
+        let mut fp: Vec<String> = o.all("followpins").iter().map(|s| layer_of(s)).collect();
+        fp.sort_by_key(|l| db.layer_get_number(l));
+        fp.dedup();
+        if fp.is_empty() {
+            continue;
+        }
+        let connects: Vec<(String, String)> = o
+            .all("connect")
+            .iter()
+            .filter_map(|spec| spec.split(':').next().and_then(|p| p.split_once(',')))
+            .map(|(a, b)| {
+                // `Connect` orders its pair by routing level: layer0 is the lower.
+                if routing_level(db, a) <= routing_level(db, b) { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) }
+            })
+            .collect();
+        let mut fp_connects: Vec<&(String, String)> = Vec::new();
+        for lower in &fp {
+            for c in connects.iter().filter(|c| &c.0 == lower) {
+                if fp.contains(&c.1) && !fp_connects.contains(&c) {
+                    fp_connects.push(c);
+                }
+            }
+        }
+        if fp.len() > 1 && fp_connects.is_empty() {
+            return Some(validate::Diag { code: 192, message: format!("There are multiple ({}) followpin definitions in {}, but no connect statements between them.", fp.len(), g.name) });
+        }
+        if fp.len() - 1 != fp_connects.len() {
+            return Some(validate::Diag { code: 193, message: format!("There are only ({}) followpin connect statements when {} is/are required.", fp_connects.len(), fp.len() - 1) });
+        }
+        let num = |l: &str| db.layer_get_number(l);
+        for c0 in &fp_connects {
+            for c1 in &fp_connects {
+                if c0 == c1 {
+                    continue;
+                }
+                let (mut a, mut b) = (*c0, *c1);
+                if (routing_level(db, &a.0), routing_level(db, &a.1)) > (routing_level(db, &b.0), routing_level(db, &b.1)) {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let overlaps = |x: &(String, String), y: &(String, String)| {
+                    if num(&x.0) < num(&y.0) { num(&x.1) >= num(&y.0) } else { num(&y.1) >= num(&x.0) }
+                };
+                if overlaps(a, b) || overlaps(b, a) {
+                    return Some(validate::Diag { code: 194, message: format!("Connect statements for followpins overlap between layers: {} -> {} and {} -> {}", a.0, a.1, b.0, b.1) });
+                }
+            }
+        }
+        let mut check: Vec<String> = o.all("ring").iter().flat_map(|s| layer_of(s).split(',').map(str::to_string).collect::<Vec<_>>()).collect();
+        check.extend(o.all("stripe").iter().map(|s| layer_of(s)));
+        check.extend(fp.iter().cloned());
+        for pin in o.all("pins").iter().flat_map(|s| s.split(',')).filter(|s| !s.is_empty()) {
+            if !check.iter().any(|l| l == pin) {
+                return Some(validate::Diag { code: 111, message: format!("Pin layer {pin} is not a valid shape in {}", g.name) });
+            }
+        }
+        let nets = grid_nets(db, o, g, build_nets);
+        let insts: Vec<String> = if g.instance.is_empty() { all_insts.to_vec() } else { vec![g.instance.clone()] };
+        for inst in insts.iter().filter(|i| db.inst_is_fixed(i)) {
+            let master = db.inst_get_master(inst);
+            for term in db.master_get_m_terms(&master) {
+                if nets.contains(&db.iterm_get_net(inst, &term)) {
+                    for (l, ..) in db.mterm_pin_boxes(&master, &term).unwrap_or_default() {
+                        check.push(db.layer_name_by_number(l));
+                    }
+                }
+            }
+        }
+        if let Some(sw) = o.one("power-switch").filter(|s| !s.is_empty()) {
+            let cell = sw.split(':').next().unwrap_or("");
+            for term in db.master_get_m_terms(cell) {
+                for (l, ..) in db.mterm_pin_boxes(cell, &term).unwrap_or_default() {
+                    check.push(db.layer_name_by_number(l));
+                }
+            }
+        }
+        for net in &nets {
+            for (l, ..) in db.net_swire_shapes(net).unwrap_or_default() {
+                check.push(db.layer_name_by_number(l));
+            }
+            for bterm in db.net_bterms(net) {
+                for pin in 0..db.num_bterm_get_b_pins(&bterm) {
+                    if !matches!(db.bpin_get_placement_status(&bterm, pin).as_str(), "FIRM" | "LOCKED" | "COVER") {
+                        continue;
+                    }
+                    for (l, ..) in db.bpin_layer_boxes(&bterm, pin).unwrap_or_default() {
+                        check.push(db.layer_name_by_number(l));
+                    }
+                }
+            }
+        }
+        for (lower, upper) in &connects {
+            if !check.contains(lower) {
+                return Some(validate::Diag { code: 112, message: format!("Cannot find shapes to connect to on {lower}") });
+            }
+            if !check.contains(upper) {
+                return Some(validate::Diag { code: 113, message: format!("Cannot find shapes to connect to on {upper}") });
+            }
+        }
+    }
+    None
+}
+
 fn grid_net_count(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> i32 {
     if let Some(spec) = o.one("domain") {
         let f: Vec<&str> = spec.split(':').collect();
@@ -2359,6 +2500,25 @@ fn generate(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // `set_voltage_domain -region <name>` (the VoltageDomain constructor), before any grid: the
+    // region must be exactly one rectangle — none is PDN-0103, several PDN-0104. It runs for every
+    // region domain the script declares, whether or not a grid claims it.
+    for region in opts.all("region-domain") {
+        let n = db.region_boundaries(region).unwrap_or_default().len();
+        let d = match n {
+            0 => Some(vyges_pdn::validate::Diag { code: 103, message: format!("{region} region must have a shape.") }),
+            1 => None,
+            _ => Some(vyges_pdn::validate::Diag { code: 104, message: format!("{region} region contains {n} shapes, but only one is supported.") }),
+        };
+        if let Some(d) = d {
+            vyges_events::emit(
+                &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
+                    .with_code(format!("PDN-{:04}", d.code)),
+            );
+            eprintln!("{d}");
+            return ExitCode::from(1);
+        }
+    }
 
     let per_micron = db.block_get_def_units() as f64;
     let core = area(&db, true);
@@ -2914,7 +3074,8 @@ fn generate(args: &[String]) -> ExitCode {
 
     // ── what the technology allows a component to state ─────────────────────────────────────
     // 🔑 **Before anything is built, and the first violation ends the run.** See `validate_grids`.
-    if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron, core) {
+    let setup = || check_setup(&db, &grids, &build_nets, &db.block_get_insts());
+    if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron, core).or_else(setup) {
         // 🔑 **One site, every diagnostic.** `Diag` already carries the reference's own code and
         // wording (PDN-0003/0004/0005, 0106/0107/0108/0114/0117/0118/0191, 0185, 0215), and its
         // `Display` renders upstream's exact `[ERROR PDN-0106] ...` line. Routing it here puts all
@@ -3245,8 +3406,8 @@ fn generate(args: &[String]) -> ExitCode {
         // is then measured against the region's own rectangle rather than the die core, and its
         // supply nets are the domain's, not the block's.
         //
-        // ⚠️ **A region may be several boxes** — DEF allows a non-rectangular region — so the area
-        // is their union. Taking the first silently shrinks the grid.
+        // ⚠️ **A region of several boxes never gets here**: the domain refuses it up front
+        // (PDN-0104, `--region-domain`). The union below is what one box reduces to.
         let region_domain: Option<(Rect, nets::Domain)> = opts.one("domain").and_then(|spec| {
             let mut f = spec.split(':');
             let name = f.next().unwrap_or("");
