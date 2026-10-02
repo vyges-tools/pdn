@@ -1112,6 +1112,7 @@ fn intersect_rect(a: Rect, b: Rect) -> Option<Rect> {
 }
 
 /// One region the grid failed to connect, with everything needed to fill it.
+#[derive(Clone)]
 struct Channel {
     /// The orphaned shapes' region, grown to cover every one of them.
     area: Rect,
@@ -1380,68 +1381,86 @@ fn connects_between(_db: &Db, _lower: &str, _upper: &str) -> bool {
     false
 }
 
-/// **Stage 6f, part two** — build the straps for one channel.
-///
-/// `determineParameters`: try the target strap's own width and spacing; then relax the spacing to
-/// the layer's minimum for that width; then halve the width until something fits or the layer's
-/// minimum width is reached.
-#[allow(clippy::type_complexity)]
-/// **Stage 6f, one channel** — `determineParameters`, then `testBuild`, then narrow once and retry.
-///
-/// 🔑 **Two questions, not one.** `determineParameters` asks whether a group of this width FITS
-/// clear of obstructions somewhere in the channel, looking only at `obs_check_area_` — the along
-/// axis narrowed to where the orphans are. `testBuild` then asks whether the strap SURVIVES the
-/// cut, which sees its whole length. The two legitimately disagree, and that disagreement is the
-/// only reason the reference ever ends up narrower than its own search said it could be.
-///
-/// ⚠️ **Once, not until it fits.** The reference narrows a single time at this call site; the loop
-/// inside `determineParameters` is a different loop, and running them together would narrow past
-/// what the reference produces.
-///
-/// ℹ️ A third attempt with snapping switched off follows in the reference. Not built: no case in
-/// the suite reaches it, and every strap here is on a track either way.
-fn build_repair(
+/// The layer's spacing for a strap of `width` (`TechLayer::getSpacing(width, max_length)`).
+fn repair_spacing(db: &Db, layer: &str, width: i32, max_length: i32) -> i32 {
+    db.layer_find_v55_spacing(layer, width, max_length).unwrap_or(0).max(db.layer_get_spacing(layer))
+}
+
+/// A repair strap set as the grid holds it (`RepairChannelStraps`): the channel it was made for
+/// (its area, available area and orphan extent never change), the nets it carries, the width and
+/// spacing it is at, whether it snaps to tracks, and its shapes, by index into `emitted`.
+struct RepairStrap {
+    ch: Channel,
+    width: i32,
+    spacing: i32,
+    snap: bool,
+    shapes: Vec<usize>,
+    /// `setStrapStartEnd`: the area's extent at first, then — after every cut that leaves
+    /// something — the merged extent of what survived (`RepairChannelStraps::cutShapes`). A rebuild
+    /// starts from it, so a narrower strap never reaches back past where a wider one was cut.
+    span: (i32, i32),
+}
+
+impl RepairStrap {
+    /// The channel as the next build sees it: the strap's own start and end along its layer.
+    fn build_channel(&self, vertical: bool) -> Channel {
+        let mut c = self.ch.clone();
+        if vertical {
+            c.area.1 = self.span.0;
+            c.area.3 = self.span.1;
+        } else {
+            c.area.0 = self.span.0;
+            c.area.2 = self.span.1;
+        }
+        c
+    }
+
+    /// After a build that left pieces: start and end at their merged extent.
+    fn settle_span(&mut self, straps: &[(String, Rect)], vertical: bool) {
+        if straps.is_empty() {
+            return;
+        }
+        let lo = straps.iter().map(|(_, r)| if vertical { r.1 } else { r.0 }).min().unwrap();
+        let hi = straps.iter().map(|(_, r)| if vertical { r.3 } else { r.2 }).max().unwrap();
+        self.span = (lo, hi);
+    }
+}
+
+impl RepairStrap {
+    /// `isAtEndOfRepairOptions`: at the layer's minimum width, at no more than its spacing.
+    fn at_end(&self, db: &Db, max_length: i32) -> bool {
+        let min_width = db.layer_get_min_width(&self.ch.target_layer) as i32;
+        self.width == min_width && self.spacing <= repair_spacing(db, &self.ch.target_layer, self.width, max_length)
+    }
+
+    /// `continueRepairs`' step: the next width while there is one (the spacing kept), else the
+    /// layer's spacing at the minimum width. `determineParameters` then starts from these.
+    fn next_options(&self, db: &Db, max_length: i32, grid_mfg: i32) -> (i32, i32) {
+        let min_width = db.layer_get_min_width(&self.ch.target_layer) as i32;
+        if self.width > min_width {
+            (vyges_pdn::channels::next_width(self.width, min_width, grid_mfg), self.spacing)
+        } else {
+            (self.width, repair_spacing(db, &self.ch.target_layer, min_width, max_length))
+        }
+    }
+}
+
+/// `testBuild` from `determineParameters` at the given width and spacing: the surviving straps and
+/// the parameters it settled on; `None` when no width fits (`invalid_`).
+#[allow(clippy::too_many_arguments)]
+fn test_build(
     db: &Db,
     ch: &Channel,
+    width: i32,
+    spacing: i32,
+    snap: bool,
     emitted: &[(String, String, Rect, &'static str)],
     blockages: &[(String, Rect, Option<String>, Rect)],
     core: Rect,
     die: Rect,
     grid_mfg: i32,
-) -> Option<(Vec<(String, Rect)>, i32, i32)> {
-    let first = build_repair_at(
-        db,
-        ch,
-        ch.target_width,
-        ch.target_spacing,
-        emitted,
-        blockages,
-        core,
-        die,
-        grid_mfg,
-    )?;
-    if !first.straps.is_empty() {
-        return Some((first.straps, first.width, first.spacing));
-    }
-    // ⚠️ `isAtEndOfRepairOptions` — nothing narrower to try.
-    let min_width = db.layer_get_min_width(&ch.target_layer) as i32;
-    if first.width <= min_width {
-        return None;
-    }
-    let next = vyges_pdn::channels::next_width(first.width, min_width, grid_mfg);
-    let max_length = if direction_of(db, &ch.target_layer) == Direction::Horizontal {
-        core.2 - core.0
-    } else {
-        core.3 - core.1
-    };
-    let spacing = db
-        .layer_find_v55_spacing(&ch.target_layer, next, max_length)
-        .unwrap_or(0)
-        .max(db.layer_get_spacing(&ch.target_layer));
-    let second = build_repair_at(
-        db, ch, next, spacing, emitted, blockages, core, die, grid_mfg,
-    )?;
-    (!second.straps.is_empty()).then_some((second.straps, second.width, second.spacing))
+) -> Option<RepairAttempt> {
+    build_repair_at(db, ch, width, spacing, snap, emitted, blockages, core, die, grid_mfg)
 }
 
 /// What one `determineParameters` + `testBuild` attempt produced.
@@ -1463,6 +1482,7 @@ fn build_repair_at(
     ch: &Channel,
     start_width: i32,
     start_spacing: i32,
+    snap: bool,
     emitted: &[(String, String, Rect, &'static str)],
     blockages: &[(String, Rect, Option<String>, Rect)],
     core: Rect,
@@ -1609,7 +1629,8 @@ fn build_repair_at(
     let mut pos = offset;
     let mut next_minimum_track = i32::MIN;
     for net in &ch.nets {
-        let group_pos = vyges_pdn::vias::snap_to_grid(pos, &grid_axis, next_minimum_track);
+        // `setSnapToGrid(false)` — the last attempt — lays the strap where the offset puts it.
+        let group_pos = if snap { vyges_pdn::vias::snap_to_grid(pos, &grid_axis, next_minimum_track) } else { pos };
         let start = group_pos - width / 2;
         let rect = if vertical {
             (start, ch.area.1, start + width, ch.area.3)
@@ -1652,7 +1673,7 @@ fn build_repair_at(
     //
     // ⚠️ Cut away ENTIRELY, not into pieces: the wide group violates spacing to a strap running
     // beside it along the full length, and the narrow one clears.
-    let survivors = surviving_pieces(db, ch, &out, emitted, blockages, horizontal);
+    let survivors = surviving_pieces(db, ch, &out, emitted, blockages);
     Some(RepairAttempt {
         straps: survivors,
         width: settled,
@@ -1664,57 +1685,42 @@ fn build_repair_at(
 ///
 /// ⚠️ **The whole length.** `determineOffset` narrowed its obstruction test to the orphans' extent;
 /// this does not, which is the entire reason the two can disagree.
+///
+/// 🔑 **The same `Shape::cut` every other grid shape gets** ([`cut_shapes`]): each violation is the
+/// other shape's RAW rect grown by the LARGER of its halo and the strap's own
+/// (`getRectWithLargestObstructionHalo`). Cutting at the other's obstruction instead stops a wide
+/// strap short of its own spacing — a 0.96 um metal4 repair strap began 540 dbu low and caught a
+/// rail the reference leaves orphaned, so a channel the reference reports as remaining closed.
+/// An already-built shape is a plain shape (`kShape`): one of the SAME net still cuts, so it goes
+/// in with no net and the same-net exemption never applies to it.
 fn surviving_pieces(
     db: &Db,
     ch: &Channel,
     group: &[(String, Rect)],
     emitted: &[(String, String, Rect, &'static str)],
     blockages: &[(String, Rect, Option<String>, Rect)],
-    horizontal: bool,
 ) -> Vec<(String, Rect)> {
     let layer = ch.target_layer.as_str();
-    let mut out = Vec::new();
-    for (net, rect) in group {
-        // Everything already standing on this layer, each bloated by its own spacing, and the
-        // strap bloated by its own — the same two-sided comparison the obstruction tree makes.
-        let own = obstruction_of(db, layer, *rect);
-        let mut blocked: Vec<(i32, i32)> = Vec::new();
-        let mut note = |o: Rect| {
-            if own.0 < o.2 && o.0 < own.2 && own.1 < o.3 && o.1 < own.3 {
-                blocked.push(if horizontal { (o.0, o.2) } else { (o.1, o.3) });
-            }
-        };
-        for (bl, r, ..) in blockages {
-            if bl == layer {
-                note(*r);
-            }
-        }
-        for (n, el, r, _) in emitted {
-            // ⚠️ A strap of the SAME net still cuts: `cutShapes` applies no net test.
-            if el == layer && !std::ptr::eq(n, net) {
-                note(obstruction_of(db, layer, *r));
-            }
-        }
-        let along = if horizontal {
-            (rect.0, rect.2)
-        } else {
-            (rect.1, rect.3)
-        };
-        match shapes::cut(along, &blocked) {
-            None => out.push((net.clone(), *rect)),
-            Some(pieces) => {
-                for (lo, hi) in pieces {
-                    let r = if horizontal {
-                        (lo, rect.1, hi, rect.3)
-                    } else {
-                        (rect.0, lo, rect.2, hi)
-                    };
-                    out.push((net.clone(), r));
-                }
-            }
-        }
-    }
-    out
+    let obstructions: Vec<(String, Rect, Option<String>, Rect)> = blockages
+        .iter()
+        .filter(|(l, ..)| l == layer)
+        .cloned()
+        .chain(
+            emitted
+                .iter()
+                .filter(|(_, l, ..)| l == layer)
+                .map(|(_, l, r, _)| (l.clone(), obstruction_of(db, l, *r), None, *r)),
+        )
+        .collect();
+    let shapes: Vec<(String, String, Rect)> = group.iter().map(|(n, r)| (n.clone(), layer.to_string(), *r)).collect();
+    // `RepairChannelStraps::cutShapes`: a piece that no longer reaches the orphans' extent
+    // (`obs_check_area_`, touching counts) repairs nothing and is dropped.
+    let o = ch.obs;
+    cut_shapes(db, &shapes, &obstructions)
+        .into_iter()
+        .filter(|(_, _, r)| r.0 <= o.2 && o.0 <= r.2 && r.1 <= o.3 && o.1 <= r.3)
+        .map(|(n, _, r)| (n, r))
+        .collect()
 }
 
 fn repair_vias(
@@ -5104,7 +5110,19 @@ fn generate(args: &[String]) -> ExitCode {
             // Which of this grid's shapes are REPAIR straps, by index into `emitted`, and the
             // bloat each takes in the next round's channel search (its own width + spacing).
             let mut repair_bloat: Vec<(usize, i32)> = Vec::new();
-            for _round in 0..8 {
+            // `grid->getStraps()` of type `kRepairChannel`, in the order they were added.
+            let mut repairs: Vec<RepairStrap> = Vec::new();
+            // `getMaxLength`: the core's extent along the repair layer.
+            let max_length_of = |layer: &str| if direction_of(&db, layer) == Direction::Horizontal { core.2 - core.0 } else { core.3 - core.1 };
+            // `repairGridChannels` recurses until a pass repairs nothing; the options sequence
+            // ends every recurring channel, so it terminates. The bound only guards a defect here.
+            let mut round = 0;
+            loop {
+                round += 1;
+                if round > 64 {
+                    vyges_events::log("vyges-pdn", vyges_events::Severity::Error, "repair channels: 64 passes without settling — not modelled".to_string());
+                    return ExitCode::from(2);
+                }
                 let channels = find_channels(
                     &db,
                     &emitted,
@@ -5139,6 +5157,76 @@ fn generate(args: &[String]) -> ExitCode {
                         );
                     }
                 }
+                // Take a strap's shapes out of `emitted`, keeping every other index right.
+                fn take_shapes(emitted: &mut Vec<(String, String, Rect, &'static str)>, repairs: &mut [RepairStrap], k: usize) -> Vec<Rect> {
+                    let mut idx = std::mem::take(&mut repairs[k].shapes);
+                    idx.sort_unstable();
+                    let rects: Vec<Rect> = idx.iter().map(|&i| emitted[i].2).collect();
+                    for &i in idx.iter().rev() {
+                        emitted.remove(i);
+                    }
+                    for r in repairs.iter_mut() {
+                        for s in r.shapes.iter_mut() {
+                            *s -= idx.iter().filter(|&&i| i < *s).count();
+                        }
+                    }
+                    rects
+                }
+                let push_shapes = |emitted: &mut Vec<(String, String, Rect, &'static str)>, layer: &str, straps: Vec<(String, Rect)>| -> Vec<usize> {
+                    straps
+                        .into_iter()
+                        .map(|(net, rect)| {
+                            // 🔑 **Kind `REPAIR`, written as `STRIPE`.** A repair-channel strap is a
+                            // STRIPE in the DEF but not a grid strap: `RepairChannelStraps`
+                            // overrides `allowDbPins()` to false, so on a `-pins` layer it is
+                            // neither a pin nor exempt from trimming.
+                            emitted.push((net, layer.to_string(), rect, "REPAIR"));
+                            emitted.len() - 1
+                        })
+                        .collect()
+                };
+                // 🔑 **A channel that comes back is the SAME strap's to repair** ("check for
+                // recurring channels"): a repair strap made for this very area, on this layer,
+                // with options left, takes the channel's nets, gives up its shapes, steps to its
+                // next width or spacing and is built again. It counts as a repair only when what
+                // it builds differs from what it had — the same shapes again repair nothing.
+                for ch in &channels {
+                    for k in 0..repairs.len() {
+                        if repairs[k].ch.target_layer != ch.target_layer || repairs[k].ch.area != ch.area || repairs[k].at_end(&db, max_length_of(&ch.target_layer)) {
+                            continue;
+                        }
+                        let prev = take_shapes(&mut emitted, &mut repairs, k);
+                        // addNets: a set, in the database's net order.
+                        let mut nets = repairs[k].ch.nets.clone();
+                        nets.extend(ch.nets.iter().cloned());
+                        nets.sort_by_key(|n| db_net_order.iter().position(|o| o == n));
+                        nets.dedup();
+                        repairs[k].ch.nets = nets;
+                        let (w, sp) = repairs[k].next_options(&db, max_length_of(&ch.target_layer), grid_mfg);
+                        trace("Channel", &format!("continue repair at {:?}: width {} -> {w}, spacing {} -> {sp}", ch.area, repairs[k].width, repairs[k].spacing));
+                        let vertical = direction_of(&db, &ch.target_layer) != Direction::Horizontal;
+                        let bc = repairs[k].build_channel(vertical);
+                        let built = test_build(&db, &bc, w, sp, repairs[k].snap, &emitted, &blockages, core, die, grid_mfg);
+                        let (w, sp, straps) = match built {
+                            Some(a) => (a.width, a.spacing, a.straps),
+                            None => (w, sp, Vec::new()),
+                        };
+                        repairs[k].width = w;
+                        repairs[k].spacing = sp;
+                        repairs[k].settle_span(&straps, vertical);
+                        let mut now: Vec<Rect> = straps.iter().map(|(_, r)| *r).collect();
+                        let layer = repairs[k].ch.target_layer.clone();
+                        repairs[k].shapes = push_shapes(&mut emitted, &layer, straps);
+                        if !repairs[k].shapes.is_empty() {
+                            let mut was = prev.clone();
+                            was.sort_unstable();
+                            now.sort_unstable();
+                            if now != was {
+                                repaired.push(ch.area);
+                            }
+                        }
+                    }
+                }
                 for ch in &channels {
                     // ⚠️ **One channel per band, per pass.** A channel sharing an x or a y span with
                     // one already repaired is left for the next round, by which time the straps just
@@ -5146,31 +5234,77 @@ fn generate(args: &[String]) -> ExitCode {
                     if repaired.iter().any(|o: &Rect| {
                         (ch.area.2 > o.0 && ch.area.0 < o.2) || (ch.area.3 > o.1 && ch.area.1 < o.3)
                     }) {
+                        trace("Channel", &format!("skipping repair at {:?}", ch.area));
                         continue;
                     }
-                    let Some((straps, width, spacing)) =
-                        build_repair(&db, ch, &emitted, &blockages, core, die, grid_mfg)
-                    else {
+                    // A strap already here that has run out of widths and spacings has tried
+                    // everything a new one would: the channel is left to be reported.
+                    if repairs.iter().any(|r| r.ch.target_layer == ch.target_layer && r.ch.area == ch.area && r.at_end(&db, max_length_of(&ch.target_layer))) {
+                        trace("Channel", &format!("no repair options left at {:?}", ch.area));
+                        continue;
+                    }
+                    // The constructor's `determineParameters`, then `testBuild`; failing that the
+                    // next option once, then the same unsnapped.
+                    let Some(first) = test_build(&db, ch, ch.target_width, ch.target_spacing, true, &emitted, &blockages, core, die, grid_mfg) else {
                         continue;
                     };
-                    for (net, rect) in straps {
-                        repair_bloat.push((emitted.len(), width + spacing));
-                        // 🔑 **Kind `REPAIR`, written as `STRIPE`.** A repair-channel strap is a
-                        // STRIPE in the DEF but not a grid strap: `RepairChannelStraps` overrides
-                        // `allowDbPins()` to false, so on a `-pins` layer it is neither a pin nor
-                        // exempt from trimming. Tagged `STRIPE`, ours was both — on
-                        // `asap7_repair_channel_blocked_extend` the M6 repairs kept the whole
-                        // channel length and were published as block pins.
-                        emitted.push((net, ch.target_layer.clone(), rect, "REPAIR"));
+                    let vertical = direction_of(&db, &ch.target_layer) != Direction::Horizontal;
+                    let span = if vertical { (ch.area.1, ch.area.3) } else { (ch.area.0, ch.area.2) };
+                    let mut strap = RepairStrap { ch: ch.clone(), width: first.width, spacing: first.spacing, snap: true, shapes: Vec::new(), span };
+                    strap.settle_span(&first.straps, vertical);
+                    let mut straps = first.straps;
+                    if straps.is_empty() && !strap.at_end(&db, max_length_of(&ch.target_layer)) {
+                        let (w, sp) = strap.next_options(&db, max_length_of(&ch.target_layer), grid_mfg);
+                        if let Some(a) = test_build(&db, &strap.build_channel(vertical), w, sp, true, &emitted, &blockages, core, die, grid_mfg) {
+                            strap.width = a.width;
+                            strap.spacing = a.spacing;
+                            strap.settle_span(&a.straps, vertical);
+                            straps = a.straps;
+                        } else {
+                            strap.width = w;
+                            strap.spacing = sp;
+                        }
                     }
+                    if straps.is_empty() {
+                        strap.snap = false;
+                        if let Some(a) = test_build(&db, &strap.build_channel(vertical), strap.width, strap.spacing, false, &emitted, &blockages, core, die, grid_mfg) {
+                            strap.settle_span(&a.straps, vertical);
+                            straps = a.straps;
+                        }
+                    }
+                    if straps.is_empty() {
+                        continue;
+                    }
+                    strap.shapes = push_shapes(&mut emitted, &ch.target_layer, straps);
+                    repairs.push(strap);
                     repaired.push(ch.area);
                 }
+                // Every repair strap's bloat in the next search: its own width + spacing.
+                repair_bloat = repairs.iter().flat_map(|r| r.shapes.iter().map(move |&i| (i, r.width + r.spacing))).collect();
                 if repaired.is_empty() {
-                    // The tail of `repairGridChannels`: nothing repaired and channels remain — each
-                    // is warned about (PDN-0178, its area, the layer left unconnected, its nets in
-                    // database order), then the run stops (PDN-0179) unless the grid allows them.
+                    // The tail of `repairGridChannels`: nothing repaired, so the channels are found
+                    // again as the grid now stands, each remaining one warned about (PDN-0178, its
+                    // area, the layer left unconnected, its nets in database order), then the run
+                    // stops (PDN-0179) unless the grid allows them.
+                    let remaining = find_channels(
+                        &db,
+                        &emitted,
+                        &placed,
+                        &strap_sets[strap_sets_from..],
+                        &followpin_layer,
+                        followpin_pitch,
+                        highest,
+                        strap_boundary,
+                        &db_net_order,
+                        &connects,
+                        &emitted[grid_shapes_from..],
+                        &repair_bloat,
+                    );
+                    if remaining.is_empty() {
+                        break;
+                    }
                     let um = |v: i32| f64::from(v) / per_micron;
-                    for ch in &channels {
+                    for ch in &remaining {
                         let a = ch.area;
                         vyges_events::log(
                             "vyges-pdn",
