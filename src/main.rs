@@ -476,7 +476,9 @@ fn validate_grids(
                 continue;
             };
             let (r0, r1) = (routing_level(db, l0), routing_level(db, l1));
-            if let Some(d) = validate::check_connect_layers(l0, r0, l1, r1) {
+            if let Some(d) = validate::check_connect_layers(l0, r0, l1, r1)
+                .or_else(|| validate::check_connect_backside(l0, db.layer_is_backside(l0), l1, db.layer_is_backside(l1)))
+            {
                 return Some(d);
             }
         }
@@ -663,6 +665,174 @@ fn grid_nets(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> Vec<Stri
     build_nets.to_vec()
 }
 
+/// The tail of `InstanceGrid::checkSetup`: a supply pin the macro's own obstructions bury.
+///
+/// Rules: per terminal on one of the grid's nets, in terminal order — its pin shapes on its TOP
+/// layer (highest routing level, distinct boxes); every routing-layer obstruction ABOVE that layer
+/// (by number) that touches a pin box (inclusive) adds their overlap to that box. A box overlapped
+/// by at least its own area is fully blocked: PDN-0006. Otherwise a warning, PDN-0007, with the
+/// overlap as a share of the touched boxes' area. The layers are named in layer order.
+fn check_pin_blockage(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> Option<validate::Diag> {
+    if g.instance.is_empty() {
+        return None;
+    }
+    let nets = grid_nets(db, o, g, build_nets);
+    let master = db.inst_get_master(&g.instance);
+    let obstructions = db.master_obstruction_boxes(&master).unwrap_or_default();
+    let area = |r: &Rect| i64::from(r.2 - r.0) * i64::from(r.3 - r.1);
+    for term in db.master_get_m_terms(&master) {
+        let net = db.iterm_get_net(&g.instance, &term);
+        if net.is_empty() || !nets.contains(&net) {
+            continue;
+        }
+        let mut top: Option<String> = None;
+        let mut boxes: std::collections::BTreeSet<Rect> = std::collections::BTreeSet::new();
+        for (l, x0, y0, x1, y1) in db.mterm_pin_boxes(&master, &term).unwrap_or_default() {
+            let layer = db.layer_name_by_number(l);
+            if top.as_ref().is_none_or(|t| routing_level(db, t) < routing_level(db, &layer)) {
+                top = Some(layer.clone());
+                boxes.clear();
+            }
+            if top.as_deref() == Some(layer.as_str()) {
+                boxes.insert((x0, y0, x1, y1));
+            }
+        }
+        let Some(top) = top else { continue };
+        let top_idx = i64::from(db.layer_get_number(&top));
+        let mut overlap_area: std::collections::BTreeMap<Rect, i64> = std::collections::BTreeMap::new();
+        let mut layers: Vec<i64> = Vec::new();
+        for &(l, x0, y0, x1, y1) in &obstructions {
+            let layer = db.layer_name_by_number(l);
+            if db.layer_get_type(&layer).ok().as_deref() != Some("ROUTING") || l <= top_idx {
+                continue;
+            }
+            for pin in &boxes {
+                if x0 <= pin.2 && pin.0 <= x1 && y0 <= pin.3 && pin.1 <= y1 {
+                    let overlap = (x0.max(pin.0), y0.max(pin.1), x1.min(pin.2), y1.min(pin.3));
+                    *overlap_area.entry(*pin).or_default() += area(&overlap);
+                    if !layers.contains(&l) {
+                        layers.push(l);
+                    }
+                }
+            }
+        }
+        if overlap_area.is_empty() {
+            continue;
+        }
+        layers.sort_unstable();
+        let layer_txt = layers.iter().map(|&l| db.layer_name_by_number(l)).collect::<Vec<_>>().join(", ");
+        let (mut total_pin_area, mut total_overlap) = (0i64, 0i64);
+        for (pin, overlap) in &overlap_area {
+            total_overlap += overlap;
+            total_pin_area += area(pin);
+            if *overlap >= area(pin) {
+                return Some(validate::Diag { code: 6, message: format!("{term} on {top} is blocked by obstructions on {layer_txt} for {}", g.instance) });
+            }
+        }
+        if total_pin_area == 0 {
+            continue;
+        }
+        let pct = 100.0 * total_overlap as f32 / total_pin_area as f32;
+        vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("PDN-0007 {term} on {top} is partially blocked ({pct:.1}%) by obstructions on {layer_txt} for {}", g.instance));
+    }
+    None
+}
+
+/// `VoltageDomain::findDomainNet`: the block's single net of a sig type — none is PDN-0100, more
+/// than one PDN-0181 (never a guess between them). The domain is the implicit Core one.
+fn find_domain_net(db: &Db, want: &str) -> Result<String, validate::Diag> {
+    let found: Vec<String> = db.block_get_nets().into_iter().filter(|n| db.net_sigtype(n).eq_ignore_ascii_case(want)).collect();
+    match found.len() {
+        0 => Err(validate::Diag { code: 100, message: format!("Unable to find {want} net for Core domain.") }),
+        1 => Ok(found.into_iter().next().unwrap()),
+        _ => Err(validate::Diag { code: 181, message: format!("Found multiple possible nets for {want} net for Core domain.") }),
+    }
+}
+
+/// `InstanceGrid::checkHalo`: an instance grid's halo must not reach into a row the instance does
+/// not itself sit on — PDN-0008, with the largest halo that would clear them all, written back in
+/// the macro's own frame so it can be typed into `-halo` as it is.
+///
+/// Rules: no halo, or a COVER macro, is not checked; the halo is `-halo` moved to the placed edges
+/// (`EdgeSpec::transform`); a row counts when the haloed box OVERLAPS it (strictly) and the bare box
+/// does not; rows beside the macro shrink the side halo, rows above or below the top or bottom one,
+/// and a corner row still reached gives up whichever side moves less (ties to the side halo); the
+/// suggestion goes back through the inverse orientation (`R90` and `R270` swap).
+fn check_halo(db: &Db, g: &GridSpec) -> Option<validate::Diag> {
+    if g.instance.is_empty() || g.halo == [0; 4] || db.master_is_cover(&db.inst_get_master(&g.instance)) {
+        return None;
+    }
+    let orient = db.inst_get_orient(&g.instance);
+    let [hl, hb, hr, ht] = vyges_pdn::orient::edges_in_placed_frame(g.halo, &orient);
+    let b = db.inst_bbox(&g.instance).ok()?;
+    let (x0, y0, x1, y1) = (b[0], b[1], b[2], b[3]);
+    // `applyHalo(.., rect_is_min)`: never smaller than the instance itself.
+    let halo_box = ((x0 - hl).min(x0), (y0 - hb).min(y0), (x1 + hr).max(x1), (y1 + ht).max(y1));
+    let overlaps = |a: Rect, r: Rect| r.2 > a.0 && r.0 < a.2 && r.3 > a.1 && r.1 < a.3;
+    let mut rows: Vec<Rect> = Vec::new();
+    let mut first_row = String::new();
+    for row in db.block_get_rows() {
+        let r = (db.row_get_b_box_x_min(&row), db.row_get_b_box_y_min(&row), db.row_get_b_box_x_max(&row), db.row_get_b_box_y_max(&row));
+        if !overlaps(halo_box, r) || overlaps((x0, y0, x1, y1), r) {
+            continue;
+        }
+        if rows.is_empty() {
+            first_row = row.clone();
+        }
+        rows.push(r);
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    // suggestHalo, in the placed frame.
+    let (mut sl, mut sb, mut sr, mut st) = (hl, hb, hr, ht);
+    let overlaps_x = |r: &Rect| r.2 > x0 && r.0 < x1;
+    let overlaps_y = |r: &Rect| r.3 > y0 && r.1 < y1;
+    let mut corners = Vec::new();
+    for r in &rows {
+        if overlaps_y(r) {
+            if r.0 >= x1 { sr = sr.min(r.0 - x1) } else { sl = sl.min(x0 - r.2) }
+        } else if overlaps_x(r) {
+            if r.1 >= y1 { st = st.min(r.1 - y1) } else { sb = sb.min(y0 - r.3) }
+        } else {
+            corners.push(*r);
+        }
+    }
+    for r in &corners {
+        if !overlaps(halo_box, *r) {
+            continue;
+        }
+        let right = r.0 >= x1;
+        let x_halo = if right { r.0 - x1 } else { x0 - r.2 };
+        let above = r.1 >= y1;
+        let y_halo = if above { r.1 - y1 } else { y0 - r.3 };
+        let x_edge = if right { &mut sr } else { &mut sl };
+        let x_now = *x_edge;
+        let y_now = if above { st } else { sb };
+        if x_now - x_halo <= y_now - y_halo {
+            *x_edge = x_now.min(x_halo);
+        } else {
+            let y_edge = if above { &mut st } else { &mut sb };
+            *y_edge = y_now.min(y_halo);
+        }
+    }
+    let inverse = match vyges_pdn::orient::canonical(&orient) {
+        "R90" => "R270",
+        "R270" => "R90",
+        o => o,
+    };
+    let [ml, mb, mr, mt] = vyges_pdn::orient::edges_in_placed_frame([sl, sb, sr, st], inverse);
+    let dbu = f64::from(db.tech_get_db_units_per_micron());
+    Some(validate::Diag {
+        code: 8,
+        message: format!(
+            "{} - {} halo overlaps row {} (and {} other row(s)); reduce the halo to at most \"{:.4} {:.4} {:.4} {:.4}\".",
+            g.name, g.instance, first_row, rows.len() - 1,
+            f64::from(ml) / dbu, f64::from(mb) / dbu, f64::from(mr) / dbu, f64::from(mt) / dbu
+        ),
+    })
+}
+
 /// `Grid::checkSetup`, per grid in declaration order, at `pdngen` — after every declaration.
 ///
 /// Rules, in the reference's order:
@@ -675,105 +845,127 @@ fn grid_nets(db: &Db, o: &Opts, g: &GridSpec, build_nets: &[String]) -> Vec<Stri
 ///   rings and straps, the fixed instances' pins on its nets, the power-switch cells' pins, its
 ///   nets' special wires and their FIXED block pins — in declaration order.
 fn check_setup(db: &Db, grids: &[(GridSpec, Opts)], build_nets: &[String], all_insts: &[String]) -> Option<validate::Diag> {
+    // `PdnGen::checkDesign` first: every macro must be placed AND fixed — each that is not is
+    // warned about (PDN-0234), then the run stops (PDN-0235).
+    let mut unplaced = false;
+    for inst in all_insts {
+        if db.master_is_block(&db.inst_get_master(inst)) && !db.inst_is_fixed(inst) {
+            unplaced = true;
+            vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("PDN-0234 {inst} has not been placed and fixed."));
+        }
+    }
+    if unplaced {
+        return Some(validate::Diag { code: 235, message: "Design has unplaced macros.".to_string() });
+    }
     let layer_of = |spec: &str| spec.split(':').next().unwrap_or("").to_string();
     for (g, o) in grids {
         let mut fp: Vec<String> = o.all("followpins").iter().map(|s| layer_of(s)).collect();
         fp.sort_by_key(|l| db.layer_get_number(l));
         fp.dedup();
-        if fp.is_empty() {
-            continue;
-        }
-        let connects: Vec<(String, String)> = o
-            .all("connect")
-            .iter()
-            .filter_map(|spec| spec.split(':').next().and_then(|p| p.split_once(',')))
-            .map(|(a, b)| {
-                // `Connect` orders its pair by routing level: layer0 is the lower.
-                if routing_level(db, a) <= routing_level(db, b) { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) }
-            })
-            .collect();
-        let mut fp_connects: Vec<&(String, String)> = Vec::new();
-        for lower in &fp {
-            for c in connects.iter().filter(|c| &c.0 == lower) {
-                if fp.contains(&c.1) && !fp_connects.contains(&c) {
-                    fp_connects.push(c);
-                }
+        // `Grid::checkSetup` returns here for a grid with no follow pins; an instance grid's own
+        // checks below run regardless.
+        'base: {
+            if fp.is_empty() {
+                break 'base;
             }
-        }
-        if fp.len() > 1 && fp_connects.is_empty() {
-            return Some(validate::Diag { code: 192, message: format!("There are multiple ({}) followpin definitions in {}, but no connect statements between them.", fp.len(), g.name) });
-        }
-        if fp.len() - 1 != fp_connects.len() {
-            return Some(validate::Diag { code: 193, message: format!("There are only ({}) followpin connect statements when {} is/are required.", fp_connects.len(), fp.len() - 1) });
-        }
-        let num = |l: &str| db.layer_get_number(l);
-        for c0 in &fp_connects {
-            for c1 in &fp_connects {
-                if c0 == c1 {
-                    continue;
-                }
-                let (mut a, mut b) = (*c0, *c1);
-                if (routing_level(db, &a.0), routing_level(db, &a.1)) > (routing_level(db, &b.0), routing_level(db, &b.1)) {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                let overlaps = |x: &(String, String), y: &(String, String)| {
-                    if num(&x.0) < num(&y.0) { num(&x.1) >= num(&y.0) } else { num(&y.1) >= num(&x.0) }
-                };
-                if overlaps(a, b) || overlaps(b, a) {
-                    return Some(validate::Diag { code: 194, message: format!("Connect statements for followpins overlap between layers: {} -> {} and {} -> {}", a.0, a.1, b.0, b.1) });
-                }
-            }
-        }
-        let mut check: Vec<String> = o.all("ring").iter().flat_map(|s| layer_of(s).split(',').map(str::to_string).collect::<Vec<_>>()).collect();
-        check.extend(o.all("stripe").iter().map(|s| layer_of(s)));
-        check.extend(fp.iter().cloned());
-        for pin in o.all("pins").iter().flat_map(|s| s.split(',')).filter(|s| !s.is_empty()) {
-            if !check.iter().any(|l| l == pin) {
-                return Some(validate::Diag { code: 111, message: format!("Pin layer {pin} is not a valid shape in {}", g.name) });
-            }
-        }
-        let nets = grid_nets(db, o, g, build_nets);
-        let insts: Vec<String> = if g.instance.is_empty() { all_insts.to_vec() } else { vec![g.instance.clone()] };
-        for inst in insts.iter().filter(|i| db.inst_is_fixed(i)) {
-            let master = db.inst_get_master(inst);
-            for term in db.master_get_m_terms(&master) {
-                if nets.contains(&db.iterm_get_net(inst, &term)) {
-                    for (l, ..) in db.mterm_pin_boxes(&master, &term).unwrap_or_default() {
-                        check.push(db.layer_name_by_number(l));
+            let connects: Vec<(String, String)> = o
+                .all("connect")
+                .iter()
+                .filter_map(|spec| spec.split(':').next().and_then(|p| p.split_once(',')))
+                .map(|(a, b)| {
+                    // `Connect` orders its pair by routing level: layer0 is the lower.
+                    if routing_level(db, a) <= routing_level(db, b) { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) }
+                })
+                .collect();
+            let mut fp_connects: Vec<&(String, String)> = Vec::new();
+            for lower in &fp {
+                for c in connects.iter().filter(|c| &c.0 == lower) {
+                    if fp.contains(&c.1) && !fp_connects.contains(&c) {
+                        fp_connects.push(c);
                     }
                 }
             }
-        }
-        if let Some(sw) = o.one("power-switch").filter(|s| !s.is_empty()) {
-            let cell = sw.split(':').next().unwrap_or("");
-            for term in db.master_get_m_terms(cell) {
-                for (l, ..) in db.mterm_pin_boxes(cell, &term).unwrap_or_default() {
-                    check.push(db.layer_name_by_number(l));
-                }
+            if fp.len() > 1 && fp_connects.is_empty() {
+                return Some(validate::Diag { code: 192, message: format!("There are multiple ({}) followpin definitions in {}, but no connect statements between them.", fp.len(), g.name) });
             }
-        }
-        for net in &nets {
-            for (l, ..) in db.net_swire_shapes(net).unwrap_or_default() {
-                check.push(db.layer_name_by_number(l));
+            if fp.len() - 1 != fp_connects.len() {
+                return Some(validate::Diag { code: 193, message: format!("There are only ({}) followpin connect statements when {} is/are required.", fp_connects.len(), fp.len() - 1) });
             }
-            for bterm in db.net_bterms(net) {
-                for pin in 0..db.num_bterm_get_b_pins(&bterm) {
-                    if !matches!(db.bpin_get_placement_status(&bterm, pin).as_str(), "FIRM" | "LOCKED" | "COVER") {
+            let num = |l: &str| db.layer_get_number(l);
+            for c0 in &fp_connects {
+                for c1 in &fp_connects {
+                    if c0 == c1 {
                         continue;
                     }
-                    for (l, ..) in db.bpin_layer_boxes(&bterm, pin).unwrap_or_default() {
+                    let (mut a, mut b) = (*c0, *c1);
+                    if (routing_level(db, &a.0), routing_level(db, &a.1)) > (routing_level(db, &b.0), routing_level(db, &b.1)) {
+                        std::mem::swap(&mut a, &mut b);
+                    }
+                    let overlaps = |x: &(String, String), y: &(String, String)| {
+                        if num(&x.0) < num(&y.0) { num(&x.1) >= num(&y.0) } else { num(&y.1) >= num(&x.0) }
+                    };
+                    if overlaps(a, b) || overlaps(b, a) {
+                        return Some(validate::Diag { code: 194, message: format!("Connect statements for followpins overlap between layers: {} -> {} and {} -> {}", a.0, a.1, b.0, b.1) });
+                    }
+                }
+            }
+            let mut check: Vec<String> = o.all("ring").iter().flat_map(|s| layer_of(s).split(',').map(str::to_string).collect::<Vec<_>>()).collect();
+            check.extend(o.all("stripe").iter().map(|s| layer_of(s)));
+            check.extend(fp.iter().cloned());
+            for pin in o.all("pins").iter().flat_map(|s| s.split(',')).filter(|s| !s.is_empty()) {
+                if !check.iter().any(|l| l == pin) {
+                    return Some(validate::Diag { code: 111, message: format!("Pin layer {pin} is not a valid shape in {}", g.name) });
+                }
+            }
+            let nets = grid_nets(db, o, g, build_nets);
+            let insts: Vec<String> = if g.instance.is_empty() { all_insts.to_vec() } else { vec![g.instance.clone()] };
+            for inst in insts.iter().filter(|i| db.inst_is_fixed(i)) {
+                let master = db.inst_get_master(inst);
+                for term in db.master_get_m_terms(&master) {
+                    if nets.contains(&db.iterm_get_net(inst, &term)) {
+                        for (l, ..) in db.mterm_pin_boxes(&master, &term).unwrap_or_default() {
+                            check.push(db.layer_name_by_number(l));
+                        }
+                    }
+                }
+            }
+            if let Some(sw) = o.one("power-switch").filter(|s| !s.is_empty()) {
+                let cell = sw.split(':').next().unwrap_or("");
+                for term in db.master_get_m_terms(cell) {
+                    for (l, ..) in db.mterm_pin_boxes(cell, &term).unwrap_or_default() {
                         check.push(db.layer_name_by_number(l));
                     }
                 }
             }
+            for net in &nets {
+                for (l, ..) in db.net_swire_shapes(net).unwrap_or_default() {
+                    check.push(db.layer_name_by_number(l));
+                }
+                for bterm in db.net_bterms(net) {
+                    for pin in 0..db.num_bterm_get_b_pins(&bterm) {
+                        if !matches!(db.bpin_get_placement_status(&bterm, pin).as_str(), "FIRM" | "LOCKED" | "COVER") {
+                            continue;
+                        }
+                        for (l, ..) in db.bpin_layer_boxes(&bterm, pin).unwrap_or_default() {
+                            check.push(db.layer_name_by_number(l));
+                        }
+                    }
+                }
+            }
+            for (lower, upper) in &connects {
+                if !check.contains(lower) {
+                    return Some(validate::Diag { code: 112, message: format!("Cannot find shapes to connect to on {lower}") });
+                }
+                if !check.contains(upper) {
+                    return Some(validate::Diag { code: 113, message: format!("Cannot find shapes to connect to on {upper}") });
+                }
+            }
         }
-        for (lower, upper) in &connects {
-            if !check.contains(lower) {
-                return Some(validate::Diag { code: 112, message: format!("Cannot find shapes to connect to on {lower}") });
-            }
-            if !check.contains(upper) {
-                return Some(validate::Diag { code: 113, message: format!("Cannot find shapes to connect to on {upper}") });
-            }
+        if let Some(d) = check_halo(db, g) {
+            return Some(d);
+        }
+        if let Some(d) = check_pin_blockage(db, o, g, build_nets) {
+            return Some(d);
         }
     }
     None
@@ -1167,8 +1359,7 @@ fn find_channels(
                 connect_direction: repaired_layer_direction(
                     grid_emitted
                         .iter()
-                        .filter(|(_, l, _, k)| *l == layer && matches!(*k, "FOLLOWPIN" | "STRIPE" | "REPAIR"))
-                        .last()
+                        .rfind(|(_, l, _, k)| *l == layer && matches!(*k, "FOLLOWPIN" | "STRIPE" | "REPAIR"))
                         .map(|(_, _, _, k)| *k),
                     direction_of(db, &layer),
                 ),
@@ -2480,12 +2671,7 @@ fn generate(args: &[String]) -> ExitCode {
         };
         return ripup(path, out, &opts);
     }
-    let (Some(path), Some(out), Some(power), Some(ground)) = (
-        args.first(),
-        opts.one("out-def"),
-        opts.one("power"),
-        opts.one("ground"),
-    ) else {
+    let (Some(path), Some(out)) = (args.first(), opts.one("out-def")) else {
         return usage();
     };
 
@@ -2519,6 +2705,24 @@ fn generate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     }
+
+    // `PdnGen::ensureCoreDomain`: with no `--power`/`--ground` (no `set_voltage_domain`), the
+    // Core domain takes the block's one net of each sig type — power first, then ground.
+    let mut found = Vec::new();
+    for (explicit, want) in [(opts.one("power"), "POWER"), (opts.one("ground"), "GROUND")] {
+        match explicit.filter(|n| !n.is_empty()).map(str::to_string).ok_or(()).or_else(|()| find_domain_net(&db, want)) {
+            Ok(n) => found.push(n),
+            Err(d) => {
+                vyges_events::emit(
+                    &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
+                        .with_code(format!("PDN-{:04}", d.code)),
+                );
+                eprintln!("{d}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let (power, ground) = (found[0].as_str(), found[1].as_str());
 
     let per_micron = db.block_get_def_units() as f64;
     let core = area(&db, true);
@@ -3358,8 +3562,12 @@ fn generate(args: &[String]) -> ExitCode {
         split_by_connect: Vec<((String, String), Vec<(String, i32, bool)>)>,
         min_width_by_connect: Vec<((String, String), Vec<String>)>,
         ground: String,
+        /// The index of the grid these vias belong to (`grids`), for `Grid::hasVias`.
+        grid: usize,
     }
     let mut pending: Vec<PendingVias> = Vec::new();
+    // `Grid::hasShapes`, per grid, as its build left it — see the PDN-0232 check after the trim.
+    let mut grid_has_shapes = vec![false; grids.len()];
     for (grid_index, (grid, opts)) in grids.iter().enumerate() {
         // 🔑 **`Grid::makeShapes` opens with PDN-0001** (`grid.cpp:122`), once per grid, and the
         // name it prints is `getLongName()`: the grid's own name for a core grid, and
@@ -4958,6 +5166,30 @@ fn generate(args: &[String]) -> ExitCode {
                     repaired.push(ch.area);
                 }
                 if repaired.is_empty() {
+                    // The tail of `repairGridChannels`: nothing repaired and channels remain — each
+                    // is warned about (PDN-0178, its area, the layer left unconnected, its nets in
+                    // database order), then the run stops (PDN-0179) unless the grid allows them.
+                    let um = |v: i32| f64::from(v) / per_micron;
+                    for ch in &channels {
+                        let a = ch.area;
+                        vyges_events::log(
+                            "vyges-pdn",
+                            vyges_events::Severity::Warn,
+                            format!(
+                                "PDN-0178 Remaining channel ({:.4}, {:.4}) - ({:.4}, {:.4}) on {} for nets: {}",
+                                um(a.0), um(a.1), um(a.2), um(a.3), ch.connect_to, ch.nets.join(", ")
+                            ),
+                        );
+                    }
+                    if opts.one("allow-repair-channels").is_none() {
+                        let d = vyges_pdn::validate::Diag { code: 179, message: "Unable to repair all channels.".to_string() };
+                        vyges_events::emit(
+                            &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
+                                .with_code(format!("PDN-{:04}", d.code)),
+                        );
+                        eprintln!("{d}");
+                        return ExitCode::from(1);
+                    }
                     break;
                 }
                 // The straps changed, so every via has to be found again -- and so has the area
@@ -5078,8 +5310,10 @@ fn generate(args: &[String]) -> ExitCode {
                 min_width_by_connect,
                 fixed,
                 ground: ground.to_string(),
+                grid: grid_index,
             });
         }
+        grid_has_shapes[grid_index] = emitted.len() > grid_shapes_from;
     }
 
 
@@ -5337,6 +5571,44 @@ fn generate(args: &[String]) -> ExitCode {
     // 🔑 **After trimming, because that is where `PdnGen::writeToDb` sits.** Each grid's crossings
     // were found against the shapes as they stood; each grid's vias are SIZED against the shapes as
     // they were left. See `PendingVias` for why the two can be separated at all.
+    // `PdnGen::buildGrids`, after `cleanupVias` and before anything is written: every grid left
+    // with no shape and no via is warned about (PDN-0232), in grid order, then the run stops
+    // (PDN-0233).
+    //
+    // ⚠️ A grid's shapes are counted as its own build left them; a trim that deletes EVERY shape
+    // of a grid is not seen here (no case in the corpus does), its vias are.
+    {
+        // `Via::isValid` after `cleanupVias` — the same test the via loop below applies, against
+        // the shapes as the trim left them (before any via grows one).
+        let held_end = |net: &str, layer: &str, was: Rect, area: Rect| -> bool {
+            emitted.iter().any(|(n, l, r, _)| n == net && l == layer && overlaps(*r, area) && overlaps(*r, was))
+                || connectable_pins.iter().any(|p| p.net == net && p.layer == layer && overlaps(p.rect, was))
+                || fixed_via_shapes.iter().any(|f| f.net == net && f.layer == layer && overlaps(f.rect, was))
+        };
+        let via_survives = |v: &vyges_pdn::vias::Via| {
+            held_end(&v.net, &v.lower, v.lower_rect, v.area) && held_end(&v.net, &v.upper, v.upper_rect, v.area)
+        };
+        let mut failed = false;
+        for (k, (grid, _)) in grids.iter().enumerate() {
+            let has_vias = pending.iter().any(|p| p.grid == k && p.placed.iter().any(&via_survives));
+            if grid_has_shapes[k] || has_vias {
+                continue;
+            }
+            let (long, kind) = if grid.instance.is_empty() { (grid.name.clone(), "Core") } else { (format!("{} - {}", grid.name, grid.instance), "Instance") };
+            vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("PDN-0232 The grid \"{long}\" ({kind}) does not contain any shapes or vias."));
+            failed = true;
+        }
+        if failed {
+            let d = vyges_pdn::validate::Diag { code: 233, message: "Failed to generate full power grid.".to_string() };
+            vyges_events::emit(
+                &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
+                    .with_code(format!("PDN-{:04}", d.code)),
+            );
+            eprintln!("{d}");
+            return ExitCode::from(1);
+        }
+    }
+
     for p in pending {
         let PendingVias {
             opts,
@@ -5348,6 +5620,7 @@ fn generate(args: &[String]) -> ExitCode {
             min_width_by_connect,
             fixed,
             ground,
+            grid: _,
         } = p;
         // 🔑 **The order vias are written in, which is not the order they were found in.**
         // `Grid::writeToDb` sorts a grid's vias by `(lower layer number, upper layer number,
@@ -7885,6 +8158,17 @@ fn generate(args: &[String]) -> ExitCode {
             // 🔑 **INOUT is set whenever the net arrived with NO terminal**, for the adopted one
             // as much as the created one — it is the branch that decides, not the creation.
             if db.bterm_names().iter().any(|b| b == net) {
+                // `writeToDb`: a terminal of the net's name already on ANOTHER net is PDN-0214.
+                let other = db.bterm_get_net(net);
+                if !other.is_empty() && other != *net {
+                    let d = vyges_pdn::validate::Diag { code: 214, message: format!("BTerm {net} already exists for a different net ({other})") };
+                    vyges_events::emit(
+                        &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
+                            .with_code(format!("PDN-{:04}", d.code)),
+                    );
+                    eprintln!("{d}");
+                    return ExitCode::from(1);
+                }
                 // ⛔ **NOT CONNECTED to the net, and it should be.** The reference calls
                 // `bterm->connect(net)` here; no accessor for that is bridged yet, so an adopted
                 // terminal keeps whatever net it had. Stated rather than silently skipped — a

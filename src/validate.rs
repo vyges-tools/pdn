@@ -275,6 +275,23 @@ pub fn check_connect_layers(name0: &str, level0: i32, name1: &str, level1: i32) 
     None
 }
 
+/// **PDN-1200** — a connect rule whose two layers sit on opposite sides of the wafer.
+///
+/// Rule: the last of `Connect`'s constructor checks, after 0003/0004/0005 — a via cannot join a
+/// front-side metal to a backside one, so a rule asking for it is refused, the layers named in the
+/// order the rule gave them (before the constructor sorts them by routing level).
+pub fn check_connect_backside(name0: &str, backside0: bool, name1: &str, backside1: bool) -> Option<Diag> {
+    if backside0 != backside1 {
+        return Diag::new(
+            1200,
+            format!(
+                "Connect rule layers ({name0}, {name1}) span the front-side/backside boundary. PDN cannot create TSVs or vias across this boundary; the connection must come from a tap/bridge cell that internally stitches the two sides."
+            ),
+        );
+    }
+    None
+}
+
 /// **PDN-0185** — the group of straps does not fit in the grid, once the offset is taken.
 ///
 /// The group is `net_count` straps and the gaps between them: `n*width + (n-1)*spacing`. It fails
@@ -372,6 +389,11 @@ mod tests {
         assert_eq!(check_connect_layers("via1", 0, "metal5", 5).unwrap().code, 4);
         assert_eq!(check_connect_layers("metal1", 1, "via2", 0).unwrap().code, 5);
         assert!(check_connect_layers("metal1", 1, "metal5", 5).is_none());
+        // Rule (Connect::Connect): only a rule crossing the backside boundary is refused, in the
+        // order the rule named its layers.
+        assert_eq!(check_connect_backside("M1", false, "B1", true).unwrap().code, 1200);
+        assert!(check_connect_backside("M1", false, "M2", false).is_none());
+        assert!(check_connect_backside("B1", true, "B2", true).is_none());
     }
 
     #[test]
