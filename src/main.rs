@@ -769,11 +769,19 @@ fn check_halo(db: &Db, g: &GridSpec) -> Option<validate::Diag> {
     // `applyHalo(.., rect_is_min)`: never smaller than the instance itself.
     let halo_box = ((x0 - hl).min(x0), (y0 - hb).min(y0), (x1 + hr).max(x1), (y1 + ht).max(y1));
     let overlaps = |a: Rect, r: Rect| r.2 > a.0 && r.0 < a.2 && r.3 > a.1 && r.1 < a.3;
+    // 🔑 The rows are selected against the macro's REAL outline and that outline grown by the halo
+    // (upstream `a718d1cd60`: `getDomainRegion` / `getGridRegion`), not the bounding box — on a
+    // non-rectangular macro the box covers the notch, flags the rows beside it and demands a halo
+    // of zero. Growing distributes over a union, so the outline stays a list of rectangles, each
+    // grown on its own; "touches" is a positive-area overlap, as an empty boost intersection is.
+    let outline = instance_outline(db, &g.instance);
+    let grown: Vec<Rect> = outline.iter().map(|r| (r.0 - hl, r.1 - hb, r.2 + hr, r.3 + ht)).collect();
+    let touches = |region: &[Rect], r: Rect| region.iter().any(|&a| overlaps(a, r));
     let mut rows: Vec<Rect> = Vec::new();
     let mut first_row = String::new();
     for row in db.block_get_rows() {
         let r = (db.row_get_b_box_x_min(&row), db.row_get_b_box_y_min(&row), db.row_get_b_box_x_max(&row), db.row_get_b_box_y_max(&row));
-        if !overlaps(halo_box, r) || overlaps((x0, y0, x1, y1), r) {
+        if !touches(&grown, r) || touches(&outline, r) {
             continue;
         }
         if rows.is_empty() {
@@ -831,6 +839,31 @@ fn check_halo(db: &Db, g: &GridSpec) -> Option<validate::Diag> {
             f64::from(ml) / dbu, f64::from(mb) / dbu, f64::from(mr) / dbu, f64::from(mt) / dbu
         ),
     })
+}
+
+/// `getInstanceOutline` — the real outline of a placed instance, as rectangles in placed coordinates.
+///
+/// LEF has no polygonal MACRO SIZE, so a non-rectangular macro carries its occupied area as an
+/// OVERLAP-layer obstruction. A master with none falls back to its placement bounding box, so this is
+/// the bounding box wherever that was already right. ℹ️ The reference takes the obstruction polygons
+/// plus the non-decomposed boxes; the boxes here include the decomposed ones, which cover the same
+/// union.
+fn instance_outline(db: &Db, inst: &str) -> Vec<Rect> {
+    let master = db.inst_get_master(inst);
+    let orient = db.inst_get_orient(inst);
+    let origin = (db.inst_get_origin_x(inst), db.inst_get_origin_y(inst));
+    let out: Vec<Rect> = db
+        .master_obstruction_boxes(&master)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|&(l, ..)| l >= 0 && db.layer_get_type(&db.layer_name_by_number(l)).unwrap_or_default() == "OVERLAP")
+        .map(|(_, x0, y0, x1, y1)| vyges_pdn::orient::transform_rect((x0, y0, x1, y1), &orient, origin))
+        .collect();
+    if out.is_empty() {
+        db.inst_bbox(inst).ok().filter(|b| b.len() == 4).map(|b| vec![(b[0], b[1], b[2], b[3])]).unwrap_or_default()
+    } else {
+        out
+    }
 }
 
 /// `Grid::checkSetup`, per grid in declaration order, at `pdngen` — after every declaration.
@@ -1167,6 +1200,9 @@ fn find_channels(
     grid_emitted: &[(String, String, Rect, &'static str)],
     // `(index into emitted, bloat)` for every repair strap an earlier round laid.
     repair_bloat: &[(usize, i32)],
+    // This grid's index, and every grid's claimed blankets `(owner, layer, obstruction, rect)`.
+    grid_index: usize,
+    grid_obs: &[(usize, String, Rect, Rect)],
 ) -> Vec<Channel> {
     let overlaps = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
     let mut out = Vec::new();
@@ -1222,6 +1258,31 @@ fn find_channels(
                 if !any {
                     continue;
                 }
+            }
+            // `isRouteUpOwnedByAnotherGrid` (upstream `a718d1cd60`): a via up from this shape has
+            // to pass every intermediate layer of the connect to the target, and the target. If on
+            // any one of them OTHER grids' claims (queried by their obstruction, taken by their
+            // shape) together cover the whole shape, that grid connects it — not a channel here.
+            let via_layers: Vec<&String> = connects
+                .iter()
+                .filter(|c| &c.lower == l && c.upper == target_layer)
+                .flat_map(|c| c.intermediate.iter())
+                .chain(std::iter::once(&target_layer))
+                .collect();
+            let owned = via_layers.iter().any(|vl| {
+                let claimed: Vec<Rect> = grid_obs
+                    .iter()
+                    .filter(|(owner, ol, q, _)| *owner != grid_index && ol == *vl
+                        && q.0 <= rect.2 && rect.0 <= q.2 && q.1 <= rect.3 && rect.1 <= q.3)
+                    .map(|(_, _, _, r)| *r)
+                    .collect();
+                !claimed.is_empty() && vyges_pdn::channels::covered_by(*rect, &claimed)
+            });
+            if owned {
+                if std::env::var_os("PDN_TRACE").is_some() {
+                    eprintln!("VYGPDN owned|{}|{}|{} {} {} {}", l, target_layer, rect.0, rect.1, rect.2, rect.3);
+                }
+                continue;
             }
             // 🔑 **Bloat by the pitch of the shape's OWN component** (upstream `7899a27`), across
             // the strap, so neighbours merge and the gaps between them are the channels. A
@@ -5157,6 +5218,8 @@ fn generate(args: &[String]) -> ExitCode {
                     &connects,
                     &emitted[grid_shapes_from..],
                     &repair_bloat,
+                    grid_index,
+                    &grid_obs,
                 );
                 if channels.is_empty() {
                     break;
@@ -5314,6 +5377,8 @@ fn generate(args: &[String]) -> ExitCode {
                         &connects,
                         &emitted[grid_shapes_from..],
                         &repair_bloat,
+                        grid_index,
+                        &grid_obs,
                     );
                     if remaining.is_empty() {
                         break;

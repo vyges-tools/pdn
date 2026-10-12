@@ -83,6 +83,29 @@ pub fn merge_channels(bloated: &[Rect]) -> Vec<Rect> {
     out
 }
 
+/// `Region(claimed).contains(Region(rect))` — is `rect` wholly covered by the union of `claimed`?
+/// Answered by subtracting every claim from it: covered exactly when nothing of positive area is
+/// left. A claim that only touches removes nothing.
+pub fn covered_by(rect: Rect, claimed: &[Rect]) -> bool {
+    let mut left: Vec<Rect> = if rect.0 < rect.2 && rect.1 < rect.3 { vec![rect] } else { Vec::new() };
+    for &c in claimed {
+        let mut next = Vec::with_capacity(left.len());
+        for r in left {
+            if !(r.0 < c.2 && c.0 < r.2 && r.1 < c.3 && c.1 < r.3) {
+                next.push(r);
+                continue;
+            }
+            if r.1 < c.1 { next.push((r.0, r.1, r.2, c.1)); }
+            if c.3 < r.3 { next.push((r.0, c.3, r.2, r.3)); }
+            let (y0, y1) = (r.1.max(c.1), r.3.min(c.3));
+            if r.0 < c.0 { next.push((r.0, y0, c.0, y1)); }
+            if c.2 < r.2 { next.push((c.2, y0, r.2, y1)); }
+        }
+        left = next;
+    }
+    left.is_empty()
+}
+
 /// The order a layer's channels are offered in: every WHOLE run first, then the pieces, each group
 /// in its original order (`findRepairChannels`, upstream `1a93dd266`).
 ///
@@ -518,5 +541,18 @@ mod tests {
         assert_eq!(whole_runs_first(&[piece, run], true, 10), vec![0, 1],
                    "a horizontal target measures across in y: 0 and 300 short, not a piece");
         assert_eq!(whole_runs_first(&[run, run], false, 10), vec![0, 1], "equal is not a piece");
+    }
+
+    // Rule (isRouteUpOwnedByAnotherGrid, a718d1cd60): the claims are taken TOGETHER — a shape
+    // alongside a rectilinear macro lies across several rectangles of its decomposition — and the
+    // claim must cover the whole shape; one clipping an end leaves it reachable. The values are the
+    // reference trace's metal4 strap on polygon_macro_grid_r180.
+    #[test]
+    fn a_shape_is_owned_only_when_the_claims_together_cover_it() {
+        let strap = (237150, 100630, 238110, 184970);
+        assert!(covered_by(strap, &[(230000, 100000, 240000, 150000), (230000, 150000, 240000, 190000)]), "two claims together");
+        assert!(!covered_by(strap, &[(230000, 100000, 240000, 150000)]), "one clips an end only");
+        assert!(!covered_by(strap, &[(238110, 100000, 240000, 190000)]), "touching is not covering");
+        assert!(!covered_by(strap, &[]));
     }
 }
