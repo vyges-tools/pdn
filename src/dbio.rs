@@ -389,17 +389,19 @@ pub(crate) fn fixed_tech_via(
 ///
 /// ⚠️ **Every FIXED instance**, with no filter on class: unlike `getInstanceObstructions` this does
 /// not skip core masters or end caps.
-pub(crate) fn macro_outlines(db: &Db) -> Vec<(String, Rect)> {
-    let mut out: Vec<(String, Rect)> = Vec::new();
+#[allow(clippy::type_complexity)]
+pub(crate) fn macro_outlines(db: &Db) -> Vec<(String, Rect, std::rc::Rc<Vec<Rect>>)> {
+    let mut out: Vec<(String, Rect, std::rc::Rc<Vec<Rect>>)> = Vec::new();
     for inst in db.block_get_insts() {
         if !db.inst_is_fixed(&inst) {
             continue;
         }
-        let b = db.inst_bbox(&inst).unwrap_or_default();
-        if b.len() != 4 {
+        // `getInstanceOutline` — the real outline (OVERLAP obstructions), its box the cheap first
+        // test (upstream `a718d1cd60`: a shape in the notch of an L macro is core area).
+        let shape = std::rc::Rc::new(super::instance_outline(db, &inst));
+        let Some(outline) = shape.iter().copied().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3))) else {
             continue;
-        }
-        let outline = (b[0], b[1], b[2], b[3]);
+        };
         let master = db.inst_get_master(&inst);
         let mut layers: Vec<String> = Vec::new();
         let note = |layers: &mut Vec<String>, n: String| {
@@ -416,7 +418,7 @@ pub(crate) fn macro_outlines(db: &Db) -> Vec<(String, Rect)> {
             }
         }
         for l in layers {
-            out.push((l, outline));
+            out.push((l, outline, std::rc::Rc::clone(&shape)));
         }
     }
     out
@@ -1336,6 +1338,12 @@ pub(crate) fn select_instances(
 pub(crate) const PAD_OBS: &str = "\u{1}pad-obs:";
 
 /// The net a pad-metal obstruction belongs to, if this obstruction net is one.
+/// The owner a SYSTEM-RESERVED obstruction is given in the obstruction list: odb's marker for the
+/// part of the bounding box a polygon die does not cover — an absence of die, not metal. A shape is
+/// cut at its edge with no spacing owed (`Shape::getRectWithLargestObstructionHalo` returns the
+/// bare rect for `die_absence_`). Never a real net name, so no same-net exemption can apply.
+pub(crate) const DIE_ABSENCE: &str = "\u{0}die-absence";
+
 pub(crate) fn pad_obs_net(obs_net: &str) -> Option<&str> {
     obs_net.strip_prefix(PAD_OBS)
 }

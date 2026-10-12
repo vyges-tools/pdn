@@ -96,19 +96,25 @@ pub fn followpin_minimum_rect(
 /// "no change", and a 460-unit sliver of metal survives against the die edge with nothing holding
 /// it. Recomputing per piece and not clamping reproduces the inherited value for the offcut and is
 /// identical for a shape that was never cut.
-pub fn boundary_pins(shape: Rect, die: Rect, min_width: i32) -> Vec<Rect> {
+///
+/// 🔑 **The wall of a notch counts as an edge** (upstream `a718d1cd60`: "a shape extended to one and
+/// left without a pin is a dangling shape, so the trim pass takes the extension straight back
+/// off"): `die_region` is the die as rectangles, and a face on an interior wall is pinned like one
+/// on the bounding box. Empty `die_region` tests the box alone.
+pub fn boundary_pins(shape: Rect, die: Rect, min_width: i32, die_region: &[Rect]) -> Vec<Rect> {
+    let wall = |n: (i32, i32)| crate::region::is_on_interior_wall(die_region, shape, n);
     let mut out = Vec::new();
-    if shape.0 == die.0 {
-        out.push((shape.0, shape.1, die.0 + min_width, shape.3));
+    if shape.0 == die.0 || wall((-1, 0)) {
+        out.push((shape.0, shape.1, shape.0 + min_width, shape.3));
     }
-    if shape.2 == die.2 {
-        out.push((die.2 - min_width, shape.1, shape.2, shape.3));
+    if shape.2 == die.2 || wall((1, 0)) {
+        out.push((shape.2 - min_width, shape.1, shape.2, shape.3));
     }
-    if shape.1 == die.1 {
-        out.push((shape.0, shape.1, shape.2, die.1 + min_width));
+    if shape.1 == die.1 || wall((0, -1)) {
+        out.push((shape.0, shape.1, shape.2, shape.1 + min_width));
     }
-    if shape.3 == die.3 {
-        out.push((shape.0, die.3 - min_width, shape.2, shape.3));
+    if shape.3 == die.3 || wall((0, 1)) {
+        out.push((shape.0, shape.3 - min_width, shape.2, shape.3));
     }
     out
 }
@@ -259,6 +265,25 @@ pub fn decide(
     }
 }
 
+/// `PdnGen::trimShapes` for a follow pin, given its minimum rect (`followpin_minimum_rect`) and the
+/// via areas on it.
+///
+/// Rules, in the reference's order: no shorter copy is made when every via is a stack on the
+/// minimum rect — `effectively_vias_stack`, TRUE with no vias at all — and then a follow pin, which
+/// its cell pins keep from removal, stays at its FULL length; otherwise it becomes the minimum rect
+/// only if that fits inside it (`getRect().contains(new_rect)`), else it is left alone.
+///
+/// ⚠️ The no-via case is the one that bites: a rail extended to a ring with no via there (the seam
+/// of a T-shaped core) kept its extension in the reference and was shrunk to its rows here.
+pub fn followpin_trimmed(rect: Rect, minimum: Rect, via_areas: &[Rect]) -> Rect {
+    let only_stack = via_areas.iter().all(|v| *v == minimum);
+    if !only_stack && contains(rect, minimum) {
+        minimum
+    } else {
+        rect
+    }
+}
+
 fn contains(outer: Rect, inner: Rect) -> bool {
     outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
 }
@@ -394,7 +419,7 @@ mod tests {
     fn a_shape_reaching_the_die_edge_is_pinned_there() {
         // 🔑 Which is why a ring extended to the boundary keeps its full length: it is pinned at
         // both ends and its minimum rect therefore spans everything.
-        let got = boundary_pins((0, 100, 1000, 140), (0, 0, 1000, 1000), 20);
+        let got = boundary_pins((0, 100, 1000, 140), (0, 0, 1000, 1000), 20, &[]);
         assert_eq!(got.len(), 2, "pinned at both x edges");
         assert_eq!(got[0], (0, 100, 20, 140));
         assert_eq!(got[1], (980, 100, 1000, 140));
@@ -403,12 +428,12 @@ mod tests {
     #[test]
     fn a_shape_one_unit_short_of_the_edge_gains_nothing() {
         // ⚠️ Equality, not proximity — the same identity rule the row extension uses.
-        assert!(boundary_pins((1, 100, 999, 140), (0, 0, 1000, 1000), 20).is_empty());
+        assert!(boundary_pins((1, 100, 999, 140), (0, 0, 1000, 1000), 20, &[]).is_empty());
     }
 
     #[test]
     fn each_side_is_tested_on_its_own() {
-        let got = boundary_pins((0, 100, 999, 140), (0, 0, 1000, 1000), 20);
+        let got = boundary_pins((0, 100, 999, 140), (0, 0, 1000, 1000), 20, &[]);
         assert_eq!(got.len(), 1, "pinned at the low edge only");
         assert_eq!(got[0], (0, 100, 20, 140));
     }
@@ -419,7 +444,7 @@ mod tests {
         // on the shape as first added and a cut piece inherits it, so a sliver against the die
         // edge carries a pin wider than itself — the minimum rect is then not contained by the
         // shape, no replacement is made, and the piece is removed for want of a second connection.
-        let got = boundary_pins((0, 100, 5, 140), (0, 0, 1000, 1000), 20);
+        let got = boundary_pins((0, 100, 5, 140), (0, 0, 1000, 1000), 20, &[]);
         assert_eq!(got[0], (0, 100, 20, 140), "20 deep, overhanging the shape");
     }
 
@@ -429,7 +454,7 @@ mod tests {
         // a die edge, holding one boundary pin and no via at all.
         let die = (0, 0, 200260, 201600);
         let offcut = (199800, 31300, 200260, 32700);
-        let pins = boundary_pins(offcut, die, 800);
+        let pins = boundary_pins(offcut, die, 800, &[]);
         assert_eq!(pins.len(), 1);
         assert_eq!(pins[0].0, 199460, "the pin reaches past the offcut");
         let min = minimum_rect(&pins);
@@ -581,5 +606,18 @@ mod tests {
             Decision::Replace(r) => assert!(r.2 - r.0 >= 10, "widened for the minimum area: {r:?}"),
             other => panic!("expected a replacement, got {other:?}"),
         }
+    }
+
+    // Rule (trimShapes, effectively_vias_stack): a follow pin with no vias, or only a via stack on
+    // its minimum rect, keeps its full length; one with a via elsewhere becomes its minimum rect
+    // when that fits inside it.
+    #[test]
+    fn a_follow_pin_with_no_vias_keeps_its_full_length() {
+        let rail = (111600, 120230, 192400, 120570);
+        let rows = (114000, 120230, 190000, 120570);
+        assert_eq!(followpin_trimmed(rail, rows, &[]), rail, "no vias: not shortened");
+        assert_eq!(followpin_trimmed(rail, rows, &[rows]), rail, "only a stack on the minimum rect");
+        assert_eq!(followpin_trimmed(rail, rows, &[(150000, 120230, 151200, 120570)]), rows, "a via inside: trimmed");
+        assert_eq!(followpin_trimmed(rows, rail, &[(150000, 120230, 151200, 120570)]), rows, "a minimum larger than the shape: left alone");
     }
 }

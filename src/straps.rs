@@ -133,6 +133,43 @@ pub enum Stopped {
     PastEnd,
 }
 
+/// `Straps::clipToExtent` (upstream `a718d1cd60`) — a strap generated across its whole boundary is
+/// cut to the runs that lie in `extent`, the area the straps may occupy as an outline.
+///
+/// Only how far a strap RUNS is clipped, never its width or position: the pieces of
+/// `strap ∩ extent` are projected onto the strap's own direction, touching or overlapping runs are
+/// one run, and each run keeps the strap's full width — so a strap overhanging the area across its
+/// width keeps the length it always had. An empty extent, or a strap not in it at all (the sweep's
+/// decision, e.g. `-allow_out_of_core`), comes back unchanged. On a rectangular floorplan the extent
+/// is the boundary and this is the identity.
+pub fn clip_to_extent(strap: Rect, extent: &[Rect], horizontal: bool) -> Vec<Rect> {
+    if extent.is_empty() {
+        return vec![strap];
+    }
+    let mut runs: Vec<(i32, i32)> = extent
+        .iter()
+        .filter_map(|e| {
+            let c = (e.0.max(strap.0), e.1.max(strap.1), e.2.min(strap.2), e.3.min(strap.3));
+            (c.0 < c.2 && c.1 < c.3).then_some(if horizontal { (c.0, c.2) } else { (c.1, c.3) })
+        })
+        .collect();
+    if runs.is_empty() {
+        return vec![strap];
+    }
+    runs.sort_unstable();
+    let mut merged: Vec<(i32, i32)> = Vec::new();
+    for (s, e) in runs {
+        match merged.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((s, e)),
+        }
+    }
+    merged
+        .into_iter()
+        .map(|(s, e)| if horizontal { (s, strap.1, e, strap.3) } else { (strap.0, s, strap.2, e) })
+        .collect()
+}
+
 /// **S2** — lay the stripes.
 ///
 /// `span` is a plain `(xlo, ylo, xhi, yhi)`. ⚠️ Deliberately not named "along" and "across": which
@@ -715,5 +752,19 @@ mod tests {
         // allow_out_of_core moves the LIMIT to the die's near edge; the origin stays at the core.
         assert_eq!(sweep(core, die, true, true, true), (800, 0));
         assert_eq!(sweep(core, die, false, false, true), (900, 100));
+    }
+
+    // Rule (clipToExtent): runs clipped to the outline, width kept; a strap overhanging across its
+    // width keeps its length; one outside the area is the sweep's business and is left alone.
+    #[test]
+    fn a_strap_is_clipped_to_the_runs_inside_the_outline() {
+        let l = [(0, 0, 190000, 112000), (0, 112000, 95000, 224000)];
+        assert_eq!(clip_to_extent((122520, 0, 123480, 224000), &l, false), vec![(122520, 0, 123480, 112000)]);
+        assert_eq!(clip_to_extent((22520, 0, 23480, 224000), &l, false), vec![(22520, 0, 23480, 224000)], "two touching pieces are one run");
+        assert_eq!(clip_to_extent((94500, 0, 95500, 224000), &l, false), vec![(94500, 0, 95500, 224000)], "overhanging across: full length");
+        assert_eq!(clip_to_extent((300000, 0, 301000, 224000), &l, false), vec![(300000, 0, 301000, 224000)], "outside: unchanged");
+        let u = [(0, 0, 100, 20), (0, 80, 100, 100), (0, 20, 20, 80)];
+        assert_eq!(clip_to_extent((50, 0, 60, 100), &u, false), vec![(50, 0, 60, 20), (50, 80, 60, 100)], "a U gives two runs");
+        assert_eq!(clip_to_extent((0, 5, 100, 15), &[], true), vec![(0, 5, 100, 15)]);
     }
 }

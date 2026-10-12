@@ -2367,7 +2367,16 @@ fn cut_shapes(
             // ALONG from its RAW one grown by the larger of the two halos. Both halves and the
             // order between them are tested in `shapes::cut_sequence_tests`, against the split the
             // reference makes in `report`.
-            .filter_map(|(_, r, _, raw)| shapes::blocked_span(*rect, mine, *r, *raw, horizontal))
+            .filter_map(|(_, r, owner, raw)| {
+                let span = shapes::blocked_span(*rect, mine, *r, *raw, horizontal)?;
+                // 🔑 **No spacing is owed to an absence of die** (upstream `a718d1cd60`): it still
+                // has to reach the shape, but it blocks only its own extent.
+                Some(if owner.as_deref() == Some(dbio::DIE_ABSENCE) {
+                    if horizontal { (raw.0, raw.2) } else { (raw.1, raw.3) }
+                } else {
+                    span
+                })
+            })
             .collect();
         // 🔑 **`PDN_CUT_LAYER=<layer>` says why a shape ends where it does.** One line per shape
         // on that layer with the halo it carries, then one per obstruction that reaches it —
@@ -2437,6 +2446,9 @@ fn make_strap(
     ring_shapes: &[(String, Rect)],
     b: StrapBounds,
     per_micron: f64,
+    // `getDomainBoundaryRegion` and `getGridBoundaryRegion`, for `clipToExtent`.
+    domain_boundary_region: &[Rect],
+    grid_boundary_region: &[Rect],
 ) -> (
     Option<(String, i32, i32, i32, bool)>,
     Vec<(String, String, Rect, &'static str)>,
@@ -2568,6 +2580,23 @@ fn make_strap(
                 &avoid,
                 horizontal,
             );
+            // `clipToExtent`: each strap, generated across the whole boundary, is clipped to the
+            // outline the mode allows — the domain boundary region (`core`), the ring area
+            // (`rings`), the grid boundary region (`boundary`). The identity on a rectangle.
+            let ring_extent = [b.ring];
+            let extent: &[Rect] = match extend {
+                "rings" => &ring_extent,
+                "boundary" => grid_boundary_region,
+                _ => domain_boundary_region,
+            };
+            let stripes: Vec<straps::Stripe> = stripes
+                .into_iter()
+                .flat_map(|s| {
+                    straps::clip_to_extent(s.rect, extent, horizontal)
+                        .into_iter()
+                        .map(move |r| straps::Stripe { rect: r, ..s.clone() })
+                })
+                .collect();
             // ── cut around obstructions on this layer ───────────────────────────────────────────
             // ⚠️ Both the stripe AND the obstruction are grown before they are compared. The stripe's
             // halo comes from the LEF 5.5 spacing table indexed by its own width and the length it
@@ -2985,13 +3014,16 @@ fn generate(args: &[String]) -> ExitCode {
     // ⚠️ **The two rects are not the same and both are needed.** The reference queries with the
     // bloated obstruction and then measures containment against the obstruction's own `rect_`.
     // Collapsing them either cuts too little — a raw rect queried — or exempts too much.
+    // ⚠️ A SYSTEM-RESERVED obstruction marks where a polygon die is absent, and carries
+    // `dbio::DIE_ABSENCE` as its owner so `cut_shapes` owes it no spacing.
     let blockages: Vec<(String, Rect, Option<String>, Rect)> = db
-        .obstruction_boxes()
+        .obstruction_shapes_with_rules()
         .unwrap_or_default()
         .into_iter()
-        .map(|(layer, x0, y0, x1, y1)| {
-            let r = (x0, y0, x1, y1);
-            (db.layer_name_by_number(layer), r, None, r)
+        .map(|o| {
+            let r = o.shape.rect;
+            let owner = o.system_reserved.then(|| dbio::DIE_ABSENCE.to_string());
+            (db.layer_name_by_number(o.shape.layer), r, owner, r)
         })
         .collect();
     // ── stage 5, in part: fixed block pins ───────────────────────────────────────────────────
@@ -3574,6 +3606,8 @@ fn generate(args: &[String]) -> ExitCode {
                 }
                 (b[0], b[1], b[2], b[3])
             };
+            // `getDomainRegion`: the region's rectangle, or the macro's real outline.
+            let domain_rects: Vec<Rect> = if region_area.is_some() { vec![area] } else { instance_outline(&db, &g.instance) };
             // 🔑 **How many rings nest, which is how far the keep-out reaches** — the grid's own
             // net count, which is also what a strap set divides its pitch by.
             let ring_nets: i32 = grid_net_count(&db, o, g, &build_nets);
@@ -3667,25 +3701,24 @@ fn generate(args: &[String]) -> ExitCode {
                     std::mem::swap(&mut hor, &mut ver);
                 }
                 let _ = &l1;
-                let ring_rect = (
-                    area.0 - ver - off4[0],
-                    area.1 - hor - off4[1],
-                    area.2 + ver + off4[2],
-                    area.3 + hor + off4[3],
-                );
-                for l in ring_layers {
-                    ring_blankets.push((l, ring_rect));
+                // 🔑 The domain REGION grown by offset + width (upstream `a718d1cd60`): as the
+                // bounding box grown, it would claim a polygon macro's notch, where this grid has no
+                // ring and another grid is entitled to its vias. One blanket per rectangle.
+                for ring_rect in vyges_pdn::region::rects(&vyges_pdn::region::bloat(
+                    &domain_rects,
+                    [ver + off4[0], hor + off4[1], ver + off4[2], hor + off4[3]],
+                )) {
+                    for l in &ring_layers {
+                        ring_blankets.push((l.clone(), ring_rect));
+                    }
                 }
             }
             // ⚠️ **The halo box is the INSTANCE grid's alone.** `InstanceGrid` overrides the base
             // and adds `getGridArea()` — the instance plus its halo — on every layer the base
             // produced; a core grid with a region gets the base function and nothing more.
-            let grid_area = (
-                area.0 - g.halo[0],
-                area.1 - g.halo[1],
-                area.2 + g.halo[2],
-                area.3 + g.halo[3],
-            );
+            // `getGridRegion`: the outline plus the halo, not the bounding box — the notch of an
+            // L-shaped macro is ordinary core area and the core grid is entitled to it.
+            let grid_area = vyges_pdn::region::rects(&vyges_pdn::region::bloat(&domain_rects, g.halo));
             let instance_grid = !g.instance.is_empty();
             let mut out: Vec<(usize, String, Rect, Rect)> = Vec::new();
             // 🔑 **The instance's own obstructions, with this grid's halo, as GRID-level ones.**
@@ -3697,10 +3730,16 @@ fn generate(args: &[String]) -> ExitCode {
                     out.push((i, layer.clone(), *r, *r));
                 }
             }
+            // `getDomainRegion().getRects()` on every layer the grid uses (the outline, so another
+            // grid's vias in the notch of a polygon domain are not rejected).
             for l in &layers {
-                out.push((i, l.clone(), area, area));
+                for &r in &vyges_pdn::region::rects(&domain_rects) {
+                    out.push((i, l.clone(), r, r));
+                }
                 if instance_grid {
-                    out.push((i, l.clone(), grid_area, grid_area));
+                    for &ga in &grid_area {
+                        out.push((i, l.clone(), ga, ga));
+                    }
                 }
             }
             for (l, r) in ring_blankets {
@@ -3709,7 +3748,9 @@ fn generate(args: &[String]) -> ExitCode {
                 let h = obstruction_spacing(&db, &l, w, len);
                 out.push((i, l.clone(), (r.0 - h, r.1 - h, r.2 + h, r.3 + h), r));
                 if instance_grid && !layers.contains(&l) {
-                    out.push((i, l, grid_area, grid_area));
+                    for &ga in &grid_area {
+                        out.push((i, l.clone(), ga, ga));
+                    }
                 }
             }
             out
@@ -3981,6 +4022,18 @@ fn generate(args: &[String]) -> ExitCode {
         } else {
             boundary
         };
+        // `getDomainBoundaryRegion`: the core grid's domain region grown vertically by half the
+        // follow pin width (`CoreGrid`); an instance grid's boundary minus the macro's notch (the
+        // part of its box that is not the macro). `getGridBoundaryRegion`: the die for the core
+        // grid, the domain boundary region for an instance grid.
+        let domain_boundary_region: Vec<Rect> = if grid.instance.is_empty() {
+            vyges_pdn::region::bloat(&domain_region, [0, widest_followpin / 2, 0, widest_followpin / 2])
+        } else {
+            let notch = vyges_pdn::region::minus(&[core], &domain_region);
+            vyges_pdn::region::minus(&[boundary], &notch)
+        };
+        let grid_boundary_region: Vec<Rect> =
+            if grid.instance.is_empty() { die_rects.clone() } else { domain_boundary_region.clone() };
         // 🔑 **This grid does not see its own instance's obstructions.** They are in the global
         // list for every other grid; here they are taken back out, which is what
         // `skip_insts` plus `getGridLevelObstructions` amounts to.
@@ -4646,6 +4699,8 @@ fn generate(args: &[String]) -> ExitCode {
                             mirror: grid_mirror,
                         },
                         per_micron,
+                        &domain_boundary_region,
+                        &grid_boundary_region,
                     );
                     // ⚠️ Not on the retry. `strap_sets` is our own bookkeeping — the reference has
                     // no equivalent to re-register — and a set recorded twice is counted twice by
@@ -4980,9 +5035,12 @@ fn generate(args: &[String]) -> ExitCode {
         // macro's edge, and removing it later leaves the neighbour extended to a via that no longer
         // exists.
         if grid.instance.is_empty() {
+            // Against the macro's OUTLINE (upstream `a718d1cd60`), its box only the cheap first
+            // test: a shape in the notch of an L-shaped macro is over rows and stays.
             let inside = |layer: &str, r: Rect| {
-                macro_boxes.iter().any(|(l, o)| {
+                macro_boxes.iter().any(|(l, o, shape)| {
                     l == layer && o.0 <= r.0 && o.1 <= r.1 && r.2 <= o.2 && r.3 <= o.3
+                        && vyges_pdn::region::contains(shape, &[r])
                 })
             };
             let mut i = grid_shapes_from;
@@ -5232,21 +5290,25 @@ fn generate(args: &[String]) -> ExitCode {
                     continue;
                 }
                 let mw = db.layer_get_min_width(layer) as i32;
-                if rect.0 == die.0 {
+                // 🔑 A face on the WALL of a notch is a die edge too (`isOnInteriorWall`, upstream
+                // `a718d1cd60`); the pin is measured from the shape's own face, which on the
+                // bounding box is the die's.
+                let wall = |n: (i32, i32)| vyges_pdn::region::is_on_interior_wall(&die_rects, *rect, n);
+                if rect.0 == die.0 || wall((-1, 0)) {
                     edge_connections.push((net.clone(), layer.clone(), true,
-                        (die.0, rect.1, (die.0 + mw).min(rect.2), rect.3)));
+                        (rect.0, rect.1, (rect.0 + mw).min(rect.2), rect.3)));
                 }
-                if rect.2 == die.2 {
+                if rect.2 == die.2 || wall((1, 0)) {
                     edge_connections.push((net.clone(), layer.clone(), true,
-                        ((die.2 - mw).max(rect.0), rect.1, die.2, rect.3)));
+                        ((rect.2 - mw).max(rect.0), rect.1, rect.2, rect.3)));
                 }
-                if rect.1 == die.1 {
+                if rect.1 == die.1 || wall((0, -1)) {
                     edge_connections.push((net.clone(), layer.clone(), false,
-                        (rect.0, die.1, rect.2, (die.1 + mw).min(rect.3))));
+                        (rect.0, rect.1, rect.2, (rect.1 + mw).min(rect.3))));
                 }
-                if rect.3 == die.3 {
+                if rect.3 == die.3 || wall((0, 1)) {
                     edge_connections.push((net.clone(), layer.clone(), false,
-                        (rect.0, (die.3 - mw).max(rect.1), rect.2, die.3)));
+                        (rect.0, (rect.3 - mw).max(rect.1), rect.2, rect.3)));
                 }
             }
 
@@ -5708,6 +5770,8 @@ fn generate(args: &[String]) -> ExitCode {
             .collect();
         let emitted_before = emitted.len();
         let mut held_any = 0;
+        // The die as rectangles, for the notch-wall pins (`isOnInteriorWall`).
+        let die_trim_rects = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
         let mut kept = Vec::with_capacity(emitted.len());
         for (net, layer, rect, shape) in emitted {
             // What holds this shape up: every via landing on it, on either of its two faces.
@@ -5771,6 +5835,7 @@ fn generate(args: &[String]) -> ExitCode {
                 rect,
                 die,
                 (db.layer_get_min_width(&layer) as i32).max(1),
+                &die_trim_rects,
             ));
             // ⚠️ The LAYER's direction here, and that is correct: base `Shape::getLayerDirection`
             // returns exactly that. Only `FollowPinShape` overrides it, and that path is below.
@@ -5830,13 +5895,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // ⚠️ Without the gate a CUT rail is restored: its minimum rect merges the rows it
                 // covers, a row spans the core, and both halves grow back into two identical
                 // full-width rails.
-                let want = if want.0 >= rect.0 && want.1 >= rect.1
-                    && want.2 <= rect.2 && want.3 <= rect.3
-                {
-                    want
-                } else {
-                    rect
-                };
+                let want = vyges_pdn::trim::followpin_trimmed(rect, want, &vias_only);
                 kept.push((net, layer, want, shape));
                 continue;
             }

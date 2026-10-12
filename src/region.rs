@@ -103,6 +103,14 @@ pub fn margin_beyond(region: &[Rect], from: Rect, normal: (i32, i32)) -> i32 {
     best
 }
 
+/// `Region::getRects` — the region as non-overlapping rectangles: its outer outlines (holes filled)
+/// cut into horizontal bands, one rectangle per x interval in each band. Use where the rectangles
+/// themselves are consumed one by one (an obstruction bloated by its own size), not just their
+/// union.
+pub fn rects(region: &[Rect]) -> Vec<Rect> {
+    outline_loops(region).iter().flat_map(|l| polygon_rects(l)).collect()
+}
+
 /// `Region::Edge` — a boundary edge walked with the interior on its LEFT, corner to corner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edge {
@@ -285,6 +293,40 @@ pub fn margin_beyond_exact(region: &[Rect], from: Rect, normal: (i32, i32)) -> i
     }).min().unwrap().max(0)
 }
 
+/// `Region::isOnInteriorWall` — does the named face of `rect` sit on a wall of the region strictly
+/// inside its bounding box (the wall of a notch)? Faces on the bounding box itself are excluded, so
+/// on a rectangular region this never fires. Measured across the part of `rect` actually in the
+/// region (a rail hanging half past the die must not read as a wall); the face counts when that part
+/// still reaches it and the region goes no further beyond it.
+pub fn is_on_interior_wall(region: &[Rect], rect: Rect, normal: (i32, i32)) -> bool {
+    let Some(b) = region.iter().copied().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3))) else {
+        return false;
+    };
+    let high = normal.0 > 0 || normal.1 > 0;
+    let horizontal = normal.0 != 0;
+    let face_of = |r: Rect| match (horizontal, high) {
+        (true, true) => r.2,
+        (true, false) => r.0,
+        (false, true) => r.3,
+        (false, false) => r.1,
+    };
+    let (bx, face) = (face_of(b), face_of(rect));
+    if if high { face >= bx } else { face <= bx } {
+        return false;
+    }
+    let touching: Vec<Rect> = region
+        .iter()
+        .filter_map(|r| {
+            let c = (r.0.max(rect.0), r.1.max(rect.1), r.2.min(rect.2), r.3.min(rect.3));
+            (c.0 < c.2 && c.1 < c.3).then_some(c)
+        })
+        .collect();
+    let Some(clipped) = touching.iter().copied().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3))) else {
+        return false;
+    };
+    face_of(clipped) == face && margin_beyond_exact(region, clipped, normal) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +375,16 @@ mod tests {
         assert_eq!(area, 9 * 8, "left in by 1, bottom up by 2");
         assert!(contains(&[(1, 2, 10, 10)], &s) && contains(&s, &[(1, 2, 10, 10)]));
         assert_eq!(margin_beyond_exact(&[(0, 0, 100, 100)], (10, 10, 20, 20), (0, -1)), 10);
+    }
+
+    // Rule (isOnInteriorWall): the notch wall of an L die is an edge; the bounding box's own faces
+    // are not (they are the caller's other test); a face short of the region is not on it.
+    #[test]
+    fn a_notch_wall_is_an_edge_and_the_bounding_box_is_not() {
+        let l = vec![(0, 0, 190000, 112000), (0, 112000, 95000, 224000)];
+        assert!(is_on_interior_wall(&l, (122520, 0, 123480, 112000), (0, 1)), "a strap ending on the notch's floor");
+        assert!(!is_on_interior_wall(&l, (122520, 0, 123480, 103770), (0, 1)), "short of the wall");
+        assert!(!is_on_interior_wall(&l, (22520, 0, 23480, 224000), (0, 1)), "on the bounding box's top: not interior");
+        assert!(is_on_interior_wall(&l, (0, 160340, 95000, 161660), (1, 0)), "a strap ending on the notch's side wall");
     }
 }
