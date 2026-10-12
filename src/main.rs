@@ -2562,10 +2562,19 @@ fn make_strap(
             // it merely crosses. Avoiding every ring on every layer silently deletes whole strap sets:
             // a vertical strap spanning the ring area crosses the horizontal rings by construction, so
             // every one of its stripes is dropped and the set produces nothing at all.
+            //
+            // 🔑 **And each by its OBSTRUCTION box**, the ring grown by its own spacing: the avoid set
+            // is a `Shape::ObstructionTree`, which indexes a shape by its obstruction. Measured
+            // (`instruments/pdn/pdn-strap-avoid-patch.py`, polygon_die_and_macro): a macro strap at
+            // x 85870–87730 is skipped for a VSS ring at 88600–89800 — the raw rects do not meet.
             let avoid: Vec<Rect> = ring_shapes
                 .iter()
                 .filter(|(l, _)| *l == spec.layer)
-                .map(|(_, r)| *r)
+                .map(|(l, r)| {
+                    let (w, len) = ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
+                    let h = obstruction_spacing(db, l, w, len);
+                    (r.0 - h, r.1 - h, r.2 + h, r.3 + h)
+                })
                 .collect();
             // The mirror that matters is along the axis the stripes STEP on: y for horizontal ones.
             let mirror = if horizontal { b.mirror.1 } else { b.mirror.0 };
