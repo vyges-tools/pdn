@@ -51,7 +51,7 @@ src/channels.rs    finding unconnected channels and repairing them
 OpenROAD's `pdn` module was the **reference for this engine's behaviour**. The algorithms here are
 reimplemented from its published behaviour — the same published algorithm and the same parameter
 semantics — and are not a transliteration of its source; no code is copied. Written against OpenDB
-at pin `da9f29f18b6487825aa880597176e0fa97110b31`; `vyges-pdn --describe` reports the pin a given
+at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`; `vyges-pdn --describe` reports the pin a given
 build was made against.
 
 Agreeing with `pdn` is not a goal this project is bound to. Where its own requirements point
