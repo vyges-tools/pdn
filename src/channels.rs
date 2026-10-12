@@ -83,6 +83,33 @@ pub fn merge_channels(bloated: &[Rect]) -> Vec<Rect> {
     out
 }
 
+/// The order a layer's channels are offered in: every WHOLE run first, then the pieces, each group
+/// in its original order (`findRepairChannels`, upstream `1a93dd266`).
+///
+/// A channel is a PIECE when another channel contains it, is not equal to it, and reaches further
+/// ACROSS the strap by less than the target strap's width at both ends — the same run, cut along its
+/// length. Repairing a piece first takes the rest of the run out of the pass as overlapping it and
+/// leaves holes in what should be one strap. A contained channel reaching further by the strap width
+/// or more is a different shape (the two halves of a jog) and stays whole. "Across" is y for a
+/// horizontal target, x for a vertical one; `areas` are the channels' final areas, after the core
+/// clip and the feed extension.
+pub fn whole_runs_first(areas: &[Rect], target_horizontal: bool, strap_width: i32) -> Vec<usize> {
+    let is_piece_of = |whole: Rect, piece: Rect| {
+        let contains = whole.0 <= piece.0 && whole.1 <= piece.1 && piece.2 <= whole.2 && piece.3 <= whole.3;
+        if whole == piece || !contains {
+            return false;
+        }
+        let (low, high) = if target_horizontal {
+            (piece.1 - whole.1, whole.3 - piece.3)
+        } else {
+            (piece.0 - whole.0, whole.2 - piece.2)
+        };
+        low < strap_width && high < strap_width
+    };
+    let whole: Vec<bool> = areas.iter().map(|&p| !areas.iter().any(|&w| is_piece_of(w, p))).collect();
+    (0..areas.len()).filter(|&i| whole[i]).chain((0..areas.len()).filter(|&i| !whole[i])).collect()
+}
+
 /// **K2** — the part of a channel still free on the layer the repair straps will use.
 ///
 /// A channel is measured on the layer that was left unconnected, and the straps go on another. If
@@ -473,4 +500,23 @@ mod tests {
         assert_eq!(got, area, "neither candidate may move an end");
     }
 
+
+    // Rule (findRepairChannels, 1a93dd266): a contained channel differing ACROSS the strap by less
+    // than the strap width at both ends is a piece of the same run and goes behind every whole
+    // run; one reaching further by the width or more is a separate shape. Order within each group
+    // is kept.
+    #[test]
+    fn whole_runs_are_offered_before_their_pieces() {
+        // vertical target (across = x), strap width 10
+        let run = (0, 0, 100, 500);
+        let piece = (5, 0, 95, 200); // inside, 5 and 5 short across: a piece
+        let jog = (30, 300, 100, 500); // inside, 30 short on the low side: its own shape
+        let other = (200, 0, 300, 100);
+        assert_eq!(whole_runs_first(&[piece, run, jog, other], false, 10), vec![1, 2, 3, 0]);
+        assert_eq!(whole_runs_first(&[(10, 0, 90, 200), run], false, 10), vec![0, 1],
+                   "10 short = the strap width: not a piece");
+        assert_eq!(whole_runs_first(&[piece, run], true, 10), vec![0, 1],
+                   "a horizontal target measures across in y: 0 and 300 short, not a piece");
+        assert_eq!(whole_runs_first(&[run, run], false, 10), vec![0, 1], "equal is not a piece");
+    }
 }

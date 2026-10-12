@@ -1254,6 +1254,7 @@ fn find_channels(
         if orphans.is_empty() {
             continue;
         }
+        let first = out.len();
         for region in vyges_pdn::channels::merge_channels(&bloated) {
             let Some(mut area) = intersect_rect(region, core) else {
                 continue;
@@ -1368,6 +1369,20 @@ fn find_channels(
                 target_width,
                 target_spacing,
             });
+        }
+        // 🔑 Whole runs ahead of their pieces (upstream `1a93dd266`), within this layer's channels
+        // — one call of `findRepairChannels`, every channel sharing one target.
+        let mine: Vec<Channel> = out.drain(first..).collect();
+        let areas: Vec<Rect> = mine.iter().map(|c| c.area).collect();
+        let order = vyges_pdn::channels::whole_runs_first(&areas, target_horizontal, target_width);
+        let mut mine: Vec<Option<Channel>> = mine.into_iter().map(Some).collect();
+        out.extend(order.into_iter().filter_map(|i| mine[i].take()));
+        if std::env::var_os("PDN_TRACE").is_some() {
+            for c in &out[first..] {
+                let whole = !areas.iter().any(|&w| w != c.area && w.0 <= c.area.0 && w.1 <= c.area.1 && c.area.2 <= w.2 && c.area.3 <= w.3
+                    && vyges_pdn::channels::whole_runs_first(&[c.area, w], target_horizontal, target_width) == vec![1, 0]);
+                eprintln!("VYGPDN chan|{}|{}|{} {} {} {}|{}", layer, target_layer, c.area.0, c.area.1, c.area.2, c.area.3, u8::from(whole));
+            }
         }
     }
     out
