@@ -214,6 +214,8 @@ impl Opts {
     fn grids(&self) -> Vec<(String, Opts)> {
         const SCOPED: &[&str] = &[
             "ring",
+            // A ring declared inside `catch { … }`, resolved by `resolve_caught_rings`.
+            "caught-ring",
             "followpins",
             "stripe",
             "connect",
@@ -434,6 +436,107 @@ fn instance_pin_outline(db: &Db, inst: &str) -> Option<Rect> {
     })
 }
 
+/// What a ring is built around (`Grid::getDomainRegion`): the instance's real outline for an
+/// instance grid; for a core grid its domain's REGION rectangle when the domain has one (the bounding
+/// box of the region's rectangles, as the grid blankets read it), else the core's rebuilt outline.
+fn ring_domain(db: &Db, g: &GridSpec, o: &Opts, core: Rect) -> Vec<Rect> {
+    if !g.instance.is_empty() {
+        return instance_outline(db, &g.instance);
+    }
+    o.one("domain")
+        .and_then(|spec| {
+            let name = spec.split(':').next().unwrap_or("");
+            db.region_boundaries(name).ok().filter(|b| !b.is_empty())
+        })
+        .and_then(|b| b.into_iter().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3))))
+        .map_or_else(|| core_domain_region(db, core), |r| vec![r])
+}
+
+/// `Rings::checkLayerSpecifications` for one `--ring` spec, in its order: each layer's width,
+/// spacing and manufacturing grid, then `checkDieArea`. `Some((true, d))` refuses the ring,
+/// `Some((false, w))` is the PDN-0239 warning under `-allow_out_of_die`.
+fn ring_diag(db: &Db, spec: &str, net_count: i32, per_micron: f64, domain: &[Rect]) -> Option<(bool, validate::Diag)> {
+    // `<layer0>,<layer1>:<w0>,<w1>:<s0>,<s1>:<offsets>:<boundary>:<kind>[:allow]`
+    let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
+    let mut names = layers.split(',');
+    let l0 = names.next().unwrap_or("");
+    let l1 = names.next().unwrap_or(l0);
+    let p: Vec<&str> = rest.split(':').collect();
+    // ⚠️ One value expands to two, one per layer — `pdn::get_one_to_two`.
+    let pair = |field: Option<&&str>| -> (i32, i32) {
+        let v: Vec<i32> = field.unwrap_or(&"0").split(',').map(|x| dbu(x, per_micron)).collect();
+        match v.len() {
+            0 => (0, 0),
+            1 => (v[0], v[0]),
+            _ => (v[0], v[1]),
+        }
+    };
+    let (w0, w1) = pair(p.first());
+    let (s0, s1) = pair(p.get(1));
+    let offs: Vec<i32> = p.get(2).unwrap_or(&"0").split(',').map(|v| dbu(v, per_micron)).collect();
+    // One value expands to four and two to `{a b a b}` — `pdn::get_one_to_four`.
+    let off4 = match offs.len() {
+        0 => [0; 4],
+        1 => [offs[0]; 4],
+        2 => [offs[0], offs[1], offs[0], offs[1]],
+        _ => [offs[0], offs[1], offs[2], offs[3]],
+    };
+    for (layer, width, spacing) in [(l0, w0, s0), (l1, w1, s1)] {
+        if layer.is_empty() {
+            continue;
+        }
+        let Some(rules) = layer_rules(db, layer) else {
+            continue;
+        };
+        let min_spacing = min_spacing_for(db, layer, width);
+        if let Some(d) = validate::check_ring_layer(&rules, width, spacing, min_spacing, &off4) {
+            return Some((true, d));
+        }
+    }
+    // `getTotalWidth`: layer0's stack is the horizontal one unless layer0 is not horizontal.
+    let n = net_count.max(1);
+    let (mut hor, mut ver) = (w0 * n + s0 * (n - 1), w1 * n + s1 * (n - 1));
+    if direction_of(db, l0) != Direction::Horizontal {
+        std::mem::swap(&mut hor, &mut ver);
+    }
+    let die = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
+    validate::check_ring_die_area(domain, off4, hor, ver, &die, p.get(5) == Some(&"allow"), per_micron)
+}
+
+/// `catch { add_pdn_ring … }`: a ring declared inside a catch block reaches the engine as
+/// `--caught-ring`. The reference validates it inside `add_pdn_ring` and, refused, never adds it —
+/// the catch swallows the error and the script goes on. Resolved here, before anything else reads
+/// the options: kept as a `ring` AT ITS POSITION when its checks pass, dropped (the error logged)
+/// when they do not. The engine decides; the harness only says the command was caught.
+fn resolve_caught_rings(db: &Db, grids: &mut [(GridSpec, Opts)], build_nets: &[String], per_micron: f64, core: Rect) {
+    for (g, o) in grids.iter_mut() {
+        if !o.values.iter().any(|(k, _)| k == "caught-ring") {
+            continue;
+        }
+        let net_count = grid_net_count(db, o, g, build_nets);
+        let domain = ring_domain(db, g, o, core);
+        let mut kept = Vec::with_capacity(o.values.len());
+        for (k, v) in o.values.drain(..) {
+            if k != "caught-ring" {
+                kept.push((k, v));
+                continue;
+            }
+            match ring_diag(db, &v, net_count, per_micron, &domain) {
+                Some((true, d)) => {
+                    vyges_events::log("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {} (caught: the ring is not added)", d.code, d.message));
+                }
+                Some((false, w)) => {
+                    vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("PDN-{:04} {}", w.code, w.message));
+                    kept.push(("ring".to_string(), v));
+                }
+                None => kept.push(("ring".to_string(), v)),
+            }
+        }
+        o.values = kept;
+    }
+}
+
+
 /// Every declared component's dimensions, checked before anything is built.
 ///
 /// 🔑 **The reference checks these when the component is DECLARED, not when the grid is built** —
@@ -484,53 +587,10 @@ fn validate_grids(
         }
 
         for spec in o.all("ring") {
-            // `<layer0>,<layer1>:<w0>,<w1>:<s0>,<s1>:<offsets>[:boundary][:kind]`
-            let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
-            let mut names = layers.split(',');
-            let l0 = names.next().unwrap_or("");
-            let l1 = names.next().unwrap_or(l0);
-            let p: Vec<&str> = rest.split(':').collect();
-            // ⚠️ One value expands to two, one per layer — `pdn::get_one_to_two`.
-            let pair = |field: Option<&&str>| -> (i32, i32) {
-                let v: Vec<i32> = field
-                    .unwrap_or(&"0")
-                    .split(',')
-                    .map(|x| dbu(x, per_micron))
-                    .collect();
-                match v.len() {
-                    0 => (0, 0),
-                    1 => (v[0], v[0]),
-                    _ => (v[0], v[1]),
-                }
-            };
-            let (w0, w1) = pair(p.first());
-            let (s0, s1) = pair(p.get(1));
-            let offs: Vec<i32> = p
-                .get(2)
-                .unwrap_or(&"0")
-                .split(',')
-                .map(|v| dbu(v, per_micron))
-                .collect();
-            // One value expands to four and two to `{a b a b}` — `pdn::get_one_to_four`.
-            let off4 = match offs.len() {
-                0 => [0; 4],
-                1 => [offs[0]; 4],
-                2 => [offs[0], offs[1], offs[0], offs[1]],
-                _ => [offs[0], offs[1], offs[2], offs[3]],
-            };
-            for (layer, width, spacing) in [(l0, w0, s0), (l1, w1, s1)] {
-                if layer.is_empty() {
-                    continue;
-                }
-                let Some(rules) = layer_rules(db, layer) else {
-                    continue;
-                };
-                let min_spacing = min_spacing_for(db, layer, width);
-                if let Some(d) =
-                    validate::check_ring_layer(&rules, width, spacing, min_spacing, &off4)
-                {
-                    return Some(d);
-                }
+            match ring_diag(db, spec, net_count, per_micron, &ring_domain(db, g, o, core)) {
+                Some((true, d)) => return Some(d),
+                Some((false, w)) => vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("PDN-{:04} {}", w.code, w.message)),
+                None => {}
             }
         }
 
@@ -839,6 +899,51 @@ fn check_halo(db: &Db, g: &GridSpec) -> Option<validate::Diag> {
             f64::from(ml) / dbu, f64::from(mb) / dbu, f64::from(mr) / dbu, f64::from(mt) / dbu
         ),
     })
+}
+
+/// `VoltageDomain::getDomainRegion` for the core domain — the core as an OUTLINE, not a box.
+///
+/// Every non-PAD row in the block (not just the domain's: a region carved out of the core is where
+/// a different grid is built, not where the core stops), united with the real outline of every
+/// fixed block instance standing in them, holes filled, clipped to the core box and to the die.
+/// Trusted only if it is ONE piece reaching every side of the core box; otherwise the box is the
+/// better answer and is what comes back.
+fn core_domain_region(db: &Db, area: Rect) -> Vec<Rect> {
+    let mut shapes: Vec<Rect> = Vec::new();
+    for row in db.block_get_rows() {
+        if db.site_get_class(&db.row_get_site(&row)).unwrap_or_default() == "PAD" {
+            continue;
+        }
+        shapes.push((db.row_get_b_box_x_min(&row), db.row_get_b_box_y_min(&row), db.row_get_b_box_x_max(&row), db.row_get_b_box_y_max(&row)));
+    }
+    if shapes.is_empty() {
+        return vec![area];
+    }
+    for inst in db.block_get_insts() {
+        if db.master_is_block(&db.inst_get_master(&inst)) && db.inst_is_fixed(&inst) {
+            shapes.extend(instance_outline(db, &inst));
+        }
+    }
+    let filled: Vec<Rect> = vyges_pdn::region::outline_loops(&shapes)
+        .iter()
+        .flat_map(|l| vyges_pdn::region::polygon_rects(l))
+        .collect();
+    let clip = |a: Rect, b: Rect| -> Option<Rect> {
+        let r = (a.0.max(b.0), a.1.max(b.1), a.2.min(b.2), a.3.min(b.3));
+        (r.0 < r.2 && r.1 < r.3).then_some(r)
+    };
+    let die = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
+    let outline: Vec<Rect> = filled
+        .iter()
+        .filter_map(|&r| clip(r, area))
+        .flat_map(|r| die.iter().filter_map(move |&d| clip(r, d)).collect::<Vec<_>>())
+        .collect();
+    let loops = vyges_pdn::region::outline_loops(&outline);
+    let enclosing = outline.iter().copied().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3)));
+    if loops.len() != 1 || enclosing != Some(area) {
+        return vec![area];
+    }
+    outline
 }
 
 /// `getInstanceOutline` — the real outline of a placed instance, as rectangles in placed coordinates.
@@ -1929,7 +2034,10 @@ fn make_ring(
     // The grid's orientation: the instance's for a macro grid, `R0` for the core grid.
     orient: &str,
     per_micron: f64,
-) -> (Vec<rings::Segment>, Option<String>) {
+    // `getDomainRegion` (see `domain_region`) and the die as rectangles.
+    domain_region: &[Rect],
+    die_rects: &[Rect],
+) -> (Vec<rings::Segment>, Option<String>, (i32, i32, [i32; 4])) {
     let (layers, rest) = spec.split_once(':').unwrap_or((spec, ""));
     let p: Vec<&str> = rest.split(':').collect();
     let (l0, l1) = layers.split_once(',').unwrap_or((layers, layers));
@@ -1997,13 +2105,18 @@ fn make_ring(
     // value moves to the edge it now faces — upstream's `Rings::setOffset`, which both the core
     // and the pad form end in. Measured: `macros_flipped_180` puts `{1 2 3 4}` at `{3 4 1 2}`.
     let off4 = vyges_pdn::orient::edges_in_placed_frame(off4, orient);
-    let outline = rings::inner_outline(core, off4);
+    // `getInnerRingOutline`: the domain REGION grown by the offsets — on a polygon core the ring
+    // follows the outline (upstream `a718d1cd60`); on a rectangle this is `inner_outline` exactly.
+    let _ = die;
+    let inner = vyges_pdn::region::bloat(domain_region, off4);
     // ⚠️ A ring extended to the boundary reaches the DIE along each side, and stops growing per net
     // on that axis — the loops still nest, they just all reach the same distance.
-    let ring_bound = (p.get(3).copied() == Some("boundary")).then_some(die);
+    let ring_bound = (p.get(3).copied() == Some("boundary")).then_some(die_rects);
+    let totals = rings::total_width(&mk(l0), &mk(l1), build_nets.len());
     (
-        rings::make(&mk(l0), &mk(l1), build_nets, outline, ring_bound),
+        rings::make_region(&mk(l0), &mk(l1), build_nets, &inner, ring_bound),
         locked,
+        (totals.0, totals.1, off4),
     )
 }
 
@@ -2517,6 +2630,10 @@ fn make_followpins(
     die: Rect,
     ring_area: Rect,
     per_micron: f64,
+    // `getDomainRegion`, the die as rectangles, and the grid's rings as built.
+    domain_region: &[Rect],
+    die_rects: &[Rect],
+    built_rings: &[rings::BuiltRing],
 ) -> Option<(String, i32, Vec<(String, Rect)>)> {
     let mut parts = spec.splitn(3, ':');
     let layer = parts.next().unwrap_or(spec);
@@ -2547,7 +2664,28 @@ fn make_followpins(
     // multi-height cases. The same number is now also the STEP the rails ladder by.
     let row_height = followpins::row_height(rows).unwrap_or(0);
     let pitch = 2 * row_height;
-    let rails = followpins::make(layer, power, ground, width, rows, core, fp_bound, row_height);
+    let _ = (core, fp_bound);
+    // `FollowPins::makeShapes`' `reach`, per extension mode, against what is beside each band:
+    // `rings` — that band's ring (`getRingReach`); `boundary` — where the grid boundary region
+    // ends beyond it; `core` / `fixed` — the row's own end.
+    let reach = |band: Rect, normal: (i32, i32)| -> i32 {
+        let high = normal.0 > 0;
+        match extend {
+            "rings" => {
+                let r = rings::ring_reach(built_rings, band, normal);
+                if std::env::var_os("PDN_TRACE").is_some() {
+                    eprintln!("[fpreach] band {band:?} normal {normal:?} -> {r} ({} rings)", built_rings.len());
+                }
+                r
+            }
+            "boundary" => {
+                let m = vyges_pdn::region::margin_beyond_exact(die_rects, band, normal);
+                if high { band.2 + m } else { band.0 - m }
+            }
+            _ => if high { band.2 } else { band.0 },
+        }
+    };
+    let rails = followpins::make(layer, power, ground, width, rows, domain_region, row_height, &reach);
     // ⚠️ **Accumulated, not deduped.** Adjacent rows are flipped, so every interior row edge is
     // written by both of the rows that meet on it — but the two are not always the same rectangle.
     // Where a macro splits one row and not the row beneath it, the shared edge is written once at
@@ -3322,7 +3460,7 @@ fn generate(args: &[String]) -> ExitCode {
     // Every grid this run declares, in the order `buildGrids` would build them.
     // ⚠️ **One `-macro` declaration can name several instances, and each is its own grid** with
     // the same components. Expanded here so the loop below never has to know.
-    let grids: Vec<(GridSpec, Opts)> = opts
+    let mut grids: Vec<(GridSpec, Opts)> = opts
         .grids()
         .into_iter()
         .flat_map(|(spec, o)| {
@@ -3360,6 +3498,8 @@ fn generate(args: &[String]) -> ExitCode {
 
     // ── what the technology allows a component to state ─────────────────────────────────────
     // 🔑 **Before anything is built, and the first violation ends the run.** See `validate_grids`.
+    resolve_caught_rings(&db, &mut grids, &build_nets, per_micron, core);
+    let grids = grids;
     let setup = || check_setup(&db, &grids, &build_nets, &db.block_get_insts());
     if let Some(d) = validate_grids(&db, &grids, &build_nets, per_micron, core).or_else(setup) {
         // 🔑 **One site, every diagnostic.** `Diag` already carries the reference's own code and
@@ -3826,6 +3966,16 @@ fn generate(args: &[String]) -> ExitCode {
             db.inst_get_orient(&grid.instance)
         };
         let grid_mirror = vyges_pdn::orient::axis_mirror(&grid_orient);
+        // `Grid::getDomainRegion`: a region domain's rectangle; the core grid's rebuilt outline;
+        // an instance grid's real outline.
+        let domain_region: Vec<Rect> = if region_domain.is_some() {
+            vec![core]
+        } else if grid.instance.is_empty() {
+            core_domain_region(&db, core)
+        } else {
+            instance_outline(&db, &grid.instance)
+        };
+        let die_rects = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
         let strap_boundary = if grid.instance.is_empty() {
             vyges_pdn::grid::domain_boundary(core, widest_followpin)
         } else {
@@ -3989,6 +4139,8 @@ fn generate(args: &[String]) -> ExitCode {
         } else {
             Vec::new()
         };
+        // This grid's rings, as built — what `getRingReach` reads.
+        let mut built_rings: Vec<rings::BuiltRing> = Vec::new();
         let mut queue: Vec<(components::Component, bool)> =
             components::plan(&opts.values, pad_conns.len())
                 .into_iter()
@@ -4027,8 +4179,8 @@ fn generate(args: &[String]) -> ExitCode {
             }
             match comp {
                 components::Component::Ring(spec) => {
-                    let (segments, locked) =
-                        make_ring(&db, spec, &build_nets, core, die, &grid_orient, per_micron);
+                    let (segments, locked, (ring_hor, ring_ver, ring_off)) =
+                        make_ring(&db, spec, &build_nets, core, die, &grid_orient, per_micron, &domain_region, &die_rects);
                     // ⚠️ Not on the retry, for the same reason `strap_sets` is not: our bookkeeping,
                     // recorded once per declaration.
                     if let (Some(layer), false) = (locked, is_retry) {
@@ -4061,6 +4213,8 @@ fn generate(args: &[String]) -> ExitCode {
                             .chain(made_obstructions(&db, &emitted))
                             .collect::<Vec<_>>(),
                     );
+                    // `ring->getShapes()` as a later follow pin set reads them: cut, as they stand.
+                    built_rings.push((ring_hor, ring_ver, ring_off, pieces.iter().map(|(_, _, r)| *r).collect()));
                     for (net, layer, rect) in pieces {
                         ring_shapes.push((layer.clone(), rect));
                         emitted.push((net, layer, rect, "RING"));
@@ -4438,6 +4592,9 @@ fn generate(args: &[String]) -> ExitCode {
                         die,
                         ring_area,
                         per_micron,
+                        &domain_region,
+                        &die_rects,
+                        &built_rings,
                     ) else {
                         vyges_events::log(
                             "vyges-pdn",

@@ -352,6 +352,67 @@ pub fn check_strap(
         .or_else(|| check_group_fits(l, grid_name, d.grid_width, d.offset, group))
 }
 
+/// `Rings::checkDieArea` — does the ring fit inside the die? PDN-0351 if not (or, under
+/// `-allow_out_of_die`, the warning PDN-0239 and the ring is kept). `Some((is_error, diag))`.
+///
+/// Rules: the ring occupies the domain grown by each side's core offset plus the stacked metal on
+/// that side — `getTotalWidth`: `width × nets + spacing × (nets − 1)` per layer, the HORIZONTAL
+/// layer's on the bottom and top, the vertical layer's on the left and right — tested as an AREA
+/// against the die (on a polygon die a ring can leave it at a notch inside its bounding box).
+/// The message reports, side by side, the room each side needs (offset + width) against the room
+/// beyond it in the die (`getMarginBeyond`), the largest deficit per axis; when no side is short
+/// (the ring leaves the die only at a corner) it falls back to the extent of what lies outside.
+#[allow(clippy::too_many_arguments)]
+pub fn check_ring_die_area(
+    domain: &[crate::Rect],
+    offsets: [i32; 4],
+    hor_width: i32,
+    ver_width: i32,
+    die: &[crate::Rect],
+    allow_outside_die: bool,
+    per_micron: f64,
+) -> Option<(bool, Diag)> {
+    let [ol, ob, or, ot] = offsets;
+    // `getInnerRingOutline().bloat({ver, hor, ver, hor})` — the domain REGION, so on a polygon core
+    // the ring is measured where it actually runs, notch included.
+    let outline = crate::region::bloat(domain, [ol + ver_width, ob + hor_width, or + ver_width, ot + hor_width]);
+    if die.is_empty() || crate::region::contains(die, &outline) {
+        return None;
+    }
+    if allow_outside_die {
+        return Some((false, Diag { code: 239, message: "Ring shape falls outside the die bounds.".into() }));
+    }
+    // `getDieAreaDeficit`: each edge of the DOMAIN region against the die's room beyond it.
+    let (mut xb, mut yb) = (0, 0);
+    for e in crate::region::edges(&crate::region::outline_loops(domain)) {
+        let horizontal = e.start.1 == e.end.1;
+        let needed = if horizontal {
+            (if e.normal.1 > 0 { ot } else { ob }) + hor_width
+        } else {
+            (if e.normal.0 > 0 { or } else { ol }) + ver_width
+        };
+        let face = (e.start.0.min(e.end.0), e.start.1.min(e.end.1), e.start.0.max(e.end.0), e.start.1.max(e.end.1));
+        let deficit = needed - crate::region::margin_beyond_exact(die, face, e.normal);
+        if deficit > 0 {
+            if horizontal { yb = yb.max(deficit) } else { xb = xb.max(deficit) }
+        }
+    }
+    if xb == 0 && yb == 0 {
+        let out = crate::region::minus(&outline, die);
+        if let Some(r) = out.iter().copied().reduce(|a, c| (a.0.min(c.0), a.1.min(c.1), a.2.max(c.2), a.3.max(c.3))) {
+            xb = r.2 - r.0;
+            yb = r.3 - r.1;
+        }
+    }
+    Some((true, Diag {
+        code: 351,
+        message: format!(
+            "PDN rings do not fit inside the die area by {} um in X and {} um in Y. Either reduce the ring area or increase the core to die spacing to accommodate. Use -allow_out_of_die if this is intentional.",
+            f64::from(xb) / per_micron, f64::from(yb) / per_micron
+        ),
+    }))
+}
+
 /// Every check one of a ring's two layers must pass.
 ///
 /// ⚠️ **A ring measures its width against the LAYER's direction**, never against the shape's — the
@@ -377,6 +438,27 @@ pub fn check_ring_layer(
 // Test names carry the rule's emphasis in CAPITALS, as the reference comments do.
 #[allow(non_snake_case)]
 mod tests {
+    // Rule (Rings::checkDieArea / getDieAreaDeficit): the ring needs offset + stacked width beyond
+    // each side; the deficit against the die's room there is reported per axis, largest first.
+    // core_grid_with_rings_asymmetric_widths' refused ring, at 2000 DBU/um: 0.5/4.5 widths,
+    // 0.5/1.5 spacings, 2 nets → vertical stack 10.5 um + 0.5 offset = 11 um, room 9.88 um.
+    #[test]
+    fn a_ring_that_overruns_the_die_is_pdn_0351_with_the_deficit_per_axis() {
+        let die = [(0, 0, 100000, 100000)];
+        let core = (19760, 30000, 80240, 70000);
+        let (err, d) = check_ring_die_area(&[core], [1000; 4], 3000, 21000, &die, false, 2000.0).unwrap();
+        assert!(err);
+        assert_eq!(d.code, 351);
+        assert!(d.message.starts_with("PDN rings do not fit inside the die area by 1.12 um in X and 0 um in Y."), "{}", d.message);
+        let (err, d) = check_ring_die_area(&[core], [1000; 4], 3000, 21000, &die, true, 2000.0).unwrap();
+        assert!(!err && d.code == 239, "allowed outside: a warning, the ring kept");
+        assert!(check_ring_die_area(&[core], [1000; 4], 3000, 18000, &die, false, 2000.0).is_none(), "fits with 760 to spare");
+        // a polygon die: the ring fits the bounding box but crosses the notch
+        let l = crate::region::polygon_rects(&[(0, 0), (100000, 0), (100000, 40000), (40000, 40000), (40000, 100000), (0, 100000)]);
+        assert!(check_ring_die_area(&[(10000, 10000, 30000, 30000)], [0; 4], 1000, 1000, &l, false, 2000.0).is_none(), "inside the lower arm");
+        assert!(check_ring_die_area(&[(10000, 35000, 60000, 45000)], [0; 4], 1000, 1000, &l, false, 2000.0).is_some(), "crosses the notch");
+    }
+
 
     #[test]
     fn a_connect_rule_names_two_different_routing_layers() {

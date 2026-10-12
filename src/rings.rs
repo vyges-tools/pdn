@@ -66,6 +66,79 @@ pub fn inner_outline(domain: Rect, offset: [i32; 4]) -> Rect {
 /// `extend_to_boundary` replaces the along-side extent with the grid boundary. ⚠️ It stops the
 /// *along* axis growing per net, but the across axis still steps by a pitch — the rings still nest,
 /// they just all reach the same distance.
+/// **R2** on a region — `Rings::makeShapes` since polygon floorplans (`a718d1cd60`).
+///
+/// `inner` is the inner ring outline (the domain region grown by the offsets). Net `i`'s ring is
+/// that outline grown by `i` pitches — this layer's pitch along its own direction of travel, the
+/// other layer's across it — and its edges facing each side are swept outward by this layer's
+/// width, then run out along the side by the other layer's width at a CONVEX corner only (at a
+/// concave corner the neighbour already shares that square). With `boundary`, each end runs instead
+/// to where the boundary region ends beyond it (`getMarginBeyond`).
+///
+/// Sides are walked bottom then top for the horizontal pass, left then right for the vertical one,
+/// net by net — the rectangular builder's order, which this reproduces exactly on a rectangle.
+pub fn make_region(
+    layer0: &Layer,
+    layer1: &Layer,
+    nets: &[String],
+    inner: &[Rect],
+    boundary: Option<&[Rect]>,
+) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let single_layer = layer0.name == layer1.name;
+    let mut processed_horizontal = false;
+    for (def, other) in [(layer0, layer1), (layer1, layer0)] {
+        let (width, pitch) = (def.width, def.pitch());
+        let (other_width, other_pitch) = (other.width, other.pitch());
+        let horizontal = if single_layer { !processed_horizontal } else { def.direction == Direction::Horizontal };
+        if horizontal {
+            processed_horizontal = true;
+        }
+        let ring_edges: Vec<Vec<crate::region::Edge>> = (0..nets.len())
+            .map(|i| {
+                let (step, other_step) = (i as i32 * pitch, i as i32 * other_pitch);
+                let m = if horizontal { [other_step, step, other_step, step] } else { [step, other_step, step, other_step] };
+                crate::region::edges(&crate::region::outline_loops(&crate::region::bloat(inner, m)))
+            })
+            .collect();
+        let sides = if horizontal { [(0, -1), (0, 1)] } else { [(-1, 0), (1, 0)] };
+        for side in sides {
+            for (index, net) in nets.iter().enumerate() {
+                for e in ring_edges[index].iter().filter(|e| e.normal == side) {
+                    let (xlo, xhi) = (e.start.0.min(e.end.0), e.start.0.max(e.end.0));
+                    let (ylo, yhi) = (e.start.1.min(e.end.1), e.start.1.max(e.end.1));
+                    let start_is_low = if horizontal { e.start.0 < e.end.0 } else { e.start.1 < e.end.1 };
+                    let (convex_low, convex_high) =
+                        if start_is_low { (e.convex_at_start, e.convex_at_end) } else { (e.convex_at_end, e.convex_at_start) };
+                    let mut rect = if horizontal {
+                        let base = if side.1 > 0 { yhi } else { ylo - width };
+                        (xlo, base, xhi, base + width)
+                    } else {
+                        let base = if side.0 > 0 { xhi } else { xlo - width };
+                        (base, ylo, base + width, yhi)
+                    };
+                    let (low_n, high_n) = if horizontal { ((-1, 0), (1, 0)) } else { ((0, -1), (0, 1)) };
+                    let (mut ext_low, mut ext_high) =
+                        (if convex_low { other_width } else { 0 }, if convex_high { other_width } else { 0 });
+                    if let Some(b) = boundary {
+                        ext_low = crate::region::margin_beyond_exact(b, rect, low_n);
+                        ext_high = crate::region::margin_beyond_exact(b, rect, high_n);
+                    }
+                    if horizontal {
+                        rect.0 -= ext_low;
+                        rect.2 += ext_high;
+                    } else {
+                        rect.1 -= ext_low;
+                        rect.3 += ext_high;
+                    }
+                    out.push(Segment { layer: def.name.clone(), net: net.clone(), rect });
+                }
+            }
+        }
+    }
+    out
+}
+
 /// **R6** — the width every net's ring occupies on each axis, `Rings::getTotalWidth`.
 ///
 /// `width * rings + spacing * (rings - 1)` per layer, and ⚠️ **the pair is swapped where the lower
@@ -80,6 +153,57 @@ pub fn total_width(layer0: &Layer, layer1: &Layer, rings: usize) -> (i32, i32) {
     } else {
         (ver, hor)
     }
+}
+
+/// One built ring as a follow pin set reads it: `getTotalWidth` (horizontal, vertical), its core
+/// offsets `(left, bottom, right, top)` in the placed frame, and its shapes as they stand.
+pub type BuiltRing = (i32, i32, [i32; 4], Vec<Rect>);
+
+/// `Grid::getRingReach` — how far a shape at `band` may run out on the side `normal` points to: the
+/// furthest edge of any ring side ALONGSIDE the band on that side, but only within that ring's own
+/// reach from the domain (offset + total width on that side), which is what tells the band's own
+/// leg's ring from the one across a notch. A side bounds only the axis it is thin along (a square
+/// corner piece both). No such side: the band's own end.
+pub fn ring_reach(rings: &[BuiltRing], band: Rect, normal: (i32, i32)) -> i32 {
+    let horizontal_reach = normal.0 != 0;
+    let high = if horizontal_reach { normal.0 > 0 } else { normal.1 > 0 };
+    let origin = match (horizontal_reach, high) {
+        (true, true) => band.2,
+        (true, false) => band.0,
+        (false, true) => band.3,
+        (false, false) => band.1,
+    };
+    let mut reach = origin;
+    for (hor, ver, off, shapes) in rings {
+        let limit = if horizontal_reach {
+            (if high { off[2] } else { off[0] }) + ver
+        } else {
+            (if high { off[3] } else { off[1] }) + hor
+        };
+        for r in shapes {
+            let (dx, dy) = (r.2 - r.0, r.3 - r.1);
+            let bounds = dx == dy || if horizontal_reach { dx < dy } else { dx > dy };
+            if !bounds {
+                continue;
+            }
+            let alongside = if horizontal_reach { !(r.3 <= band.1 || r.1 >= band.3) } else { !(r.2 <= band.0 || r.0 >= band.2) };
+            if !alongside {
+                continue;
+            }
+            let far = match (horizontal_reach, high) {
+                (true, true) => r.2,
+                (true, false) => r.0,
+                (false, true) => r.3,
+                (false, false) => r.1,
+            };
+            let distance = if high { far - origin } else { origin - far };
+            if distance <= 0 || distance > limit {
+                continue;
+            }
+            reach = if high { reach.max(far) } else { reach.min(far) };
+        }
+    }
+    reach
 }
 
 /// **R7** — a PAD offset expressed as the core offset it is equivalent to, `Rings::setPadOffset`.
@@ -467,5 +591,50 @@ mod tests {
         let h = layer("m5", Direction::Horizontal, 10, 5);
         let v = layer("m6", Direction::Vertical, 10, 5);
         assert!(make(&h, &v, &[], (0, 0, 1000, 1000), None).is_empty());
+    }
+
+    // Rule (makeShapes since a718d1cd60): on a RECTANGLE the region builder is the old one exactly
+    // — same shapes, same order — with and without extending to a boundary.
+    #[test]
+    fn the_region_builder_is_the_rectangular_one_on_a_rectangle() {
+        let h = Layer { name: "m5".into(), direction: Direction::Horizontal, width: 100, spacing: 50 };
+        let v = Layer { name: "m6".into(), direction: Direction::Vertical, width: 200, spacing: 70 };
+        let nets = vec!["VDD".to_string(), "VSS".to_string()];
+        let core = (1000, 2000, 9000, 8000);
+        assert_eq!(make_region(&h, &v, &nets, &[core], None), make(&h, &v, &nets, core, None));
+        let die = (0, 0, 10000, 10000);
+        assert_eq!(make_region(&h, &v, &nets, &[core], Some(&[die])), make(&h, &v, &nets, core, Some(die)));
+    }
+
+    // Rule (makeShapes since a718d1cd60): on an L the bottom/top/left/right are walked per edge —
+    // three horizontal sides on the outside of the notch become three segments, and the side meeting
+    // the notch's concave corner is not extended into it.
+    #[test]
+    fn an_l_shaped_core_gets_a_ring_along_its_outline() {
+        let h = Layer { name: "m5".into(), direction: Direction::Horizontal, width: 10, spacing: 10 };
+        let v = Layer { name: "m6".into(), direction: Direction::Vertical, width: 10, spacing: 10 };
+        let nets = vec!["VDD".to_string()];
+        let l = [(0, 0, 100, 40), (0, 40, 40, 100)];
+        let s = make_region(&h, &v, &nets, &l, None);
+        let m5: Vec<Rect> = s.iter().filter(|s| s.layer == "m5").map(|s| s.rect).collect();
+        assert_eq!(m5, vec![(-10, -10, 110, 0), (40, 40, 110, 50), (-10, 100, 50, 110)], "the notch end (x 40) is not extended");
+        let m6: Vec<Rect> = s.iter().filter(|s| s.layer == "m6").map(|s| s.rect).collect();
+        assert_eq!(m6, vec![(-10, -10, 0, 110), (100, -10, 110, 50), (40, 40, 50, 110)], "the notch end (y 40) is not extended");
+    }
+
+    // Rule (getRingReach): the band's own leg's ring, not the one across the notch — a side further
+    // out than that ring's offset + width from the band is another edge's ring. Values: an L whose
+    // narrow leg ends at x 87400, ring offset 2000 + total width 2400 on the right.
+    #[test]
+    fn a_rail_reaches_its_own_legs_ring_and_not_the_wide_legs() {
+        let band = (14600, 114630, 87400, 114970);
+        let own = (91200, 100000, 91800, 180000); // right side of the narrow leg, 4400 out
+        let far = (175000, 0, 175400, 120000); // right side of the wide leg, reaching up past the band
+        let top = (0, 180000, 200000, 180400); // a horizontal side: bounds y, not x
+        let rings = vec![(2400, 2400, [2000; 4], vec![own, far, top])];
+        assert_eq!(ring_reach(&rings, band, (1, 0)), 91800);
+        assert_eq!(ring_reach(&rings, band, (-1, 0)), 14600, "nothing alongside on the left: the band's end");
+        let short = vec![(2400, 2400, [1000; 4], vec![own])];
+        assert_eq!(ring_reach(&short, band, (1, 0)), 87400, "4400 out is past a 3400 reach");
     }
 }
