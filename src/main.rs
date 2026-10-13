@@ -2062,6 +2062,7 @@ fn repair_vias(
 /// Build one `-ring` declaration — a `Rings` component, the first kind a grid holds.
 ///
 /// Returns its segments and, when the ring is single-layer, the layer that locks.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn make_ring(
     db: &Db,
     spec: &str,
@@ -9373,14 +9374,14 @@ mod channel_direction_tests {
 
 #[cfg(test)]
 mod repair_ownership_tests {
-    use super::repairable_shape;
+    use super::{repairable_shape, Rect};
 
     // Rule (`Grid::repairVias`): a via end is extended only when its shape belongs to the grid
     // doing the repair (`lower_belongs_to_grid` / `upper_belongs_to_grid`). Shapes from index 2 on
     // are this grid's; the core strap at index 0 contains the via end but is another grid's.
     #[test]
     fn only_the_repairing_grids_own_shape_is_extended() {
-        let e: Vec<(String, String, (i32, i32, i32, i32), &'static str)> = vec![
+        let e: Vec<(String, String, Rect, &'static str)> = vec![
             ("VSS".into(), "metal4".into(), (142520, 184940, 143480, 207370), "STRIPE"),
             ("VDD".into(), "metal4".into(), (0, 0, 10, 10), "STRIPE"),
             ("VSS".into(), "metal5".into(), (114000, 183870, 171000, 185730), "STRIPE"),

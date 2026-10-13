@@ -255,7 +255,7 @@ mod tests {
     /// the order they are added in, which decides who wins a cross-net overlap in `addShape`.
     fn every_row_gets_a_ground_rail_then_a_power_rail_bottom_up() {
         let rows = [row(0, 0, 1000, 200, "R0")];
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(out.len(), 2, "a single-height row still emits exactly two rails");
         assert_eq!(out[0].net, "VSS", "yMin comes first, and an R0 row has ground there");
         assert_eq!(out[1].net, "VDD");
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn an_r0_row_puts_power_on_its_top_edge() {
         let rows = [row(0, 0, 1000, 200, "R0")];
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(out[1].rect, (0, 180, 1000, 220), "power straddles the top edge");
         assert_eq!(out[0].rect, (0, -20, 1000, 20), "ground straddles the bottom");
     }
@@ -278,13 +278,13 @@ mod tests {
     fn only_the_y_inverting_orientations_swap_the_rails() {
         for orient in ["R0", "MY"] {
             let rows = [row(0, 0, 1000, 200, orient)];
-            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
             assert_eq!(out[0].net, "VSS", "{orient} is right side up: ground at yMin");
             assert_eq!(out[1].net, "VDD", "and power on top for {orient}");
         }
         for orient in ["MX", "R180", "MXR90"] {
             let rows = [row(0, 0, 1000, 200, orient)];
-            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
             assert_eq!(out[0].rect, (0, -20, 1000, 20), "power on the bottom for {orient}");
             assert_eq!(out[0].net, "VDD", "and it IS the power net for {orient}");
             assert_eq!(out[1].net, "VSS", "ground on top for {orient}");
@@ -302,7 +302,7 @@ mod tests {
     fn a_double_height_row_gets_a_rail_at_every_site_boundary_not_just_its_edges() {
         // A row on a 400-unit DOUBLE-height site, in a design whose standard row is 200.
         let rows = [tall_row(0, 0, 1000, 400, "R0", 400)];
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 400)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 400)).2 } else { ((0, 0, 1000, 400)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 400)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 400).2 } else { (0, 0, 1000, 400).0 });
         assert_eq!(out.len(), 3, "yMin, the interior boundary, and yMax -- `<=` includes yMax");
         let ys: Vec<i32> = out.iter().map(|r| r.rect.1 + 20).collect();
         assert_eq!(ys, vec![0, 200, 400], "one rail per 200-unit row boundary");
@@ -325,14 +325,14 @@ mod tests {
     fn an_even_height_rows_orientation_does_not_decide_its_first_rail() {
         for orient in ["R0", "MY", "MX", "R180"] {
             let rows = [tall_row(0, 0, 1000, 400, orient, 400)];
-            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 400)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 400)).2 } else { ((0, 0, 1000, 400)).0 });
+            let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 400)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 400).2 } else { (0, 0, 1000, 400).0 });
             let nets: Vec<&str> = out.iter().map(|r| r.net.as_str()).collect();
             assert_eq!(nets, vec!["VSS", "VDD", "VSS"], "ground first for {orient}");
         }
         // ⚠️ The probe must be able to FAIL: an ODD-height row DOES read its orientation, so the
         // two groups must not agree, or this test proves nothing about the even-height rule.
         let odd = [row(0, 0, 1000, 200, "MX")];
-        let out = make("m1", "VDD", "VSS", 40, &odd, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &odd, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(out[0].net, "VDD", "an odd-height MX row still starts with power");
     }
 
@@ -342,7 +342,7 @@ mod tests {
         let mut r = row(0, 0, 1000, 200, "R0");
         r.has_row_pattern = true;
         assert!(
-            make("m1", "VDD", "VSS", 40, &[r], &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 }).is_empty(),
+            make("m1", "VDD", "VSS", 40, &[r], &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 }).is_empty(),
             "the row pattern already placed these rails"
         );
     }
@@ -354,7 +354,7 @@ mod tests {
     fn a_row_that_is_not_a_whole_number_of_rows_emits_only_its_edges() {
         // A 270-tall site in a design whose standard row is 200: 270 % 200 != 0.
         let rows = [tall_row(0, 0, 1000, 270, "R0", 270)];
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 270)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 270)).2 } else { ((0, 0, 1000, 270)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[(0, 0, 1000, 270)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 270).2 } else { (0, 0, 1000, 270).0 });
         assert_eq!(out.len(), 2, "two edges, no interior rail");
         let ys: Vec<i32> = out.iter().map(|r| r.rect.1 + 20).collect();
         assert_eq!(ys, vec![0, 270], "stepped by 270, not by 200");
@@ -393,7 +393,7 @@ mod tests {
     fn a_row_flush_with_the_core_is_stretched_to_the_boundary() {
         let rows = [row(100, 0, 900, 200, "R0")];
         let core = (100, 0, 900, 200);
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!((out[0].rect.0, out[0].rect.2), (0, 1000));
     }
 
@@ -403,7 +403,7 @@ mod tests {
         // any amount gets no extension, and a comparison written with `<=` would extend every row.
         let rows = [row(101, 0, 899, 200, "R0")];
         let core = (100, 0, 900, 200);
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(
             (out[0].rect.0, out[0].rect.2),
             (101, 899),
@@ -415,7 +415,7 @@ mod tests {
     fn each_end_is_tested_on_its_own() {
         let rows = [row(100, 0, 899, 200, "R0")];
         let core = (100, 0, 900, 200);
-        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 40, &rows, &[core], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(
             (out[0].rect.0, out[0].rect.2),
             (0, 899),
@@ -426,7 +426,7 @@ mod tests {
     #[test]
     fn an_odd_width_puts_the_extra_unit_above_the_row_edge() {
         let rows = [row(0, 0, 1000, 200, "R0")];
-        let out = make("m1", "VDD", "VSS", 41, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { ((0, 0, 1000, 200)).2 } else { ((0, 0, 1000, 200)).0 });
+        let out = make("m1", "VDD", "VSS", 41, &rows, &[(0, 0, 1000, 200)], 200, &|_, n| if n.0 > 0 { (0, 0, 1000, 200).2 } else { (0, 0, 1000, 200).0 });
         assert_eq!(out[1].rect, (0, 180, 1000, 221));
     }
 
