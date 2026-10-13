@@ -1904,6 +1904,38 @@ fn surviving_pieces(
         .collect()
 }
 
+/// The shape at one end of a via that `repairVias` may extend, as an index into `emitted`.
+///
+/// 🔑 **Only a shape of the grid doing the repair.** `Grid::repairVias` extends the lower shape
+/// only when `lower_belongs_to_grid && lower_shape->isModifiable()`, and the upper likewise: a
+/// via between this grid's strap and ANOTHER grid's leaves the other grid's strap alone. Without
+/// this a macro grid's repair stretched the core grid's metal4 strap down onto its own metal5
+/// stripe (`polygon_macro_grid`: 184940 -> 183870), where the reference keeps the strap where the
+/// core grid cut it and fits the via into the 790 overlap.
+///
+/// ⚠️ The shape is found FIRST over every grid's shapes and only then tested for ownership: the
+/// via's end is the shape that contains it, and a foreign one is not a reason to go looking for
+/// one of ours instead.
+fn repairable_shape(
+    emitted: &[(String, String, Rect, &'static str)],
+    net: &str,
+    layer: &str,
+    own: Rect,
+    locked_layers: &[String],
+    own_from: usize,
+) -> Option<usize> {
+    let contains = |outer: Rect, inner: Rect| {
+        outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
+    };
+    let i = emitted.iter().position(|(n, l, r, shape)| {
+        n == net
+            && l == layer
+            && !(*shape == "RING" && locked_layers.iter().any(|x| x == l))
+            && contains(*r, own)
+    })?;
+    (i >= own_from).then_some(i)
+}
+
 fn repair_vias(
     db: &Db,
     emitted: &mut [(String, String, Rect, &'static str)],
@@ -1920,10 +1952,9 @@ fn repair_vias(
     // flipchip wire is 265000 long: seventeen pad straps came out
     // running 175000..440000 where the reference's run 349800..391140.
     fixed_shapes: &[vyges_pdn::vias::Shape],
+    // The first index in `emitted` that belongs to the grid doing the repair.
+    own_from: usize,
 ) -> bool {
-    let contains = |outer: Rect, inner: Rect| {
-        outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
-    };
     let mut moved = false;
     let is_fixed = |layer: &str, rect: Rect| {
         fixed_shapes
@@ -1973,12 +2004,8 @@ fn repair_vias(
             (&v.lower, v.lower_rect, v.upper_rect),
             (&v.upper, v.upper_rect, v.lower_rect),
         ] {
-            let Some(i) = emitted.iter().position(|(n, l, r, shape)| {
-                n == &v.net
-                    && l == layer
-                    && !(*shape == "RING" && locked_layers.contains(l))
-                    && contains(*r, own)
-            }) else {
+            let Some(i) = repairable_shape(emitted, &v.net, layer, own, locked_layers, own_from)
+            else {
                 continue;
             };
             let obstructions: Vec<Rect> = obstructions_by_layer
@@ -5328,6 +5355,7 @@ fn generate(args: &[String]) -> ExitCode {
                 &blockages,
                 &locked_layers,
                 &fixed_via_shapes,
+                grid_shapes_from,
             )
             {
                 // STAGE DUMP — shapes after `repairVias` moved something (the reference's
@@ -9320,5 +9348,26 @@ mod channel_direction_tests {
         assert_eq!(repaired_layer_direction(Some("STRIPE"), Direction::Vertical), Direction::Vertical);
         assert_eq!(repaired_layer_direction(None, Direction::Vertical), Direction::Vertical);
         assert_eq!(repaired_layer_direction(Some("STRIPE"), Direction::None), Direction::Horizontal);
+    }
+}
+
+#[cfg(test)]
+mod repair_ownership_tests {
+    use super::repairable_shape;
+
+    // Rule (`Grid::repairVias`): a via end is extended only when its shape belongs to the grid
+    // doing the repair (`lower_belongs_to_grid` / `upper_belongs_to_grid`). Shapes from index 2 on
+    // are this grid's; the core strap at index 0 contains the via end but is another grid's.
+    #[test]
+    fn only_the_repairing_grids_own_shape_is_extended() {
+        let e: Vec<(String, String, (i32, i32, i32, i32), &'static str)> = vec![
+            ("VSS".into(), "metal4".into(), (142520, 184940, 143480, 207370), "STRIPE"),
+            ("VDD".into(), "metal4".into(), (0, 0, 10, 10), "STRIPE"),
+            ("VSS".into(), "metal5".into(), (114000, 183870, 171000, 185730), "STRIPE"),
+        ];
+        let end4 = (142520, 184940, 143480, 185730);
+        assert_eq!(repairable_shape(&e, "VSS", "metal4", end4, &[], 2), None);
+        assert_eq!(repairable_shape(&e, "VSS", "metal4", end4, &[], 0), Some(0));
+        assert_eq!(repairable_shape(&e, "VSS", "metal5", (142520, 183870, 143480, 185730), &[], 2), Some(2));
     }
 }
