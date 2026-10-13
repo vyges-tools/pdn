@@ -8354,6 +8354,16 @@ fn generate(args: &[String]) -> ExitCode {
     let mut drop_via = vec![false; placements.len()];
     for (pi, layer, metal, area) in &via_faces {
         let net = &placements[*pi].0;
+        // 🔑 **Only the stack's two END layers are checked.** `Via::writeToDb` calls
+        // `check_shapes(lower_, shapes.bottom)` and `check_shapes(upper_, shapes.top)`; the
+        // metal a stack leaves on the layers it passes through (`shapes.middle`) is never merged
+        // into a strap nor ripped against one — it is ripped only where it overlaps an END box
+        // that was. Checked here, a metal4 -> metal7 stack's metal6 found the macro grid's VSS
+        // metal6 strap beside it and ripped the whole stack (`polygon_macro_grid_r180`: 6 vias at
+        // y 100800 the reference keeps).
+        if *layer != placements[*pi].3 && *layer != placements[*pi].4 {
+            continue;
+        }
         let Some(si) = emitted
             .iter()
             .position(|(n, l, r, _)| n == net && l == layer && overlaps(*r, *area))
