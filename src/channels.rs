@@ -213,13 +213,22 @@ pub fn next_width(width: i32, min_width: i32, manufacturing_grid: i32) -> i32 {
 /// `clear` is asked whether the group placed at a given rect is free of obstructions; it receives
 /// the group's whole extent, across and along.
 ///
+/// 🔑 **A clear offset must still pass `checkLayerOffsetSpecification(false)`** — the group, measured
+/// from the grid's DOMAIN AREA (`domain`; the core, or a macro's box), must not run past its far
+/// edge: `offset - domain_lo + group <= domain extent`. When it does, that node of the search
+/// fails outright — it does not bisect further from a position that was clear. Without it a
+/// 0.7 um metal7 repair strap was taken at 205250..206650 in `polygon_macro_grid_r180`, where the
+/// reference rejects it (189150 + 1400 > 190400) and narrows to 0.4.
+///
 /// Returns the group's centre-line position for the first strap, in absolute coordinates.
+#[allow(clippy::too_many_arguments)]
 pub fn determine_offset(
     available: Rect,
     vertical: bool,
     width: i32,
     group: i32,
     manufacturing_grid: i32,
+    domain: Rect,
     clear: &dyn Fn(Rect) -> bool,
 ) -> Option<i32> {
     #[allow(clippy::too_many_arguments)]
@@ -229,6 +238,7 @@ pub fn determine_offset(
         width: i32,
         group: i32,
         mfg: i32,
+        domain: Rect,
         clear: &dyn Fn(Rect) -> bool,
         extra: i32,
         bisect: i32,
@@ -261,7 +271,8 @@ pub fn determine_offset(
             return None;
         }
         if clear(straps) {
-            return Some(offset);
+            let (d_lo, d_hi) = if vertical { (domain.0, domain.2) } else { (domain.1, domain.3) };
+            return (d_hi - d_lo >= offset - d_lo + group).then_some(offset);
         }
 
         let next = if bisect == 0 {
@@ -275,18 +286,18 @@ pub fn determine_offset(
         }
         // Low side first, then high — the order decides which of two free offsets is taken.
         search(
-            available, vertical, width, group, mfg, clear,
+            available, vertical, width, group, mfg, domain, clear,
             extra - next, next,
         )
         .or_else(|| {
             search(
-                available, vertical, width, group, mfg, clear,
+                available, vertical, width, group, mfg, domain, clear,
                 extra + next, next,
             )
         })
     }
     search(
-        available, vertical, width, group, manufacturing_grid, clear, 0, 0,
+        available, vertical, width, group, manufacturing_grid, domain, clear, 0, 0,
     )
 }
 
@@ -456,18 +467,34 @@ mod tests {
         assert_eq!(next_width(1400, 1400, 10), 1400);
     }
 
+    /// A domain that never limits the search.
+    const D: Rect = (-1000, -1000, 1000, 1000);
+
+    // Rule (`determineOffset` -> `checkLayerOffsetSpecification(false)`): a clear position is
+    // taken only if (offset - domain low) + group width <= the domain's extent; otherwise that
+    // node fails WITHOUT bisecting further. Values from `polygon_macro_grid_r180`'s metal7 repair
+    // (core y 16800..207200): 0.7 um clear at centre 205950 is refused, 0.4 um there is taken.
+    #[test]
+    fn a_clear_offset_that_runs_past_the_domain_is_refused() {
+        let core = (19000, 16800, 247000, 207200);
+        let avail = (102520, 205250, 247000, 206650);
+        assert_eq!(determine_offset(avail, false, 1400, 1400, 10, core, &|_| true), None);
+        let avail = (102520, 205550, 247000, 206350);
+        assert_eq!(determine_offset(avail, false, 800, 800, 10, core, &|_| true), Some(205950));
+    }
+
     #[test]
     fn a_group_that_fits_and_is_clear_sits_on_the_centre_line() {
         // Channel 0..100 across, group 20 wide, strap width 20: centred at 50, so the strap runs
         // 40..60 and its centre line is 50.
-        let off = determine_offset((0, 0, 100, 10), true, 20, 20, 1, &|_| true);
+        let off = determine_offset((0, 0, 100, 10), true, 20, 20, 1, D, &|_| true);
         assert_eq!(off, Some(50));
     }
 
     #[test]
     fn a_group_wider_than_the_channel_is_refused_outright() {
         assert_eq!(
-            determine_offset((0, 0, 30, 10), true, 40, 40, 1, &|_| true),
+            determine_offset((0, 0, 30, 10), true, 40, 40, 1, D, &|_| true),
             None
         );
     }
@@ -477,14 +504,14 @@ mod tests {
         // 🔑 Anything overlapping x 45..55 is blocked, so the centre fails and the search tries
         // -25 before +25.
         let clear = |r: Rect| r.2 <= 45 || r.0 >= 55;
-        let off = determine_offset((0, 0, 100, 10), true, 20, 20, 1, &clear);
+        let off = determine_offset((0, 0, 100, 10), true, 20, 20, 1, D, &clear);
         assert_eq!(off, Some(25), "the low side is tried first");
     }
 
     #[test]
     fn the_search_gives_up_when_the_bisection_reaches_zero() {
         assert_eq!(
-            determine_offset((0, 0, 100, 10), true, 20, 20, 1, &|_| false),
+            determine_offset((0, 0, 100, 10), true, 20, 20, 1, D, &|_| false),
             None
         );
     }

@@ -1752,13 +1752,20 @@ fn build_repair_at(
                         true
                     }
                 };
+                // `PDN_TRACE` [chanoff]: the reference's `VYGPDN off` (pdn-channel-offset-patch.py).
+                let tr = |hit: String| {
+                    if std::env::var_os("PDN_TRACE").is_some() {
+                        eprintln!("[chanoff] {width}|{straps:?}|{check:?}|{hit}");
+                    }
+                };
                 for l in &check_layers {
-                    for (bl, r, ..) in blockages {
+                    for (bl, r, net, raw) in blockages {
                         if bl == l && hits(l, *r) {
+                            tr(format!("{l}|blockage {raw:?}|{r:?}|{net:?}"));
                             return false;
                         }
                     }
-                    for (_, el, r, _) in emitted {
+                    for (net, el, r, _) in emitted {
                         if el != l {
                             continue;
                         }
@@ -1766,10 +1773,12 @@ fn build_repair_at(
                             ((r.2 - r.0).min(r.3 - r.1), (r.2 - r.0).max(r.3 - r.1));
                         let hh = obstruction_spacing(db, l, w, len);
                         if hits(l, (r.0 - hh, r.1 - hh, r.2 + hh, r.3 + hh)) {
+                            tr(format!("{l}|shape {r:?}|halo {hh}|{net}"));
                             return false;
                         }
                     }
                 }
+                tr("-".into());
                 true
             };
             if let Some(o) = vyges_pdn::channels::determine_offset(
@@ -1778,6 +1787,7 @@ fn build_repair_at(
                 width,
                 group,
                 grid_mfg,
+                core,
                 &clear,
             ) {
                 break o;
