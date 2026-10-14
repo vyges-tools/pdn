@@ -2956,8 +2956,22 @@ fn ripup(path: &str, out: &str, opts: &Opts) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Every option `generate` reads. `Opts::parse` takes any `--key value`, so without this a
+/// misspelt or misplaced option was silently dropped and the run reported success — a
+/// `--out-odb` (a `global-connect` option) wrote no database and said nothing.
+const GENERATE_OPTIONS: &[&str] = &[
+    "allow-repair-channels", "caught-ring", "connect", "connect-to-pads", "cut-enclosure",
+    "cut-height", "cut-width", "domain", "followpins", "grid", "ground", "out-def", "pins", "power",
+    "power-switch", "region-domain", "report-vias", "ring", "ripup", "secondary", "split-cuts",
+    "starts-with", "stripe", "switched-power", "trim", "voltage-domains",
+];
+
 fn generate(args: &[String]) -> ExitCode {
     let opts = Opts::parse(args);
+    if let Some((k, _)) = opts.values.iter().find(|(k, _)| !GENERATE_OPTIONS.contains(&k.as_str())) {
+        eprintln!("vyges-pdn generate: unknown option --{k}");
+        return usage();
+    }
     // ⛔ **`-ripup` is mutually exclusive with every other flag** (`PDN-1038`), and it needs
     // neither a grid nor a declared domain — `ripup.tcl` declares no grid at all, which is why
     // this cannot be a step inside the ordinary build.
