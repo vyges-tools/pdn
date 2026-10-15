@@ -3443,6 +3443,10 @@ fn generate(args: &[String]) -> ExitCode {
         .flat_map(|r| db.region_boundaries(r).unwrap_or_default())
         .collect();
     let mut emitted: Vec<(String, String, Rect, &str)> = Vec::new();
+    // Each emitted shape's (grid, component) — kept in step with `emitted` at every push and
+    // removal. `Grid::writeToDb` writes a grid's components in the order it holds them, each one's
+    // shapes sorted by (layer, rect), so the writer needs to know which component made a shape.
+    let mut emitted_tag: Vec<(usize, usize)> = Vec::new();
     // Over-pad straps that survived their cut whole, and so are still eligible for a refine.
     // `(index into emitted, index into iterm_holds, what the refine needs)`.
     let mut refinable: Vec<(usize, Option<usize>, OverPadStrap)> = Vec::new();
@@ -3517,12 +3521,16 @@ fn generate(args: &[String]) -> ExitCode {
     // ⚠️ Carries the stack's identity for the same reason a placement does: the patch exists only
     // because the stack passes through, so a stack that trimming leaves unheld takes its patches
     // with it. Left behind, they are metal on a layer nothing connects to.
-    let mut drcfill: Vec<(String, String, Rect, String, String, Rect)> = Vec::new();
+    let mut drcfill: Vec<(String, String, Rect, String, String, Rect, u64)> = Vec::new();
     // Where each via goes, applied only once the boxes are in — see the note at the placement.
     // Each carries the STACK's two end layers and the stack's own area, which is what decides
     // whether trimming has left it standing.
     #[allow(clippy::type_complexity)]
-    let mut placements: Vec<(String, String, (i32, i32), String, String, Rect)> = Vec::new();
+    let mut placements: Vec<(String, String, (i32, i32), String, String, Rect, u64)> = Vec::new();
+    // Each via placement and DRCFILL patch carries its CREATION sequence (the last field): the
+    // writer orders a net's boxes as `Grid::writeToDb` creates them, and within one stack that is
+    // the order they were built here — see the write.
+    let mut write_seq: u64 = 0;
 
     // `(layer, rect)` — the layer matters: a strap avoids only the rings on its OWN layer.
     let mut ring_shapes: Vec<(String, Rect)> = Vec::new();
@@ -4255,14 +4263,20 @@ fn generate(args: &[String]) -> ExitCode {
         };
         // This grid's rings, as built — what `getRingReach` reads.
         let mut built_rings: Vec<rings::BuiltRing> = Vec::new();
-        let mut queue: Vec<(components::Component, bool)> =
+        let mut queue: Vec<(components::Component, bool, usize)> =
             components::plan(&opts.values, pad_conns.len())
                 .into_iter()
-                .map(|c| (c, false))
+                .enumerate()
+                .map(|(i, c)| (c, false, i))
                 .collect();
+        // The plan index of the first pad connection: `PadConnect(k)` is component `pad_base + k`.
+        let pad_base = queue
+            .iter()
+            .position(|(c, ..)| matches!(c, components::Component::PadConnect(_)))
+            .unwrap_or(0);
         let mut at = 0;
         while at < queue.len() {
-            let (comp, is_retry) = queue[at];
+            let (comp, is_retry, comp_index) = queue[at];
             at += 1;
             trace(
                 comp.kind(),
@@ -4332,6 +4346,7 @@ fn generate(args: &[String]) -> ExitCode {
                     for (net, layer, rect) in pieces {
                         ring_shapes.push((layer.clone(), rect));
                         emitted.push((net, layer, rect, "RING"));
+                        emitted_tag.push((grid_index, comp_index));
                     }
                 }
                 components::Component::PadConnect(nth) => {
@@ -4677,6 +4692,9 @@ fn generate(args: &[String]) -> ExitCode {
                             ));
                         }
                         emitted.push((net.clone(), layer.clone(), rect, "STRIPE"));
+                        // ⚠️ The MEMBER's own component, not the one building the group: each pad terminal is a
+                        // component of its own to `GridComponent::writeToDb`, however the group was built.
+                        emitted_tag.push((grid_index, pad_base + pad_conns.iter().position(|p| std::ptr::eq(p, conn)).unwrap_or(0)));
                         if let Some(hold) = hold {
                             // Its own pin holds it, exactly as an iterm connection does.
                             iterm_holds.push((net, layer, hold));
@@ -4740,6 +4758,7 @@ fn generate(args: &[String]) -> ExitCode {
                     );
                     for (net, l, rect) in pieces {
                         emitted.push((net, l, rect, "FOLLOWPIN"));
+                        emitted_tag.push((grid_index, comp_index));
                     }
                     followpin_layer = layer;
                 }
@@ -4769,6 +4788,7 @@ fn generate(args: &[String]) -> ExitCode {
                     if let (Some(set), false) = (set, is_retry) {
                         strap_sets.push(set);
                     }
+                    emitted_tag.extend(std::iter::repeat_n((grid_index, comp_index), stripes.len()));
                     emitted.extend(stripes);
                 }
             }
@@ -4782,7 +4802,7 @@ fn generate(args: &[String]) -> ExitCode {
             // `make()`'s return value: did the shape count move? If not, this component gets one
             // more attempt once everything else has run — and only one.
             if !is_retry && emitted.len() == before {
-                queue.push((comp, true));
+                queue.push((comp, true, comp_index));
             }
         }
 
@@ -4884,6 +4904,7 @@ fn generate(args: &[String]) -> ExitCode {
                     // identical vias, and the overlap check then kills both — each being "no
                     // larger than" the other.
                     emitted.push((net, layer, rect, "SWITCH"));
+                    emitted_tag.push((grid_index, usize::MAX));
                 }
             }
         }
@@ -5031,6 +5052,7 @@ fn generate(args: &[String]) -> ExitCode {
                                 (None, None) => {}
                             }
                             for extra in &pieces[1..] {
+                                emitted_tag.push(emitted_tag[index]);
                                 emitted.push((r.net.clone(), r.layer.clone(), *extra, "STRIPE"));
                             }
                             // ⛔ **A refined shape is never refined again**, and the reason is the
@@ -5075,6 +5097,8 @@ fn generate(args: &[String]) -> ExitCode {
         // A strap the refine could not place anywhere is dropped, exactly as `removeShape` leaves it.
         let dropped = emitted.iter().filter(|(_, _, r, _)| *r == (0, 0, 0, 0)).count();
         if dropped != 0 {
+            let mut keep = emitted.iter().map(|(_, _, r, _)| *r != (0, 0, 0, 0));
+            emitted_tag.retain(|_| keep.next().unwrap_or(true));
             emitted.retain(|(_, _, r, _)| *r != (0, 0, 0, 0));
             vyges_events::log(
                 "vyges-pdn",
@@ -5108,6 +5132,7 @@ fn generate(args: &[String]) -> ExitCode {
             while i < emitted.len() {
                 if inside(&emitted[i].1, emitted[i].2) {
                     emitted.remove(i);
+                    emitted_tag.remove(i);
                 } else {
                     i += 1;
                 }
@@ -5517,12 +5542,13 @@ fn generate(args: &[String]) -> ExitCode {
                     }
                 }
                 // Take a strap's shapes out of `emitted`, keeping every other index right.
-                fn take_shapes(emitted: &mut Vec<(String, String, Rect, &'static str)>, repairs: &mut [RepairStrap], k: usize) -> Vec<Rect> {
+                fn take_shapes(emitted: &mut Vec<(String, String, Rect, &'static str)>, emitted_tag: &mut Vec<(usize, usize)>, repairs: &mut [RepairStrap], k: usize) -> Vec<Rect> {
                     let mut idx = std::mem::take(&mut repairs[k].shapes);
                     idx.sort_unstable();
                     let rects: Vec<Rect> = idx.iter().map(|&i| emitted[i].2).collect();
                     for &i in idx.iter().rev() {
                         emitted.remove(i);
+                        emitted_tag.remove(i);
                     }
                     for r in repairs.iter_mut() {
                         for s in r.shapes.iter_mut() {
@@ -5531,7 +5557,9 @@ fn generate(args: &[String]) -> ExitCode {
                     }
                     rects
                 }
-                let push_shapes = |emitted: &mut Vec<(String, String, Rect, &'static str)>, layer: &str, straps: Vec<(String, Rect)>| -> Vec<usize> {
+                // ⚠️ A repair strap is a component of its own (`addStrap` appends it after the
+                // grid's others), tagged after every planned component — `REPAIR_COMPONENT + k`.
+                let push_shapes = |emitted: &mut Vec<(String, String, Rect, &'static str)>, emitted_tag: &mut Vec<(usize, usize)>, k: usize, layer: &str, straps: Vec<(String, Rect)>| -> Vec<usize> {
                     straps
                         .into_iter()
                         .map(|(net, rect)| {
@@ -5540,6 +5568,7 @@ fn generate(args: &[String]) -> ExitCode {
                             // overrides `allowDbPins()` to false, so on a `-pins` layer it is
                             // neither a pin nor exempt from trimming.
                             emitted.push((net, layer.to_string(), rect, "REPAIR"));
+                            emitted_tag.push((grid_index, REPAIR_COMPONENT + k));
                             emitted.len() - 1
                         })
                         .collect()
@@ -5554,7 +5583,7 @@ fn generate(args: &[String]) -> ExitCode {
                         if repairs[k].ch.target_layer != ch.target_layer || repairs[k].ch.area != ch.area || repairs[k].at_end(&db, max_length_of(&ch.target_layer)) {
                             continue;
                         }
-                        let prev = take_shapes(&mut emitted, &mut repairs, k);
+                        let prev = take_shapes(&mut emitted, &mut emitted_tag, &mut repairs, k);
                         // addNets: a set, in the database's net order.
                         let mut nets = repairs[k].ch.nets.clone();
                         nets.extend(ch.nets.iter().cloned());
@@ -5575,7 +5604,7 @@ fn generate(args: &[String]) -> ExitCode {
                         repairs[k].settle_span(&straps, vertical);
                         let mut now: Vec<Rect> = straps.iter().map(|(_, r)| *r).collect();
                         let layer = repairs[k].ch.target_layer.clone();
-                        repairs[k].shapes = push_shapes(&mut emitted, &layer, straps);
+                        repairs[k].shapes = push_shapes(&mut emitted, &mut emitted_tag, k, &layer, straps);
                         if !repairs[k].shapes.is_empty() {
                             let mut was = prev.clone();
                             was.sort_unstable();
@@ -5634,7 +5663,7 @@ fn generate(args: &[String]) -> ExitCode {
                     if straps.is_empty() {
                         continue;
                     }
-                    strap.shapes = push_shapes(&mut emitted, &ch.target_layer, straps);
+                    strap.shapes = push_shapes(&mut emitted, &mut emitted_tag, repairs.len(), &ch.target_layer, straps);
                     repairs.push(strap);
                     repaired.push(ch.area);
                 }
@@ -5835,7 +5864,8 @@ fn generate(args: &[String]) -> ExitCode {
         // The die as rectangles, for the notch-wall pins (`isOnInteriorWall`).
         let die_trim_rects = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
         let mut kept = Vec::with_capacity(emitted.len());
-        for (net, layer, rect, shape) in emitted {
+        let mut kept_tag = Vec::with_capacity(emitted.len());
+        for ((net, layer, rect, shape), tag) in emitted.into_iter().zip(std::mem::take(&mut emitted_tag)) {
             // What holds this shape up: every via landing on it, on either of its two faces.
             // ⚠️ **Contained ACROSS the shape, overlapping along it.** `Shape::getVias()` is the
             // list attached to a shape, and re-attachment after a replacement is by intersection —
@@ -5918,11 +5948,11 @@ fn generate(args: &[String]) -> ExitCode {
             // pulls the vertical ones back to whatever else touches them: four segments per net
             // became two, and those two were shortened by a sixth at each end.
             if shape == "RING" && locked_layers.contains(&layer) {
-                kept.push((net, layer, rect, shape));
+                { kept_tag.push(tag); kept.push((net, layer, rect, shape)) };
                 continue;
             }
             if shape == "SWITCH" {
-                kept.push((net, layer, rect, shape));
+                { kept_tag.push(tag); kept.push((net, layer, rect, shape)) };
                 continue;
             }
             // A repair strap is never a pin (`allowDbPins()` is false for it), so it trims like
@@ -5958,7 +5988,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // covers, a row spans the core, and both halves grow back into two identical
                 // full-width rails.
                 let want = vyges_pdn::trim::followpin_trimmed(rect, want, &vias_only);
-                kept.push((net, layer, want, shape));
+                { kept_tag.push(tag); kept.push((net, layer, want, shape)) };
                 continue;
             }
             match vyges_pdn::trim::decide(
@@ -5974,8 +6004,8 @@ fn generate(args: &[String]) -> ExitCode {
                 is_pin_layer,
                 removable,
             ) {
-                vyges_pdn::trim::Decision::Keep => kept.push((net, layer, rect, shape)),
-                vyges_pdn::trim::Decision::Replace(r) => kept.push((net, layer, r, shape)),
+                vyges_pdn::trim::Decision::Keep => { kept_tag.push(tag); kept.push((net, layer, rect, shape)) },
+                vyges_pdn::trim::Decision::Replace(r) => { kept_tag.push(tag); kept.push((net, layer, r, shape)) },
                 vyges_pdn::trim::Decision::Remove => {}
             }
         }
@@ -5986,6 +6016,7 @@ fn generate(args: &[String]) -> ExitCode {
             kept.len(), emitted_before, via_areas.len()),
         );
         emitted = kept;
+        emitted_tag = kept_tag;
 
         stage_time("cleanupVias");
         // ── stage 9: cleanupVias ─────────────────────────────────────────────────────────────
@@ -6019,7 +6050,7 @@ fn generate(args: &[String]) -> ExitCode {
         // wrong via, or past the end of the list.
         let keep: Vec<bool> = placements
             .iter()
-            .map(|(net, _, _, lo, hi, area)| held(net, lo, hi, *area))
+            .map(|(net, _, _, lo, hi, area, _)| held(net, lo, hi, *area))
             .collect();
         let mut renumber = vec![usize::MAX; placements.len()];
         let mut next = 0;
@@ -6039,7 +6070,7 @@ fn generate(args: &[String]) -> ExitCode {
             i += 1;
             keep[i - 1]
         });
-        drcfill.retain(|(net, _, _, lo, hi, area)| held(net, lo, hi, *area));
+        drcfill.retain(|(net, _, _, lo, hi, area, _)| held(net, lo, hi, *area));
         if placements.len() != before {
             vyges_events::log(
                 "vyges-pdn",
@@ -6112,7 +6143,7 @@ fn generate(args: &[String]) -> ExitCode {
             min_width_by_connect,
             fixed,
             ground,
-            grid: _,
+            grid: via_grid,
         } = p;
         // 🔑 **The order vias are written in, which is not the order they were found in.**
         // `Grid::writeToDb` sorts a grid's vias by `(lower layer number, upper layer number,
@@ -7975,6 +8006,7 @@ fn generate(args: &[String]) -> ExitCode {
                             v.lower.clone(),
                             v.upper.clone(),
                             v.area,
+                            { write_seq += 1; via_seq(via_grid, write_seq) },
                         ));
                     }
                     written += spots.len();
@@ -8038,6 +8070,7 @@ fn generate(args: &[String]) -> ExitCode {
                                         v.lower.clone(),
                                         v.upper.clone(),
                                         v.area,
+                                        { write_seq += 1; via_seq(via_grid, write_seq) },
                                     ));
                                 }
                             }
@@ -8146,6 +8179,7 @@ fn generate(args: &[String]) -> ExitCode {
                             v.lower.clone(),
                             v.upper.clone(),
                             v.area,
+                            { write_seq += 1; via_seq(via_grid, write_seq) },
                         ));
                         let bare = (
                             (p.cuts.0 - 1) * pitch.0 + cut.0,
@@ -8231,6 +8265,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     v.lower.clone(),
                                     v.upper.clone(),
                                     v.area,
+                                    { write_seq += 1; via_seq(via_grid, write_seq) },
                                 ));
                             }
                         }
@@ -8474,11 +8509,11 @@ fn generate(args: &[String]) -> ExitCode {
             .iter()
             .enumerate()
             .filter(|(i, _)| drop_via[*i])
-            .map(|(_, (net, _, _, lo, hi, area))| {
+            .map(|(_, (net, _, _, lo, hi, area, _))| {
                 (net.clone(), lo.clone(), hi.clone(), *area)
             })
             .collect();
-        for (i, (net, _, _, lo, hi, area)) in placements.iter().enumerate() {
+        for (i, (net, _, _, lo, hi, area, _)) in placements.iter().enumerate() {
             if broken
                 .iter()
                 .any(|(n, l, h, a)| n == net && l == lo && h == hi && a == area)
@@ -8493,7 +8528,7 @@ fn generate(args: &[String]) -> ExitCode {
         // and its DRCFILL together, so a via that is ripped up writes neither. Kept separately, the
         // patch outlives the stack it was bridging: metal on a layer the design passes through with
         // nothing left passing through it, and no via anywhere near to explain it.
-        drcfill.retain(|(net, _, _, lo, hi, area)| {
+        drcfill.retain(|(net, _, _, lo, hi, area, _)| {
             !broken
                 .iter()
                 .any(|(n, l, h, a)| n == net && l == lo && h == hi && a == area)
@@ -8550,7 +8585,7 @@ fn generate(args: &[String]) -> ExitCode {
             Direction::Vertical => a.0 >= rect.0 && a.2 <= rect.2,
             Direction::None => true,
         };
-        emitted.retain(|(net, layer, rect, kind)| {
+        let floating_keep = |(net, layer, rect, kind): &(String, String, Rect, &str)| -> bool {
             // A follow pin is assumed connected, and a switch pin is the cell's own metal.
             if *kind == "FOLLOWPIN" || *kind == "SWITCH" {
                 return true;
@@ -8571,7 +8606,10 @@ fn generate(args: &[String]) -> ExitCode {
                     && overlaps(*a, *rect)
                     && across_ok(*rect, a)
             })
-        });
+        };
+        let mut keep = emitted.iter().map(&floating_keep).collect::<Vec<_>>().into_iter();
+        emitted_tag.retain(|_| keep.next().unwrap_or(true));
+        emitted.retain(|e| floating_keep(e));
         if emitted.len() != before {
             vyges_events::log(
                 "vyges-pdn",
@@ -8720,48 +8758,6 @@ fn generate(args: &[String]) -> ExitCode {
         }
     }
 
-    let mut written = 0;
-    for (net, layer, rect, shape) in &emitted {
-        if *shape == "SWITCH" {
-            continue; // the switch cell's own pin, not this engine's metal
-        }
-        // `REPAIR` is our tag for a repair-channel strap; the DEF knows it as STRIPE.
-        let shape = if *shape == "REPAIR" { "STRIPE" } else { *shape };
-        match db.add_swire_box_shaped(net, layer, *rect, false, shape) {
-            Ok(()) => written += 1,
-            Err(e) => {
-                vyges_events::log(
-                    "vyges-pdn",
-                    vyges_events::Severity::Warn,
-                    format!("cannot write {net} on {layer}: {e}"),
-                );
-                return ExitCode::from(2);
-            }
-        }
-    }
-    // ⚠️ **After the boxes, not before.** The write above clears each net's routed special wires
-    // first, and a via placed before that is a routed special wire — so writing vias earlier puts
-    // them in the database and then deletes them, leaving a via DEFINITION with no placements and
-    // no error anywhere to say so.
-    // ⚠️ These go in with the vias, after the boxes, for the same reason: they are routed
-    // special wires and the clear above would take them.
-    for (net, layer, rect, ..) in &drcfill {
-        if let Err(e) = db.add_swire_box_shaped(net, layer, *rect, false, "DRCFILL") {
-            vyges_events::log(
-                "vyges-pdn",
-                vyges_events::Severity::Warn,
-                format!("cannot write DRCFILL on {layer}: {e}"),
-            );
-        }
-    }
-    if !drcfill.is_empty() {
-        vyges_events::log(
-            "vyges-pdn",
-            vyges_events::Severity::Debug,
-            format!("{} patches on passed-through layers",
-            drcfill.len()),
-        );
-    }
     // 🔑 **A via takes the shape TYPE of what it lands on, not `STRIPE` always.**
     //
     // `Via::writeToDb` opens with `type = lower_->getType()` and falls back to `STRIPE` only when
@@ -8798,24 +8794,111 @@ fn generate(args: &[String]) -> ExitCode {
             .any(|p| p.net == net && p.layer == layer && overlaps(p.rect, area))
             .then_some("NONE")
     };
+    // 🔑 **Vias first, then the shapes — `Grid::writeToDb`'s order, and the order is a value.**
+    // The reference writes every via of the grid (each stack bottom-up, a DRCFILL patch right after
+    // the via above the layer it patches), sorted by (lower layer, upper layer, area), and only then
+    // each component's shapes. `addSBox` grows a net's list at the HEAD, so the DEF lists the boxes
+    // in REVERSE of that — which a set comparison of shapes and vias cannot see: the wrap run
+    // (rv_plic_lite, 2026-10-15) had every set equal and both nets' lists different from line one.
+    // (grid, then vias before shapes, then each one's own key) — see `write_key`.
+    #[derive(Clone, Copy)]
+    enum Write {
+        Via(usize),
+        Fill(usize),
+        Shape(usize),
+    }
+    let mut writes: Vec<(WriteKey, Write)> = Vec::new();
+    for (i, (_, _, _, lo, hi, area, seq)) in placements.iter().enumerate() {
+        let (g, n) = via_seq_parts(*seq);
+        writes.push((write_key(g, 0, i64::from(db.layer_get_number(lo)), i64::from(db.layer_get_number(hi)), *area, n), Write::Via(i)));
+    }
+    for (j, (_, _, _, lo, hi, area, seq)) in drcfill.iter().enumerate() {
+        let (g, n) = via_seq_parts(*seq);
+        writes.push((write_key(g, 0, i64::from(db.layer_get_number(lo)), i64::from(db.layer_get_number(hi)), *area, n), Write::Fill(j)));
+    }
+    if emitted_tag.len() != emitted.len() {
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Error,
+            format!("internal: {} shapes but {} component tags", emitted.len(), emitted_tag.len()),
+        );
+        return ExitCode::from(2);
+    }
+    for (k, ((_, layer, rect, _), (g, comp))) in emitted.iter().zip(&emitted_tag).enumerate() {
+        writes.push((write_key(*g, 1, *comp as i64, i64::from(db.layer_get_number(layer)), *rect, k as u64), Write::Shape(k)));
+    }
+    writes.sort_by_key(|w| w.0);
+    if std::env::var_os("PDN_WRITE_TRACE").is_some() {
+        for (k, w) in &writes {
+            let what = match *w {
+                Write::Via(i) => format!("via {} {}", placements[i].0, placements[i].1),
+                Write::Fill(j) => format!("fill {} {}", drcfill[j].0, drcfill[j].1),
+                Write::Shape(i) => format!("shape {} {} {}", emitted[i].0, emitted[i].1, emitted[i].3),
+            };
+            eprintln!("[writeorder] grid {} phase {} key {} {} rect {:?} | {what}", k.0, k.1, k.2, k.3, k.4);
+        }
+    }
     let mut vias_placed = 0;
-    for (net, name, centre, lo, hi, area) in &placements {
-        // ⚠️ A `SWITCH` shape is the cell's own metal and is never written, so it cannot name the
-        // via's type either; anything unfound falls back with the mismatch case.
-        let ty = match (kind_at(net, lo, *area), kind_at(net, hi, *area)) {
-            (Some(a), Some(b)) if a == b && a != "SWITCH" => {
-                if a == "REPAIR" { "STRIPE" } else { a }
+    let mut written = 0;
+    for (_, w) in &writes {
+        match *w {
+            Write::Fill(j) => {
+                let (net, layer, rect, ..) = &drcfill[j];
+                if let Err(e) = db.add_swire_box_shaped(net, layer, *rect, false, "DRCFILL") {
+                    vyges_events::log(
+                        "vyges-pdn",
+                        vyges_events::Severity::Warn,
+                        format!("cannot write DRCFILL on {layer}: {e}"),
+                    );
+                }
             }
-            _ => "STRIPE",
-        };
-        match db.add_swire_via(net, name, *centre, false, ty) {
-            Ok(()) => vias_placed += 1,
-            Err(e) => {
-                if std::env::var_os("PDN_VIA_TRACE").is_some() {
-                    eprintln!("[viawrite] {net}|{name}|{centre:?}|{ty}: {e}");
+            Write::Via(i) => {
+                let (net, name, centre, lo, hi, area, _) = &placements[i];
+                // ⚠️ A `SWITCH` shape is the cell's own metal and is never written, so it cannot
+                // name the via's type either; anything unfound falls back with the mismatch case.
+                let ty = match (kind_at(net, lo, *area), kind_at(net, hi, *area)) {
+                    (Some(a), Some(b)) if a == b && a != "SWITCH" => {
+                        if a == "REPAIR" { "STRIPE" } else { a }
+                    }
+                    _ => "STRIPE",
+                };
+                match db.add_swire_via(net, name, *centre, false, ty) {
+                    Ok(()) => vias_placed += 1,
+                    Err(e) => {
+                        if std::env::var_os("PDN_VIA_TRACE").is_some() {
+                            eprintln!("[viawrite] {net}|{name}|{centre:?}|{ty}: {e}");
+                        }
+                    }
+                }
+            }
+            Write::Shape(k) => {
+                let (net, layer, rect, shape) = &emitted[k];
+                if *shape == "SWITCH" {
+                    continue; // the switch cell's own pin, not this engine's metal
+                }
+                // `REPAIR` is our tag for a repair-channel strap; the DEF knows it as STRIPE.
+                let shape = if *shape == "REPAIR" { "STRIPE" } else { *shape };
+                match db.add_swire_box_shaped(net, layer, *rect, false, shape) {
+                    Ok(()) => written += 1,
+                    Err(e) => {
+                        vyges_events::log(
+                            "vyges-pdn",
+                            vyges_events::Severity::Warn,
+                            format!("cannot write {net} on {layer}: {e}"),
+                        );
+                        return ExitCode::from(2);
+                    }
                 }
             }
         }
+    }
+    if !drcfill.is_empty() {
+        vyges_events::log(
+            "vyges-pdn",
+            vyges_events::Severity::Debug,
+            format!("{} patches on passed-through layers",
+            drcfill.len()),
+        );
     }
     if !placements.is_empty() {
         vyges_events::log(
@@ -8938,6 +9021,37 @@ fn generate(args: &[String]) -> ExitCode {
         status = vyges_pdn::settle_status(written),
     );
     ExitCode::SUCCESS
+}
+
+/// A repair-channel strap's component index: after every component the grid was planned with —
+/// `RepairChannelStraps` is added to the grid (`addStrap`) once the planned ones are built.
+const REPAIR_COMPONENT: usize = 1 << 20;
+
+/// A via's or patch's creation sequence, with the grid that built it in the high bits.
+fn via_seq(grid: usize, n: u64) -> u64 {
+    ((grid as u64) << 40) | n
+}
+
+fn via_seq_parts(seq: u64) -> (usize, u64) {
+    ((seq >> 40) as usize, seq & ((1u64 << 40) - 1))
+}
+
+/// (grid, phase, a, b, rect, seq) — see [`write_key`].
+type WriteKey = (usize, u8, i64, i64, Rect, u64);
+
+/// The order `PdnGen::writeToDb` creates a net's boxes in. Per grid, in order (`domain->getGrids()`),
+/// `Grid::writeToDb` writes:
+///   1. its VIAS, `std::ranges::sort`ed by (lower layer number, upper layer number, area) — a
+///      stack's two END layers and its crossing, `odb::Rect`'s `<=>` being (xlo, ylo, xhi, yhi) —
+///      and within one stack in the order `DbGenerateStackedVia::generate` builds it (each level
+///      bottom-up, a level's DRCFILL patch on its lower layer right after it): creation order here;
+///   2. then each COMPONENT (`getGridComponents`: rings, then straps in the order added) through
+///      `GridComponent::writeToDb`, its shapes sorted by (layer number, rect).
+///
+/// `phase` 0 is a via or patch: `(a, b)` = its stack's (lower, upper) layer numbers, `seq` its
+/// creation sequence. `phase` 1 is a shape: `a` = its component, `b` = its layer number.
+fn write_key(grid: usize, phase: u8, a: i64, b: i64, rect: Rect, seq: u64) -> WriteKey {
+    (grid, phase, a, b, rect, seq)
 }
 
 /// `global-connect`: `add_global_connection` + `global_connect`, transcribed.
@@ -9404,5 +9518,39 @@ mod repair_ownership_tests {
         assert_eq!(repairable_shape(&e, "VSS", "metal4", end4, &[], 2), None);
         assert_eq!(repairable_shape(&e, "VSS", "metal4", end4, &[], 0), Some(0));
         assert_eq!(repairable_shape(&e, "VSS", "metal5", (142520, 183870, 143480, 185730), &[], 2), Some(2));
+    }
+}
+
+#[cfg(test)]
+mod via_write_order {
+    use super::{via_seq, via_seq_parts, write_key};
+
+    // Rule (`PdnGen::writeToDb` → `Grid::writeToDb`): per grid, every via first — sorted by (lower
+    // layer number, upper layer number, area), one stack's boxes in build order — then each
+    // component's shapes sorted by (layer number, rect); the next grid only after.
+    #[test]
+    fn grid_then_vias_then_components_then_layer_and_rect() {
+        let mut w = vec![
+            (write_key(0, 1, 0, 3, (0, 50, 90, 52), 0), "g0 followpin y50"),
+            (write_key(0, 1, 0, 3, (0, 10, 90, 12), 1), "g0 followpin y10"),
+            (write_key(0, 1, 1, 9, (40, 0, 42, 90), 2), "g0 strap"),
+            (write_key(0, 0, 9, 11, (0, 0, 10, 10), 3), "g0 via m4-m5"),
+            (write_key(0, 0, 3, 9, (20, 0, 30, 10), 4), "g0 stack level 1"),
+            (write_key(0, 0, 3, 9, (20, 0, 30, 10), 5), "g0 stack DRCFILL"),
+            (write_key(0, 0, 3, 9, (10, 0, 20, 10), 6), "g0 stack further left"),
+            (write_key(1, 0, 3, 5, (0, 0, 1, 1), 0), "g1 via"),
+            (write_key(1, 1, 0, 3, (0, 0, 9, 1), 0), "g1 shape"),
+        ];
+        w.sort_by_key(|x| x.0);
+        let order: Vec<&str> = w.iter().map(|x| x.1).collect();
+        assert_eq!(order, vec![
+            "g0 stack further left", "g0 stack level 1", "g0 stack DRCFILL", "g0 via m4-m5",
+            "g0 followpin y10", "g0 followpin y50", "g0 strap", "g1 via", "g1 shape",
+        ]);
+    }
+
+    #[test]
+    fn a_via_sequence_carries_its_grid() {
+        assert_eq!(via_seq_parts(via_seq(3, 17)), (3, 17));
     }
 }

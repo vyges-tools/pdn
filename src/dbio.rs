@@ -873,7 +873,22 @@ pub(crate) fn pad_connections(
     //
     // 🔑 `nets` arrives in the domain's own order (power first, then ground), which is what
     // `getNets()` yields. A stable sort by net keeps the within-net order this loop produced.
-    out.sort_by_key(|c| nets.iter().position(|n| *n == c.net).unwrap_or(usize::MAX));
+    //
+    // 🔑 **Within a net, `net->getITerms()` order** — the net's own terminal list, which is how
+    // `setupDirectConnect` walks it, not the block's instance order. Each pad's component is
+    // written as one (`GridComponent::writeToDb`) in that order, so the database lists a net's pad
+    // straps by it; a set comparison saw the same shapes either way (15 pad cases, 2026-10-15).
+    let iterm_order: std::collections::HashMap<String, Vec<String>> =
+        nets.iter().map(|n| (n.clone(), db.net_iterms(n))).collect();
+    out.sort_by_key(|c| {
+        (
+            nets.iter().position(|n| *n == c.net).unwrap_or(usize::MAX),
+            iterm_order
+                .get(&c.net)
+                .and_then(|v| v.iter().position(|t| *t == format!("{}/{}", c.inst, c.term)))
+                .unwrap_or(usize::MAX),
+        )
+    });
     // 🔑 **One connection TYPE per grid** — `PadDirectConnectionStraps::unifyConnectionTypes`,
     // called by `setupDirectConnect` over every connection it kept. Each pad chose alone (pins
     // facing the core → EDGE, else pins forming a ring → OVER PADS); if the grid holds BOTH kinds
@@ -882,6 +897,12 @@ pub(crate) fn pad_connections(
     // connection that can no longer connect. Observed with the reference's own `PDN Pad` debug on
     // `pads_connect_from_non_pref_edge`: `IO_FILL_IO_EAST_10_285/DVSS has 10 pins`, then
     // `has 0 pins`; ours built those 30 east fill-cell straps on Metal5.
+    if std::env::var_os("PDN_WRITE_TRACE").is_some() {
+        for c in &out {
+            let pos = iterm_order.get(&c.net).and_then(|v| v.iter().position(|t| *t == format!("{}/{}", c.inst, c.term)));
+            eprintln!("[padorder] {} {}/{} at {:?}", c.net, c.inst, c.term, pos);
+        }
+    }
     let has_edge = out.iter().any(|c| c.over_pads.is_none());
     let has_over = out.iter().any(|c| c.over_pads.is_some());
     if has_edge && has_over {
