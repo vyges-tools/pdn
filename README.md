@@ -48,7 +48,7 @@ src/channels.rs    finding unconnected channels and repairing them
 
 ## Attribution
 
-OpenROAD's `pdn` module was the **reference for this engine's behaviour**. The algorithms here are
+This engine's behaviour follows the reference implementation's `pdn` module. The algorithms here are
 reimplemented from its published behaviour — the same published algorithm and the same parameter
 semantics — and are not a transliteration of its source; no code is copied. Written against OpenDB
 at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`; `vyges-pdn --describe` reports the pin a given
