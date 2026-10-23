@@ -8838,6 +8838,32 @@ fn generate(args: &[String]) -> ExitCode {
             eprintln!("[writeorder] grid {} phase {} key {} {} rect {:?} | {what}", k.0, k.1, k.2, k.3, k.4);
         }
     }
+    // 🔑 **The grid writes into a special wire of its OWN, one per net.** `PdnGen::writeToDb`
+    // creates a fresh ROUTED `dbSWire` for every net it builds before any grid writes, and every
+    // shape and via goes into that one. The shim's box and via writers append to the net's NEWEST
+    // swire of the wire type, so without this a net that arrived with routed special wires (the
+    // flipchip bump wires) took the grid's shapes into its own last swire — the same segments,
+    // one `+ ROUTED` group short (VDD 2 vs 3, VSS 137 vs 138 on
+    // `pads_black_parrot_flipchip_connect_overpads`), which a per-net segment comparison
+    // cannot see. ⚠️ Made only for a net that has something to write: the reference makes one
+    // for every domain net and destroys the empty ones afterwards (PDN-0213, not emitted here),
+    // which leaves the same database.
+    let mut swire_nets: Vec<&str> = Vec::new();
+    for (_, w) in &writes {
+        let net = match *w {
+            Write::Via(i) => placements[i].0.as_str(),
+            Write::Fill(j) => drcfill[j].0.as_str(),
+            Write::Shape(i) => emitted[i].0.as_str(),
+        };
+        if !swire_nets.contains(&net) {
+            swire_nets.push(net);
+        }
+    }
+    for net in swire_nets {
+        if let Err(e) = db.new_swire(net, false) {
+            vyges_events::log("vyges-pdn", vyges_events::Severity::Warn, format!("special wire for {net} not created: {e}"));
+        }
+    }
     let mut vias_placed = 0;
     let mut written = 0;
     for (_, w) in &writes {
