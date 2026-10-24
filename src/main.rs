@@ -14,6 +14,25 @@ mod components;
 mod dbio;
 use dbio::*;
 
+/// Write one run line (`[INFO PDN-nnnn] text`) through the suite logger: on stderr as it is
+/// logged, and an event under its code.
+fn log_line((warning, id, text): vyges_pdn::report::Line) {
+    use std::sync::{Mutex, OnceLock};
+    static LOG: OnceLock<Mutex<vyges_events::logger::Logger>> = OnceLock::new();
+    let mut log = LOG
+        .get_or_init(|| Mutex::new(vyges_events::logger::Logger::new().events("vyges-pdn")))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if warning {
+        log.warn("PDN", id, text);
+    } else {
+        log.info("PDN", id, text);
+    }
+    for l in log.take_lines() {
+        eprintln!("{l}");
+    }
+}
+
 /// Print one stage marker when `PDN_TRACE` is set, so the order components run in can be diffed
 /// against the reference's own trace (`set_debug_level PDN Make 1`, whose markers this mirrors).
 ///
@@ -3020,8 +3039,16 @@ fn generate(args: &[String]) -> ExitCode {
     // Core domain takes the block's one net of each sig type — power first, then ground.
     let mut found = Vec::new();
     for (explicit, want) in [(opts.one("power"), "POWER"), (opts.one("ground"), "GROUND")] {
-        match explicit.filter(|n| !n.is_empty()).map(str::to_string).ok_or(()).or_else(|()| find_domain_net(&db, want)) {
-            Ok(n) => found.push(n),
+        // `VoltageDomain::determinePowerGroundNets`: a net it had to find is named in the log.
+        let given = explicit.filter(|n| !n.is_empty()).map(str::to_string);
+        let searched = given.is_none();
+        match given.ok_or(()).or_else(|()| find_domain_net(&db, want)) {
+            Ok(n) => {
+                if searched {
+                    log_line(vyges_pdn::report::domain_net(want == "POWER", &n, nets::CORE_DOMAIN));
+                }
+                found.push(n)
+            }
             Err(d) => {
                 vyges_events::emit(
                     &vyges_events::Event::new("vyges-pdn", vyges_events::Severity::Error, format!("PDN-{:04} {}", d.code, d.message))
@@ -3575,7 +3602,21 @@ fn generate(args: &[String]) -> ExitCode {
                 .filter(|i| !i.is_empty())
                 .map(str::to_string)
                 .collect();
-            select_instances(&db, base.by_cell, &patterns, &base.orients)
+            let selected = select_instances(&db, base.by_cell, &patterns, &base.orients);
+            // `define_pdn_grid_macro`'s lines, as each definition is read: PDN-231 per instance
+            // `isValid` turns away, PDN-1051 when nothing was selected.
+            let report: Vec<vyges_pdn::report::Selected> = selected
+                .iter()
+                .map(|i| vyges_pdn::report::Selected {
+                    name: i.clone(),
+                    has_supply: instance_has_supply(&db, i, &build_nets),
+                    has_terms: !db.master_get_m_terms(&db.inst_get_master(i)).is_empty(),
+                })
+                .collect();
+            for line in vyges_pdn::report::macro_grid(&base.name, &report) {
+                log_line(line);
+            }
+            selected
                 .into_iter()
                 // 🔑 **`InstanceGrid::isValid`** — an instance connected to no supply net gets a
                 // dummy grid, and `getGrids(true)` skips those. See `instance_has_supply`.
@@ -3906,21 +3947,7 @@ fn generate(args: &[String]) -> ExitCode {
         // `"<name> - <instance>"` for an instance grid (`grid.cpp:1442`). Reproducing the long
         // form matters — a design with one macro grid per macro prints one line each, and the
         // instance is the only thing telling them apart.
-        vyges_events::emit(
-            &vyges_events::Event::new(
-                "vyges-pdn",
-                vyges_events::Severity::Info,
-                format!(
-                    "PDN-0001 Inserting grid: {}",
-                    if grid.instance.is_empty() {
-                        grid.name.clone()
-                    } else {
-                        format!("{} - {}", grid.name, grid.instance)
-                    }
-                ),
-            )
-            .with_code("PDN-GRID-INSERT"),
-        );
+        log_line(vyges_pdn::report::inserting_grid(&grid.name, &grid.instance));
         // 🔑 **`-starts_with` belongs to the GRID that declared it**, and `define_pdn_grid`
         // defaults it to GROUND — `set start_with_power 0`. A grid that says nothing gets ground
         // however loudly a sibling asked for power.

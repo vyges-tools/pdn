@@ -43,6 +43,7 @@ pub mod nets;
 pub mod orient;
 pub mod pads;
 pub mod region;
+pub mod report;
 pub mod rings;
 pub mod shapes;
 pub mod split;
