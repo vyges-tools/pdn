@@ -828,6 +828,44 @@ fn find_domain_net(db: &Db, want: &str) -> Result<String, validate::Diag> {
     }
 }
 
+/// `VoltageDomain::determinePowerGroundNets` for the implicit Core domain: an explicit net stands
+/// in for `set_voltage_domain` and is taken silently; a net it had to FIND is named in the log
+/// (PDN-0101 power, PDN-0102 ground). `PdnGen::ensureCoreDomain` reaches this from BOTH `pdngen`
+/// and `pdngen -ripup`, so the two paths share this one function.
+fn core_domain_net(
+    explicit: Option<&str>,
+    want: &str,
+    find: impl FnOnce() -> Result<String, validate::Diag>,
+) -> Result<(String, Option<vyges_pdn::report::Line>), validate::Diag> {
+    match explicit.filter(|n| !n.is_empty()) {
+        Some(n) => Ok((n.to_string(), None)),
+        None => {
+            let n = find()?;
+            let line = vyges_pdn::report::domain_net(want == "POWER", &n, nets::CORE_DOMAIN);
+            Ok((n, Some(line)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod core_domain_net_tests {
+    use super::*;
+
+    // Upstream rule: `ensureCoreDomain` builds the Core domain with no nets, so
+    // `determinePowerGroundNets` searches and logs PDN-0101/0102 — on `pdngen -ripup` too
+    // (`ripup.ok` prints both). A net given explicitly is never searched and never logged.
+    #[test]
+    fn a_searched_net_is_logged_and_a_given_one_is_not() {
+        let found = core_domain_net(None, "POWER", || Ok("VDD".to_string())).unwrap();
+        assert_eq!(found.0, "VDD");
+        assert_eq!(found.1, Some((false, 101, "Using VDD as power net for Core domain.".to_string())));
+        let found = core_domain_net(Some(""), "GROUND", || Ok("VSS".to_string())).unwrap();
+        assert_eq!(found.1, Some((false, 102, "Using VSS as ground net for Core domain.".to_string())));
+        let given = core_domain_net(Some("VDD"), "POWER", || panic!("an explicit net is never searched")).unwrap();
+        assert_eq!(given, ("VDD".to_string(), None));
+    }
+}
+
 /// `InstanceGrid::checkHalo`: an instance grid's halo must not reach into a row the instance does
 /// not itself sit on — PDN-0008, with the largest halo that would clear them all, written back in
 /// the macro's own frame so it can be typed into `-halo` as it is.
@@ -2912,29 +2950,19 @@ fn ripup(path: &str, out: &str, opts: &Opts) -> ExitCode {
     // ⚠️ **`findDomainNet` errors on none AND on more than one**, so a design with two power nets
     // and no explicit domain is a diagnostic, not a guess. An explicit `--power`/`--ground` stands
     // in for `set_voltage_domain`, which `ensureCoreDomain` leaves alone.
-    let discover = |want: &str| -> Result<String, String> {
-        let found: Vec<String> = db
-            .block_get_nets()
-            .into_iter()
-            .filter(|n| db.net_sigtype(n).eq_ignore_ascii_case(want))
-            .collect();
-        match found.len() {
-            0 => Err(format!("Unable to find {want} net for Core domain.")),
-            1 => Ok(found.into_iter().next().unwrap()),
-            _ => Err(format!("Found multiple possible nets for {want} net for Core domain.")),
-        }
-    };
     let mut nets: Vec<String> = Vec::new();
     for (explicit, want) in [(opts.one("power"), "POWER"), (opts.one("ground"), "GROUND")] {
-        match explicit {
-            Some(n) if !n.is_empty() => nets.push(n.to_string()),
-            _ => match discover(want) {
-                Ok(n) => nets.push(n),
-                Err(e) => {
-                    vyges_events::log("vyges-pdn", vyges_events::Severity::Error, e);
-                    return ExitCode::from(2);
+        match core_domain_net(explicit, want, || find_domain_net(&db, want)) {
+            Ok((n, line)) => {
+                if let Some(line) = line {
+                    log_line(line);
                 }
-            },
+                nets.push(n)
+            }
+            Err(d) => {
+                vyges_events::log("vyges-pdn", vyges_events::Severity::Error, d.message);
+                return ExitCode::from(2);
+            }
         }
     }
     // 🔑 **The secondary nets of the domain go too**, in `getNets()` order after power and ground.
@@ -3039,13 +3067,10 @@ fn generate(args: &[String]) -> ExitCode {
     // Core domain takes the block's one net of each sig type — power first, then ground.
     let mut found = Vec::new();
     for (explicit, want) in [(opts.one("power"), "POWER"), (opts.one("ground"), "GROUND")] {
-        // `VoltageDomain::determinePowerGroundNets`: a net it had to find is named in the log.
-        let given = explicit.filter(|n| !n.is_empty()).map(str::to_string);
-        let searched = given.is_none();
-        match given.ok_or(()).or_else(|()| find_domain_net(&db, want)) {
-            Ok(n) => {
-                if searched {
-                    log_line(vyges_pdn::report::domain_net(want == "POWER", &n, nets::CORE_DOMAIN));
+        match core_domain_net(explicit, want, || find_domain_net(&db, want)) {
+            Ok((n, line)) => {
+                if let Some(line) = line {
+                    log_line(line);
                 }
                 found.push(n)
             }
