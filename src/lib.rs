@@ -36,6 +36,10 @@
 //!
 //! Nothing in this module reads a database; the binary does that and hands values in. That split
 //! is what lets the geometry be tested without a design.
+
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_pdn::…` paths resolve here.
+extern crate self as vyges_pdn;
 pub mod channels;
 pub mod followpins;
 pub mod grid;
@@ -193,3 +197,10 @@ mod global_connect_tests {
         assert!(!re.is_match("XVSS"));
     }
 }
+
+/// The `vyges-pdn` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
