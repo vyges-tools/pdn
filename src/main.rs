@@ -107,14 +107,14 @@ const DESCRIBE: &str = r#"{
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "MEASURED 2026-10-12 against the upstream pdn goldens at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad: 132 of 150 comparable cases exact on shapes, vias and block terminals, of 189 discovered. Of the 18 that differ, 17 are polygon-shaped grid cases that first became comparable at that pin, and 1 (asap7_repair_channel_macro_gap) is new upstream channel-repair behaviour; neither family is modelled yet. MEASURED 2026-09-30 at pin da9f29f18b6487825aa880597176e0fa97110b31: 130 of 130 comparable cases exact on shapes, vias and block terminals, of 168 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
+    "MEASURED 2026-10-12 against the reference pdn goldens at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad: 132 of 150 comparable cases exact on shapes, vias and block terminals, of 189 discovered. Of the 18 that differ, 17 are polygon-shaped grid cases that first became comparable at that pin, and 1 (asap7_repair_channel_macro_gap) is new reference channel-repair behaviour; neither family is modelled yet. MEASURED 2026-09-30 at pin da9f29f18b6487825aa880597176e0fa97110b31: 130 of 130 comparable cases exact on shapes, vias and block terminals, of 168 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
     "No comparable case fails at that pin. The eight the previous reading failed -- hybrid and multi-height rows, mirrored rows, a merged stacked-via enclosure, a pad balance case, over-pad connections and power-switch cut rows -- all match.",
     "Previous readings: 106 of 114 at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34 on 2026-09-03; 104 of 104 at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c on 2026-08-30. An earlier `110 of 110` carried in this descriptor was NOT reproducible and is withdrawn.",
     "38 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 30 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch and 1 its -instances in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
     "Diagnostics implemented so far: PDN-0003, 0004, 0005 (connect rules), 0106, 0107, 0108, 0114, 0117, 0118, 0191 (argument validation), 0185 and 0215 (runtime). A case whose golden names any other code is skipped with that code named, never silently passed.",
     "status is one of generated, vacuous or error. VACUOUS IS NOT GENERATED: it means the run laid no metal at all, and this assertion passes only on generated, so a no-op fails it rather than reporting a grid that was never built. Zero can still be the right answer for the design; read shapes and decide.",
     "The engine validates inside the ordinary build path, as the reference does inside addRing and addStrap, so every design it accepts has passed those checks too -- the diagnostics are not a separate check mode.",
-    "Written against the upstream pdn regression suite. The algorithm is reimplemented from the published behaviour and the goldens' implementation-defined details (snapping, tie-breaks, rounding), not transliterated from the source."
+    "Written against the reference pdn regression suite. The algorithm is reimplemented from the published behaviour and the goldens' implementation-defined details (snapping, tie-breaks, rounding), not transliterated from the source."
   ],
   "invocation": {
     "args_template": ["generate", "{odb}"],
@@ -173,7 +173,7 @@ const USAGE: &str =
          \x20  vyges-pdn global-connect <db> --connect NET:PINPAT:INSTPAT:power|ground|signal\n\
          \x20        [--connect ...]  [--force]  [--out-odb FILE]\n\
          \x20        creates the supply nets and connects matching instance pins to them.\n\
-         \x20        Patterns are FULL matches, as OpenROAD's are. Without this, `generate`\n\
+         \x20        Patterns are FULL matches, as the reference's are. Without this, `generate`\n\
          \x20        refuses: there is no net to build a grid on.\n\
          \x20        status is applied or vacuous. VACUOUS IS NOT APPLIED: the rules matched no\n\
          \x20        pin and nothing was connected. Exit is still 0 -- a design already wired\n\
