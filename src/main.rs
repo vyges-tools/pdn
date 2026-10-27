@@ -8898,8 +8898,8 @@ fn generate(args: &[String]) -> ExitCode {
     // one `+ ROUTED` group short (VDD 2 vs 3, VSS 137 vs 138 on
     // `pads_black_parrot_flipchip_connect_overpads`), which a per-net segment comparison
     // cannot see. ⚠️ Made only for a net that has something to write: the reference makes one
-    // for every domain net and destroys the empty ones afterwards (PDN-0213, not emitted here),
-    // which leaves the same database.
+    // for every domain net and destroys the empty ones afterwards, which leaves the same
+    // database; its warning for each (PDN-0213) is made below from what was written.
     let mut swire_nets: Vec<&str> = Vec::new();
     for (_, w) in &writes {
         let net = match *w {
@@ -8918,6 +8918,8 @@ fn generate(args: &[String]) -> ExitCode {
     }
     let mut vias_placed = 0;
     let mut written = 0;
+    // The nets whose special wire holds anything once the writes are done (PDN-0213 below).
+    let mut wired: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (_, w) in &writes {
         match *w {
             Write::Fill(j) => {
@@ -8928,6 +8930,8 @@ fn generate(args: &[String]) -> ExitCode {
                         vyges_events::Severity::Warn,
                         format!("cannot write DRCFILL on {layer}: {e}"),
                     );
+                } else {
+                    wired.insert(net.as_str());
                 }
             }
             Write::Via(i) => {
@@ -8941,7 +8945,10 @@ fn generate(args: &[String]) -> ExitCode {
                     _ => "STRIPE",
                 };
                 match db.add_swire_via(net, name, *centre, false, ty) {
-                    Ok(()) => vias_placed += 1,
+                    Ok(()) => {
+                        vias_placed += 1;
+                        wired.insert(net.as_str());
+                    }
                     Err(e) => {
                         if std::env::var_os("PDN_VIA_TRACE").is_some() {
                             eprintln!("[viawrite] {net}|{name}|{centre:?}|{ty}: {e}");
@@ -8957,7 +8964,10 @@ fn generate(args: &[String]) -> ExitCode {
                 // `REPAIR` is our tag for a repair-channel strap; the DEF knows it as STRIPE.
                 let shape = if *shape == "REPAIR" { "STRIPE" } else { *shape };
                 match db.add_swire_box_shaped(net, layer, *rect, false, shape) {
-                    Ok(()) => written += 1,
+                    Ok(()) => {
+                        written += 1;
+                        wired.insert(net.as_str());
+                    }
                     Err(e) => {
                         vyges_events::log(
                             "vyges-pdn",
@@ -9057,6 +9067,15 @@ fn generate(args: &[String]) -> ExitCode {
         );
     }
 
+    // 🔑 **Every domain net left with no shapes is warned of (PDN-0213)** — after the pins, before
+    // the empty terminals go, as the reference writes them. The domains are the core one and the
+    // region one a `--domain` names; the order is the nets' database ids (`nets::unwritten_nets`).
+    let region = opts.one("domain").and_then(region_domain_nets);
+    let domains: Vec<&nets::Domain> = std::iter::once(&domain).chain(region.as_ref()).collect();
+    for net in nets::unwritten_nets(&domains, &|n| wired.contains(n), &|n| db.net_id(n).ok()) {
+        log_line(vyges_pdn::report::no_shapes(net));
+    }
+
     // 🔑 **A terminal this run created and then left empty is destroyed.** `PdnGen::writeToDb`
     // ends by walking the terminals it made and dropping any that carry no pin geometry.
     //
@@ -9099,6 +9118,24 @@ fn generate(args: &[String]) -> ExitCode {
         status = vyges_pdn::settle_status(written),
     );
     ExitCode::SUCCESS
+}
+
+/// The nets of the region domain a `--domain name:power:ground[:secondary,...[:switched]]` names,
+/// for the PDN-0213 walk; `None` without a power or ground net. The grid's own reading of the same
+/// spec (with the region's boxes) is in `generate`.
+fn region_domain_nets(spec: &str) -> Option<nets::Domain> {
+    let mut f = spec.split(':');
+    let _name = f.next()?;
+    let power = f.next().unwrap_or("").to_string();
+    let ground = f.next().unwrap_or("").to_string();
+    let secondary = f.next().unwrap_or("").split(',').filter(|n| !n.is_empty()).map(str::to_string).collect();
+    let switched = f.next().unwrap_or("").to_string();
+    (!power.is_empty() && !ground.is_empty()).then(|| nets::Domain {
+        power,
+        ground,
+        switched_power: (!switched.is_empty()).then_some(switched),
+        secondary,
+    })
 }
 
 /// A repair-channel strap's component index: after every component the grid was planned with —

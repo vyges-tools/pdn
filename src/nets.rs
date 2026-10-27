@@ -62,9 +62,43 @@ pub fn build_order(d: &Domain, starts_with_power: bool) -> Vec<String> {
     out
 }
 
+/// The nets left with no special wire once the grid is written, as the reference warns of them
+/// (PDN-0213): it makes a special wire for EVERY net of every domain before any grid writes, then
+/// destroys and warns of each one still empty. The walk is over a map keyed by net, so the
+/// warnings come in NET-ID order, each net once — not in domain or build order. `id` is a net's
+/// database id; a net the database does not hold is never warned of (nothing was made for it).
+pub fn unwritten_nets<'a>(domains: &[&'a Domain], written: &dyn Fn(&str) -> bool, id: &dyn Fn(&str) -> Option<u32>) -> Vec<&'a str> {
+    let mut nets: Vec<(u32, &str)> = Vec::new();
+    for d in domains {
+        let all = std::iter::once(&d.power).chain(&d.switched_power).chain(std::iter::once(&d.ground)).chain(&d.secondary);
+        for n in all {
+            if let Some(i) = id(n) {
+                if !nets.iter().any(|&(j, _)| j == i) {
+                    nets.push((i, n));
+                }
+            }
+        }
+    }
+    nets.sort_by_key(|&(i, _)| i);
+    nets.into_iter().map(|(_, n)| n).filter(|n| !written(n)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unwritten_nets_are_warned_of_once_each_in_net_id_order() {
+        let core = Domain { power: "VDD".into(), ground: "VSS".into(), switched_power: None, secondary: vec!["VCC".into(), "VAUX".into()] };
+        let region = Domain { power: "VREG".into(), ground: "VSS".into(), switched_power: Some("VSW".into()), secondary: vec![] };
+        let id = |n: &str| match n { "VSS" => Some(1), "VDD" => Some(2), "VCC" => Some(7), "VAUX" => Some(3), "VREG" => Some(5), "VSW" => Some(4), _ => None };
+        let written = |n: &str| n == "VDD" || n == "VSS" || n == "VREG";
+        // VSS is in both domains and written: never warned of. The rest by id, not domain order.
+        assert_eq!(unwritten_nets(&[&core, &region], &written, &id), vec!["VAUX", "VSW", "VCC"]);
+        // A net the database does not hold made no special wire, so there is nothing to warn of.
+        let ghost = Domain { secondary: vec!["NOPE".into()], ..core.clone() };
+        assert_eq!(unwritten_nets(&[&ghost], &written, &id), Vec::<&str>::new());
+    }
 
     #[test]
     fn core_is_the_only_aliased_domain_name() {

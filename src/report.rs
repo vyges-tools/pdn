@@ -40,6 +40,11 @@ pub fn macro_grid(grid: &str, selected: &[Selected]) -> Vec<Line> {
     out
 }
 
+/// PDN-0213: a domain net the grid left without a single shape.
+pub fn no_shapes(net: &str) -> Line {
+    (true, 213, format!("No shapes were created for net {net}."))
+}
+
 /// The line that opens each grid's build: its name, and for an instance grid the instance too.
 pub fn inserting_grid(grid: &str, instance: &str) -> Line {
     let name = if instance.is_empty() { grid.to_string() } else { format!("{grid} - {instance}") };
