@@ -9355,16 +9355,17 @@ fn global_connect(args: &[String]) -> ExitCode {
     // (`dbBlock.cpp:3502`), including the "use -force" tail only when something was skipped.
     // This is `pdn`'s first structured event: the crate carried the `vyges-events` dependency
     // with no emission at all, so the largest construction engine reached the trail silently.
+    // Under the reference's own code, so its text form is the reference's line, `[INFO ODB-0403] …`.
     vyges_events::emit(
         &vyges_events::Event::new(
             "vyges-pdn",
             vyges_events::Severity::Info,
             format!(
-                "ODB-0403 {connected} connections made, {skipped} conflicts skipped{}",
+                "{connected} connections made, {skipped} conflicts skipped{}",
                 if skipped == 0 { "." } else { ", use -force to connect." }
             ),
         )
-        .with_code("PDN-GLOBAL-CONNECT"),
+        .with_code("ODB-0403"),
     );
     // ⚠️ PRETTY, like `generate`'s report. `json!`'s Display is compact, and a chain that prints
     // one command's report as a block and the next one's as a single long line reads as two
