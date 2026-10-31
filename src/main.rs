@@ -118,18 +118,43 @@ const DESCRIBE: &str = r#"{
   ],
   "invocation": {
     "args_template": ["generate", "{odb}"],
-    "optional": {
-      "out_def": { "type": "path", "description": "write the result as DEF" },
+    "optional": [
+      { "arg": "out_def", "flag": "--out-def" },
+      { "arg": "power", "flag": "--power" },
+      { "arg": "ground", "flag": "--ground" },
+      { "arg": "voltage_domains", "flag": "--voltage-domains" },
+      { "arg": "trim", "flag": "--trim" },
+      { "arg": "grid", "flag": "--grid" },
+      { "arg": "domain", "flag": "--domain" },
+      { "arg": "starts_with", "flag": "--starts-with" },
+      { "arg": "followpins", "flag": "--followpins" },
+      { "arg": "ring", "flag": "--ring" },
+      { "arg": "stripe", "flag": "--stripe" },
+      { "arg": "connect", "flag": "--connect" },
+      { "arg": "pins", "flag": "--pins" },
+      { "arg": "split_cuts", "flag": "--split-cuts" }
+    ],
+    "emits_json": false
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["odb", "out_def", "power", "ground"],
+    "properties": {
+      "odb": { "type": "string", "description": "path to the design database (.odb), its supply nets already connected (pdn.global_connect)" },
+      "out_def": { "type": "string", "description": "write the result as DEF" },
       "power": { "type": "string", "description": "the power net name" },
       "ground": { "type": "string", "description": "the ground net name" },
-      "starts_with": { "type": "string", "description": "power or ground; which net takes the innermost ring" },
-      "followpins": { "type": "string", "description": "layer[:extend[:width]], repeatable" },
-      "stripe": { "type": "string", "description": "layer:width:pitch:offset[:extend[:count[:snap[:spacing]]]], repeatable" },
-      "ring": { "type": "string", "description": "layer0,layer1:width:spacing:offset[:boundary], repeatable" },
-      "connect": { "type": "string", "description": "layer0,layer1[:vias], repeatable" },
-      "pins": { "type": "string", "description": "layers whose shapes are never shrunk" },
-      "split_cuts": { "type": "string", "description": "layer:pitch[:stagger], repeatable" },
-      "domain": { "type": "string", "description": "region:power:ground, per grid" }
+      "voltage_domains": { "type": ["string", "array"], "items": { "type": "string" }, "description": "the voltage domains to build, e.g. CORE" },
+      "trim": { "type": "integer", "enum": [0, 1], "description": "1 trims the shapes as the reference does (default 0: untrimmed)" },
+      "grid": { "type": "string", "description": "ONE grid per call, 'name:kind' e.g. 'stdcell:core'; the options below belong to it" },
+      "domain": { "type": "string", "description": "region:power:ground, for a region domain" },
+      "starts_with": { "type": "string", "enum": ["power", "ground"], "description": "which net takes the innermost ring (default ground)" },
+      "followpins": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer[:extend[:width]] in microns, e.g. 'met1:core:0.48'" },
+      "ring": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer0,layer1:width:spacing:offset[:boundary]" },
+      "stripe": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer:width:pitch:offset[:extend[:count[:snap[:spacing]]]] in microns" },
+      "connect": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer0,layer1[:vias], one per pair of layers to join" },
+      "pins": { "type": "string", "description": "layers whose shapes are never shrunk, comma-separated" },
+      "split_cuts": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer:pitch[:stagger] in microns" }
     }
   },
   "consumes": ["odb"],
@@ -138,7 +163,33 @@ const DESCRIBE: &str = r#"{
     "id": "pdn-generated",
     "field": "status",
     "pass_when": { "eq": "generated" }
-  }
+  },
+  "tools": [
+    {
+      "name": "pdn.global_connect",
+      "summary": "create the supply nets and connect every matching instance pin to them (run before generate)",
+      "invocation": {
+        "args_template": ["global-connect", "{odb}"],
+        "optional": [
+          { "arg": "connect", "flag": "--connect" },
+          { "arg": "force", "flag": "--force" },
+          { "arg": "out_odb", "flag": "--out-odb" }
+        ],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["odb", "connect"],
+        "properties": {
+          "odb": { "type": "string", "description": "path to the design database (.odb)" },
+          "connect": { "type": ["string", "array"], "items": { "type": "string" }, "description": "NET:PINPAT:INSTPAT:power|ground|signal, one rule per entry; patterns are FULL matches, e.g. 'VPWR:^VPWR$:.*:power'" },
+          "force": { "type": "boolean", "description": "reconnect pins already on another net" },
+          "out_odb": { "type": "string", "description": "write the database here instead of in place" }
+        }
+      },
+      "assertion": { "id": "supplies-connected", "field": "status", "pass_when": { "eq": "applied" } }
+    }
+  ]
 }
 "#;
 
@@ -9210,6 +9261,8 @@ fn global_connect(args: &[String]) -> ExitCode {
     while i < args.len() {
         match args[i].as_str() {
             "--force" => force = true,
+            // The report is always JSON; accepted because `vyges mcp` appends it to every call.
+            "--json" => {}
             "--out-odb" => {
                 i += 1;
                 match args.get(i) {
@@ -9668,5 +9721,43 @@ mod via_write_order {
     #[test]
     fn a_via_sequence_carries_its_grid() {
         assert_eq!(via_seq_parts(via_seq(3, 17)), (3, 17));
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 }
