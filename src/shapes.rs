@@ -45,7 +45,7 @@ pub fn dedupe(shapes: &[Rect]) -> Vec<Rect> {
 ///
 /// Three outcomes, and two of them lose the shape:
 ///
-/// - it interior-overlaps a shape of another net → a short, and the shape is **dropped**;
+/// - it overlaps OR TOUCHES a shape of another net → a short, and the shape is **dropped**;
 /// - it interior-overlaps a same-net shape aligned on neither axis → **dropped**;
 /// - otherwise every same-net shape it overlaps is absorbed into it.
 ///
@@ -63,11 +63,16 @@ pub fn add_shapes<T: PartialEq + Clone>(shapes: &[(T, Rect)]) -> Vec<(T, Rect)> 
     'next: for (net, rect) in shapes {
         let mut absorb: Vec<usize> = Vec::new();
         for (i, (other_net, other)) in kept.iter().enumerate() {
-            if !overlaps(*rect, *other) {
+            // 🔑 Another net's shape that only TOUCHES is still a short (upstream 4155ac31,
+            // f320726473c); only a same-net shape that touches without overlapping is let be.
+            if other_net != net {
+                if intersects(*rect, *other) {
+                    continue 'next; // a short: the shape is not added at all
+                }
                 continue;
             }
-            if other_net != net {
-                continue 'next; // a short: the shape is not added at all
+            if !overlaps(*rect, *other) {
+                continue;
             }
             let same_x = rect.0 == other.0 && rect.2 == other.2;
             let same_y = rect.1 == other.1 && rect.3 == other.3;
@@ -507,6 +512,17 @@ pub fn rectangles_where(edges: &[Rect], covered: impl Fn(Rect) -> bool) -> Vec<R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`GridComponent::addShape`, 4155ac31): a shape that touches another net's
+    /// shape along an edge is a short and is not added; one that touches its own net's shape is
+    /// kept beside it, unmerged.
+    #[test]
+    fn touching_another_net_is_a_short() {
+        let s = [("VDD", (0, 0, 100, 20)), ("VSS", (100, 0, 200, 20))];
+        assert_eq!(add_shapes(&s), vec![("VDD", (0, 0, 100, 20))]);
+        let s = [("VDD", (0, 0, 100, 20)), ("VDD", (100, 0, 200, 20))];
+        assert_eq!(add_shapes(&s).len(), 2);
+    }
 
     #[test]
     fn one_shape_can_absorb_several_at_once() {

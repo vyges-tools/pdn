@@ -24,6 +24,24 @@ that cross it, and the rails that run along every standard-cell row.
 Every rule is measured against a real design rather than asserted — every shape and every via
 checked, not sampled, on designs from a few dozen shapes to a few thousand.
 
+## Strap and rail options
+
+A strap set (`--stripe`) and the follow-pin rails (`--followpins`) each name how far they reach:
+
+| Extension | Reaches |
+| --- | --- |
+| `core` (default) | the grid's own core or domain |
+| `rings` | the core ring |
+| `boundary` | the die edge |
+| `padring` | the inner edge of the placed pad ring; refused (PDN-0242) when no pad is placed |
+
+Either can also run on past that target along its own length by a stated distance (`extend_by`,
+microns), never beyond the die edge and never short of the target.
+
+A strap set's offset is measured, by default, to the centre of its first strap. `offset_type`
+measures it instead to the low edge of the first strap (`START`), the centre of the whole group
+(`CENTER`), the centre of the last strap (`LAST`) or the high edge of the last strap (`END`).
+
 ## Design
 
 The library reads no database: the geometry is pure functions over values, and the binary reads the
@@ -51,7 +69,7 @@ src/channels.rs    finding unconnected channels and repairing them
 This engine's behaviour follows the reference implementation's `pdn` module. The algorithms here are
 reimplemented from its published behaviour — the same published algorithm and the same parameter
 semantics — and are not a transliteration of its source; no code is copied. Written against OpenDB
-at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`; `vyges-pdn --describe` reports the pin a given
+at pin `4155ac31014923e0fa721b691d222511adc7d8c3`; `vyges-pdn --describe` reports the pin a given
 build was made against.
 
 Agreeing with `pdn` is not a goal this project is bound to. Where its own requirements point

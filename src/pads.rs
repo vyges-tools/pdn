@@ -145,6 +145,18 @@ pub fn may_run_over_pad(
 }
 
 /// Interior overlap, as the reference's `Rect::intersects` has it.
+/// `PadDirectConnectionStraps::cutShapes`' `is_behind_edge` (upstream 4155ac31): does `rect` lie
+/// on the pad's side of the edge a connection leaves the pad through? For a pad on the north edge
+/// that is anything starting at or above the pad's bottom; the other three mirror it.
+pub fn is_behind_edge(edge: Edge, pad: Rect, rect: Rect) -> bool {
+    match edge {
+        Edge::North => rect.1 >= pad.1,
+        Edge::South => rect.3 <= pad.3,
+        Edge::East => rect.0 >= pad.0,
+        Edge::West => rect.2 <= pad.2,
+    }
+}
+
 fn overlaps(a: Rect, b: Rect) -> bool {
     a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3
 }
@@ -587,6 +599,37 @@ pub fn strap_to_shape(pin: Rect, target: Rect, edge: Edge, max_width: Option<i32
     r
 }
 
+/// `VoltageDomain::populatePadRingInnerArea`: the area inside the pad ring, from the PLACED side
+/// pads (area-IO pads already left out by the caller).
+///
+/// 🔑 **Each side is bounded by the pads beside the core on it**: a pad wholly above the core and
+/// within its width pulls the top edge down to its bottom, and so on round. A pad that is beside
+/// no single side — a corner pad, or one over the core — sets nothing.
+///
+/// ⛔ **`None` when no pad sets any side** (upstream 4155ac31): there is no pad ring, and a strap
+/// asked to reach it is refused with PDN-0242 rather than run to the die.
+pub fn ring_inner_area(pads: &[crate::Rect], core: crate::Rect, die: crate::Rect) -> Option<crate::Rect> {
+    let mut inner = die;
+    let mut found = false;
+    for &(x0, y0, x1, y1) in pads {
+        let within_x = x0 >= core.0 && x1 <= core.2;
+        let within_y = y0 >= core.1 && y1 <= core.3;
+        if y0 > core.3 && within_x {
+            inner.3 = inner.3.min(y0);
+        } else if y1 < core.1 && within_x {
+            inner.1 = inner.1.max(y1);
+        } else if x1 < core.0 && within_y {
+            inner.0 = inner.0.max(x1);
+        } else if x0 > core.2 && within_y {
+            inner.2 = inner.2.min(x0);
+        } else {
+            continue;
+        }
+        found = true;
+    }
+    found.then_some(inner)
+}
+
 #[cfg(test)]
 mod ring_tests {
     use super::*;
@@ -789,6 +832,18 @@ mod ring_tests {
 mod tests {
     use super::*;
 
+    /// Upstream rule (`PadDirectConnectionStraps::cutShapes`, 4155ac31): pad metal on the pad's
+    /// side of its connection edge is left out of an edge connection's cut; metal facing the core
+    /// beyond that edge is not.
+    #[test]
+    fn pad_metal_behind_the_edge_is_left_out() {
+        let pad = (100, 900, 200, 1000);
+        assert!(is_behind_edge(Edge::North, pad, (90, 900, 210, 1000)));
+        assert!(!is_behind_edge(Edge::North, pad, (90, 850, 210, 950)));
+        assert!(is_behind_edge(Edge::West, (0, 100, 100, 200), (0, 90, 100, 210)));
+        assert!(!is_behind_edge(Edge::West, (0, 100, 100, 200), (50, 90, 150, 210)));
+    }
+
     const CORE: Rect = (1000, 1000, 9000, 9000);
 
     #[test]
@@ -987,5 +1042,24 @@ mod refine_tests {
         assert!(call((0, 0, 100, 10), (90, 0, 110, 10), &[(9, (80, 0, 90, 10))]));
         // One unit clear, and it does not.
         assert!(!call((0, 0, 100, 10), (90, 0, 110, 10), &[(9, (80, 0, 89, 10))]));
+    }
+
+    /// Port of `PadRingInnerAreaIsBoundedByThePadsOnEachSide` and
+    /// `PadRingInnerAreaIsUnsetWithoutSidePads` (upstream 4155ac31). Upstream rule: each side pad
+    /// bounds its side; a corner pad bounds none, and with only corner pads there is no ring.
+    #[test]
+    fn the_pad_ring_is_bounded_by_the_pads_on_each_side() {
+        let core = (2000, 2000, 8000, 8000);
+        let die = (0, 0, 10000, 10000);
+        let north = (4000, 9000, 5000, 10000);
+        let south = (4000, 0, 5000, 1000);
+        let west = (500, 4000, 1500, 5000);
+        let east = (8500, 4000, 9500, 5000);
+        let corner = (0, 0, 1000, 1000);
+        assert_eq!(
+            ring_inner_area(&[north, south, west, east, corner], core, die),
+            Some((1500, 1000, 8500, 9000))
+        );
+        assert_eq!(ring_inner_area(&[corner], core, die), None);
     }
 }

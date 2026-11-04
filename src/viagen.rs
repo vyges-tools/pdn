@@ -396,11 +396,19 @@ pub fn built_enclosure(
 /// tall — five units past each end of a 360-tall opening. Snapping down gives 40, and the metal
 /// fits. Rounding up, or not snapping at all, puts metal outside the shape it lands on and the
 /// via is ripped up at write time for it.
+///
+/// ⛔ **A DEFICIT is snapped AWAY from zero** (upstream 4155ac31, `Enclosure::snap`): a negative
+/// enclosure is its magnitude rounded UP, negated. Rounding it toward zero turned a few units of
+/// missing metal into an apparently legal zero, and the via passed its enclosure check.
 pub fn snap_enclosure(e: Enclosure, manufacturing_grid: i32) -> Enclosure {
-    Enclosure {
-        x: crate::straps::snap_to_manufacturing_grid(e.x, manufacturing_grid, false),
-        y: crate::straps::snap_to_manufacturing_grid(e.y, manufacturing_grid, false),
-    }
+    let snap = |v: i32| {
+        if v < 0 {
+            -crate::straps::snap_to_manufacturing_grid(-v, manufacturing_grid, true)
+        } else {
+            crate::straps::snap_to_manufacturing_grid(v, manufacturing_grid, false)
+        }
+    };
+    Enclosure { x: snap(e.x), y: snap(e.y) }
 }
 
 /// **E23** — the overlap enclosure: half the room the cut array leaves in the shape.
@@ -457,10 +465,58 @@ pub fn spare_applied(built: Enclosure, required: Enclosure, spare: Enclosure) ->
     }
 }
 
+///
+/// ⛔ **Halved with FLOOR, not truncation** (upstream 4155ac31: `std::floor(double_enc / 2.0)`).
+/// The two differ only on an odd negative remainder, where truncation rounded the deficit toward
+/// zero — the same half-unit of missing metal [`snap_enclosure`] now keeps.
 pub fn overlap_enclosure(extent: (i32, i32), span: (i32, i32)) -> Enclosure {
     Enclosure {
-        x: (extent.0 - span.0) / 2,
-        y: (extent.1 - span.1) / 2,
+        x: half_floor(extent.0 - span.0),
+        y: half_floor(extent.1 - span.1),
+    }
+}
+
+/// `floor(v / 2.0)` in integers.
+pub fn half_floor(v: i32) -> i32 {
+    v.div_euclid(2)
+}
+
+/// `ViaGenerator::getGeneratorWidth` / `getGeneratorHeight`: the metal a via's generator spans on
+/// one side, `(x, y)`.
+///
+/// 🔑 **A cut ARRAY is measured per group**: each group is its cuts plus twice the enclosure, the
+/// groups are `array_spacing` apart, and the leftover group adds its own. A flat run is the span
+/// plus twice the enclosure.
+///
+/// ⛔ **Across, the width counts every group across** (upstream 4155ac31). Before, it took one
+/// group's width, so a wide array scored as a narrow one and lost the choice between generators.
+pub fn generator_extent(array: Option<&ArrayFit>, span: (i32, i32), cut: (i32, i32), enc: (i32, i32)) -> (i32, i32) {
+    let Some(f) = array else {
+        return (span.0 + 2 * enc.0, span.1 + 2 * enc.1);
+    };
+    let run = |n: i32, c: i32, spacing: i32, e: i32| if n == 0 { 0 } else { c * n + spacing * (n - 1) + 2 * e };
+    let axis = |groups: i32, core: i32, end: i32, c: i32, p: i32, gap: i32, e: i32| {
+        groups * run(core, c, p - c, e) + (groups - 1) * gap + run(end, c, p - c, e)
+    };
+    (
+        axis(f.groups.0, f.core.0, f.end.0, cut.0, f.cut_pitch.0, f.array_spacing.0, enc.0),
+        axis(f.groups.1, f.core.1, f.end.1, cut.1, f.cut_pitch.1, f.array_spacing.1, enc.1),
+    )
+}
+
+/// `GenerateViaGenerator::getMinimumEnclosures`: the rules one landing of a generated via is
+/// checked against.
+///
+/// ⛔ **A landing with NO cut-layer rule falls back to the VIARULE's own enclosure** (upstream
+/// 4155ac31); before, an empty set passed anything, and a forced single cut was built with a
+/// deficit the generate rule forbids. Either orientation may meet it.
+///
+/// ⚠️ **Only when the set is EMPTY.** Where the cut layer has an applicable rule, the VIARULE
+/// default is not added as one more alternative — that would let a landing pass on the weaker of
+/// the two.
+pub fn default_enclosure_if_unruled(rules: &mut Vec<(Enclosure, bool)>, default: (i32, i32)) {
+    if rules.is_empty() {
+        rules.push((Enclosure { x: default.0, y: default.1 }, true));
     }
 }
 
@@ -1479,6 +1535,76 @@ pub fn array_placements(fit: &ArrayFit, cut: (i32, i32)) -> Vec<ArrayPlacement> 
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`Enclosure::snap` and `determineRowsAndColumns`, 4155ac31): a deficit keeps
+    /// its sign and grows to the grid; the half of an odd negative remainder is floored.
+    #[test]
+    fn an_enclosure_deficit_is_never_rounded_to_zero() {
+        assert_eq!(snap_enclosure(Enclosure { x: 45, y: -3 }, 10), Enclosure { x: 40, y: -10 });
+        assert_eq!(snap_enclosure(Enclosure { x: -20, y: 0 }, 10), Enclosure { x: -20, y: 0 });
+        assert_eq!(overlap_enclosure((99, 100), (100, 100)), Enclosure { x: -1, y: 0 });
+        assert_eq!(overlap_enclosure((103, 100), (100, 100)), Enclosure { x: 1, y: 0 });
+    }
+
+    /// Port of `GeneratedOddDeficitDoesNotRoundToZero` (upstream 4155ac31). Upstream rule: a
+    /// 50-wide cut in a square of side `size` on a grid of 1 leaves `floor((size - 50) / 2)` either
+    /// side — 48 and 49 both give -1, never 0 — and only `size >= 50` meets a zero enclosure.
+    #[test]
+    fn an_odd_deficit_does_not_round_to_zero() {
+        for (size, expected) in [(48, -1), (49, -1), (50, 0), (69, 9), (70, 10)] {
+            let e = snap_enclosure(overlap_enclosure((size, size), (50, 50)), 1);
+            assert_eq!(e, Enclosure { x: expected, y: expected }, "size {size}");
+            assert_eq!(enclosure_satisfies(e, &[(Enclosure { x: 0, y: 0 }, true)]), size >= 50, "size {size}");
+        }
+    }
+
+    /// Port of `GeneratedDefaultEnclosureAppliesToBothLandings` and
+    /// `GeneratedOverrideDoesNotRemoveOtherLandingDefault`. Upstream rule: a landing with no
+    /// cut-layer rule is held to the VIARULE enclosure, each landing on its own — a rule that
+    /// covers one side leaves the other side's default in place.
+    #[test]
+    fn a_landing_without_cut_rules_is_held_to_the_viarule_default() {
+        let mut below: Vec<(Enclosure, bool)> = Vec::new();
+        let mut above = vec![(Enclosure { x: 5, y: 5 }, true)];
+        default_enclosure_if_unruled(&mut below, (10, 10));
+        default_enclosure_if_unruled(&mut above, (10, 10));
+        assert!(enclosure_satisfies(Enclosure { x: 10, y: 10 }, &below));
+        assert!(!enclosure_satisfies(Enclosure { x: 9, y: 10 }, &below));
+        assert!(enclosure_satisfies(Enclosure { x: 5, y: 5 }, &above));
+        assert!(!enclosure_satisfies(Enclosure { x: 5, y: 4 }, &above));
+    }
+
+    /// Port of `GeneratedApplicableEnclosuresRemainAlternatives`. Upstream rule: the VIARULE
+    /// default must NOT become an alternative to rules the cut layer does have.
+    #[test]
+    fn the_viarule_default_is_not_an_alternative_to_applicable_rules() {
+        let mut rules = vec![(Enclosure { x: 5, y: 20 }, false), (Enclosure { x: 20, y: 5 }, false)];
+        default_enclosure_if_unruled(&mut rules, (10, 10));
+        assert_eq!(rules.len(), 2);
+        assert!(enclosure_satisfies(Enclosure { x: 5, y: 20 }, &rules));
+        assert!(!enclosure_satisfies(Enclosure { x: 10, y: 10 }, &rules));
+    }
+
+    /// Port of `ViaGeneratorWidthSpansEveryArrayAcross`. Upstream rule: an array's generator
+    /// width is every group across plus the gaps between them — at least
+    /// `groups * group_width + (groups - 1) * array_spacing` — not one group's width.
+    #[test]
+    fn the_generator_width_spans_every_array_across() {
+        let f = ArrayFit {
+            groups: (3, 1),
+            core: (2, 2),
+            end: (0, 0),
+            cut_pitch: (100, 100),
+            array_spacing: (200, 200),
+            double_enclosure: (0, 0),
+        };
+        let (w, h) = generator_extent(Some(&f), (0, 0), (50, 50), (0, 0));
+        // One group: two cuts at a pitch of 100, so one pitch plus one cut.
+        let group = 100 + 50;
+        assert_eq!(w, 3 * group + 2 * 200);
+        assert_eq!(h, group);
+        assert_eq!(generator_extent(None, (150, 50), (50, 50), (10, 5)), (170, 60));
+    }
 
     /// The real numbers from `asap7_M1_M2_followpin_enclosure`: an M1 follow pin 54 tall crossing
     /// an M2 follow pin 18 tall, over an 18-tall cut. Upstream rule: V1 asks 9 of enclosure below,
@@ -2805,12 +2931,16 @@ mod tests {
             snap_enclosure(Enclosure { x: 260, y: 40 }, 10),
             Enclosure { x: 260, y: 40 }
         );
-        // ⚠️ A negative enclosure — which `overlap_enclosure` produces for a shape narrower than
-        // its own cut array, and carries through — truncates toward zero, as the reference's
-        // integer division does.
+        // ⛔ A negative enclosure — which `overlap_enclosure` produces for a shape narrower than
+        // its own cut array — is snapped AWAY from zero (upstream 4155ac31, port of
+        // `SnapPreservesNegativeEnclosure`: -1 and -13 on a grid of 10 become -10 and -20).
         assert_eq!(
-            snap_enclosure(Enclosure { x: -45, y: -5 }, 10),
-            Enclosure { x: -40, y: 0 }
+            snap_enclosure(Enclosure { x: -1, y: -13 }, 10),
+            Enclosure { x: -10, y: -20 }
+        );
+        assert_eq!(
+            snap_enclosure(Enclosure { x: -10, y: 20 }, 10),
+            Enclosure { x: -10, y: 20 }
         );
         // No grid declared: nothing moves.
         assert_eq!(

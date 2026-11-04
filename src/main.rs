@@ -107,7 +107,7 @@ const DESCRIBE: &str = r#"{
   "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the .odb it names.",
-    "MEASURED 2026-10-12 against the reference pdn goldens at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad: 132 of 150 comparable cases exact on shapes, vias and block terminals, of 189 discovered. Of the 18 that differ, 17 are polygon-shaped grid cases that first became comparable at that pin, and 1 (asap7_repair_channel_macro_gap) is new reference channel-repair behaviour; neither family is modelled yet. MEASURED 2026-09-30 at pin da9f29f18b6487825aa880597176e0fa97110b31: 130 of 130 comparable cases exact on shapes, vias and block terminals, of 168 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
+    "MEASURED 2026-11-04 against the reference pdn goldens at pin 4155ac31014923e0fa721b691d222511adc7d8c3: 160 of 160 comparable cases exact on shapes, vias and block terminals, of 199 discovered, and 22 of 22 error cases with the reference code and message. MEASURED 2026-10-12 against the reference pdn goldens at pin 27288f5c90265ae5296b2f5a9fa6e8714fa191ad: 132 of 150 comparable cases exact on shapes, vias and block terminals, of 189 discovered. Of the 18 that differ, 17 are polygon-shaped grid cases that first became comparable at that pin, and 1 (asap7_repair_channel_macro_gap) is new reference channel-repair behaviour; neither family is modelled yet. MEASURED 2026-09-30 at pin da9f29f18b6487825aa880597176e0fa97110b31: 130 of 130 comparable cases exact on shapes, vias and block terminals, of 168 discovered. A SCORE IS ONLY TRUE OF ONE COMMIT -- the pin is spelled out here rather than substituted, because a MEASUREMENT names the commit it was taken at, not whatever this binary was later built against.",
     "No comparable case fails at that pin. The eight the previous reading failed -- hybrid and multi-height rows, mirrored rows, a merged stacked-via enclosure, a pad balance case, over-pad connections and power-switch cut rows -- all match.",
     "Previous readings: 106 of 114 at pin 7d490b8ecd357199c0c0e9f3e32becd5eb507c34 on 2026-09-03; 104 of 104 at pin 945a9f48dc6e5cc91d865daa92c45a1094cb682c on 2026-08-30. An earlier `110 of 110` carried in this descriptor was NOT reproducible and is withdrawn.",
     "38 of the suite's cases are skipped rather than passed, and the reasons are counted, not hidden: 30 build no grid at all, 2 have a reference that built no grid, 2 compute a -pitch and 1 its -instances in Tcl this translation cannot read, and one each use -existing, repair_pdn_vias and add_sroute_connect.",
@@ -149,9 +149,9 @@ const DESCRIBE: &str = r#"{
       "grid": { "type": "string", "description": "ONE grid per call, 'name:kind' e.g. 'stdcell:core'; the options below belong to it" },
       "domain": { "type": "string", "description": "region:power:ground, for a region domain" },
       "starts_with": { "type": "string", "enum": ["power", "ground"], "description": "which net takes the innermost ring (default ground)" },
-      "followpins": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer[:extend[:width]] in microns, e.g. 'met1:core:0.48'" },
+      "followpins": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer[:extend[:width[:extend_by]]] in microns, e.g. 'met1:core:0.48'; extend is core, rings, boundary or padring" },
       "ring": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer0,layer1:width:spacing:offset[:boundary]" },
-      "stripe": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer:width:pitch:offset[:extend[:count[:snap[:spacing]]]] in microns" },
+      "stripe": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer:width:pitch:offset[:extend[:count[:snap[:spacing[:starts_with[:nets[:out[:offset_type[:extend_by]]]]]]]]] in microns; extend is core, rings, boundary or padring; offset_type is START, FIRST, CENTER, LAST or END" },
       "connect": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer0,layer1[:vias], one per pair of layers to join" },
       "pins": { "type": "string", "description": "layers whose shapes are never shrunk, comma-separated" },
       "split_cuts": { "type": ["string", "array"], "items": { "type": "string" }, "description": "layer:pitch[:stagger] in microns" }
@@ -213,8 +213,12 @@ const USAGE: &str =
         "usage: vyges-pdn generate <db> --out-def <def> --power <net> --ground <net>\n\
          \x20        [--starts-with power|ground]   (default ground)\n\
          \x20        [--domain <region>:<power>:<ground>]  (per grid; region domain)\n\
-         \x20        [--followpins <layer>[:<extend>[:<width>]]]   (micron, repeatable)\n\
-         \x20        [--stripe <layer>:<width>:<pitch>:<offset>[:<extend>[:<count>[:<snap>[:<spacing>]]]]]\n\
+         \x20        [--followpins <layer>[:<extend>[:<width>[:<extend_by>]]]]   (micron, repeatable)\n\
+         \x20        [--stripe <layer>:<width>:<pitch>:<offset>[:<extend>[:<count>[:<snap>[:<spacing>\n\
+         \x20                  [:<starts_with>[:<nets>[:out[:<offset_type>[:<extend_by>]]]]]]]]]]\n\
+         \x20        <extend> is core | rings | boundary | padring; <offset_type> is\n\
+         \x20        START | FIRST (default) | CENTER | LAST | END; <extend_by> runs a stripe or rail\n\
+         \x20        on past its target along its length, up to the die (micron).\n\
          \x20        [--ring <layer0>,<layer1>:<width>:<spacing>:<offset>[:boundary]]\n\
          \x20        [--connect <layer0>,<layer1>[:<via>[+<via>...][:...]]]   (repeatable)\n\
          \x20        [--pins <layer>[,<layer>...]]  (shapes there are never shrunk)\n\
@@ -666,11 +670,14 @@ fn validate_grids(
 
         for spec in o.all("followpins") {
             // `<layer>[:<extend>[:<width>]]`
-            let mut f = spec.splitn(3, ':');
+            let mut f = spec.splitn(4, ':');
             let layer = f.next().unwrap_or("");
-            let _extend = f.next();
+            let extend = f.next();
             if layer.is_empty() {
                 continue;
+            }
+            if let Some(d) = pad_ring_refusal(db, layer, extend == Some("padring")) {
+                return Some(d);
             }
             // ⚠️ A stated width REPLACES the cell-derived one; the cells are asked only when the
             // command states none.
@@ -699,6 +706,9 @@ fn validate_grids(
                 continue;
             }
             let p: Vec<&str> = rest.split(':').collect();
+            if let Some(d) = pad_ring_refusal(db, layer, p.get(3).copied() == Some("padring")) {
+                return Some(d);
+            }
             let width = dbu(p.first().copied().unwrap_or("0"), per_micron);
             let pitch = dbu(p.get(1).copied().unwrap_or("0"), per_micron);
             let offset = dbu(p.get(2).copied().unwrap_or("0"), per_micron);
@@ -730,6 +740,13 @@ fn validate_grids(
             } else {
                 core.2 - core.0
             };
+            // The offset is checked as `setOffset` left it, after its `-offset_type`.
+            let offset = straps::offset_for_type(
+                offset,
+                p.get(10).and_then(|t| straps::OffsetType::parse(t)).unwrap_or_default(),
+                width,
+                validate::strap_group_width(net_count, width, spacing),
+            );
             let dims = validate::StrapDims {
                 width,
                 spacing,
@@ -2570,6 +2587,9 @@ struct StrapBounds {
     die: Rect,
     strap: Rect,
     ring: Rect,
+    /// `Grid::getPadRingArea`: `die` (the grid boundary) pulled in to the pads' inner edge, or
+    /// `die` itself when no pad is placed.
+    pad_ring: Rect,
     /// `(x, y)`: whether this grid's frame is mirrored along each placed axis — the instance's
     /// orientation for a macro grid (`orient::axis_mirror`), never for the core grid.
     mirror: (bool, bool),
@@ -2662,8 +2682,15 @@ fn make_strap(
             let bound = match extend {
                 "rings" => b.ring,
                 "boundary" => b.die,
+                // `-extend_to_pad_ring`: `Grid::getPadRingArea`, the grid boundary pulled in to
+                // the pads' inner edge.
+                "padring" => b.pad_ring,
                 _ => b.strap,
             };
+            // `-extend_by`: past the mode's target along the strap's length, up to the grid
+            // boundary (`Straps::makeShapes`).
+            let extend_by = p.get(11).filter(|v| !v.is_empty()).map(|v| dbu(v, per_micron)).unwrap_or(0);
+            let bound = straps::grow_bound(bound, b.die, extend_by, horizontal);
             let set = (
                 spec.layer.clone(),
                 spec.pitch,
@@ -2696,6 +2723,16 @@ fn make_strap(
         if build_nets.is_empty() {
             return (Some(set), Vec::new()); // a strap for no net builds nothing
         }
+        // `-offset_type`: `setOffset` runs once the strap's nets are known, since CENTER, LAST and
+        // END measure from the group those nets make.
+        let offset_type = p.get(10).and_then(|t| straps::OffsetType::parse(t)).unwrap_or_default();
+        let mut spec = spec;
+        spec.offset = straps::offset_for_type(
+            spec.offset,
+            offset_type,
+            spec.width,
+            validate::strap_group_width(build_nets.len() as i32, spec.width, spec.spacing),
+        );
         let span = straps::span(b.core, b.die, bound, horizontal, spec.allow_out_of_core);
             let abs = straps::absolute(b.die, horizontal);
             // ⚠️ The track grid on the axis the stripes STEP along: y for horizontal stripes, x for
@@ -2739,11 +2776,19 @@ fn make_strap(
             // outline the mode allows — the domain boundary region (`core`), the ring area
             // (`rings`), the grid boundary region (`boundary`). The identity on a rectangle.
             let ring_extent = [b.ring];
+            let pad_extent: Vec<Rect> = grid_boundary_region
+                .iter()
+                .map(|r| (r.0.max(b.pad_ring.0), r.1.max(b.pad_ring.1), r.2.min(b.pad_ring.2), r.3.min(b.pad_ring.3)))
+                .filter(|r| r.0 < r.2 && r.1 < r.3)
+                .collect();
             let extent: &[Rect] = match extend {
                 "rings" => &ring_extent,
                 "boundary" => grid_boundary_region,
+                "padring" => &pad_extent,
                 _ => domain_boundary_region,
             };
+            let extent = straps::grow_extent(extent, grid_boundary_region, extend_by, horizontal);
+            let extent: &[Rect] = &extent;
             let stripes: Vec<straps::Stripe> = stripes
                 .into_iter()
                 .flat_map(|s| {
@@ -2819,7 +2864,7 @@ fn make_followpins(
     die_rects: &[Rect],
     built_rings: &[rings::BuiltRing],
 ) -> Option<(String, i32, Vec<(String, Rect)>)> {
-    let mut parts = spec.splitn(3, ':');
+    let mut parts = spec.splitn(4, ':');
     let layer = parts.next().unwrap_or(spec);
     let extend = parts.next().unwrap_or("core");
     // 🔑 **An explicit width wins outright.** `FollowPins`' constructor calls `determineWidth()`
@@ -2831,6 +2876,9 @@ fn make_followpins(
         .filter(|w| !w.is_empty())
         .map(|w| dbu(w, per_micron))
         .filter(|w| *w > 0);
+    // `-extend_by`, the fourth field: how far past its target a rail runs on.
+    let extend_by = parts.next().filter(|v| !v.is_empty()).map(|v| dbu(v, per_micron)).unwrap_or(0);
+    let pad_ring = if extend == "padring" { pad_ring_area(db, die) } else { die };
     // ⚠️ `boundary` is the DIE, not the grid's own extent: `Grid::getGridBoundary` returns
     // `getGridArea`, which returns the die area, and a core grid overrides neither.
     let fp_bound = match extend {
@@ -2854,7 +2902,12 @@ fn make_followpins(
     // ends beyond it; `core` / `fixed` — the row's own end.
     let reach = |band: Rect, normal: (i32, i32)| -> i32 {
         let high = normal.0 > 0;
-        match extend {
+        // The boundary edge beside this band, which nothing may run past.
+        let boundary = || {
+            let m = vyges_pdn::region::margin_beyond_exact(die_rects, band, normal);
+            if high { band.2 + m } else { band.0 - m }
+        };
+        let target = match extend {
             "rings" => {
                 let r = rings::ring_reach(built_rings, band, normal);
                 if std::env::var_os("PDN_TRACE").is_some() {
@@ -2862,11 +2915,14 @@ fn make_followpins(
                 }
                 r
             }
-            "boundary" => {
-                let m = vyges_pdn::region::margin_beyond_exact(die_rects, band, normal);
-                if high { band.2 + m } else { band.0 - m }
-            }
+            "boundary" => boundary(),
+            "padring" => if high { pad_ring.2.min(boundary()) } else { pad_ring.0.max(boundary()) },
             _ => if high { band.2 } else { band.0 },
+        };
+        if extend_by > 0 {
+            straps::extend_reach(target, boundary(), extend_by, high)
+        } else {
+            target
         }
     };
     let rails = followpins::make(layer, power, ground, width, rows, domain_region, row_height, &reach);
@@ -3137,7 +3193,11 @@ fn generate(args: &[String]) -> ExitCode {
     }
     let (power, ground) = (found[0].as_str(), found[1].as_str());
 
-    let per_micron = db.block_get_def_units() as f64;
+    // 🔑 Microns become database units at the DATABASE's resolution — the tech's units per micron,
+    // as the reference's `microns_to_dbu` does — never at the DEF header's. A DEF written at 1000
+    // read into a 4000-unit tech (asap7 since upstream e299af11e46) scaled every width, pitch and
+    // offset by a quarter and failed the multiple-of-grid checks.
+    let per_micron = f64::from(db.tech_get_db_units_per_micron());
     let core = area(&db, true);
     let die = area(&db, false);
     // 🔑 **A switched domain has THREE supply nets.** UPF's power switch splits the supply into an
@@ -4161,7 +4221,10 @@ fn generate(args: &[String]) -> ExitCode {
             .all("followpins")
             .iter()
             .map(|s| {
-                s.splitn(3, ':')
+                // ⚠️ `split`, not `splitn(3)`: since `-extend_by` became a FOURTH field the width
+                // is no longer the tail, and `splitn(3)` read `0.48:` as no width at all — every
+                // core strap then stopped half a cell-derived width short of the follow pins.
+                s.split(':')
                     .nth(2)
                     .filter(|w| !w.is_empty())
                     .map(|w| dbu(w, per_micron))
@@ -4652,13 +4715,32 @@ fn generate(args: &[String]) -> ExitCode {
                             (lane_index, group_size, *cand),
                             &mut try_over_pad,
                         );
+                        // ⛔ **An EDGE connection ignores the padframe's metal behind its edge**
+                        // (upstream 4155ac31, `PadDirectConnectionStraps::cutShapes`, kEdge). It
+                        // is the pin carried straight out of the pad, no wider than the pin, so
+                        // a pad that draws one OBS over the whole cell with its pins carved out —
+                        // or its neighbour, by spacing — would otherwise cut it off its own pin.
+                        let edge_obstructions: Vec<(String, Rect, Option<String>, Rect)>;
+                        let cut_against: &[(String, Rect, Option<String>, Rect)] = if try_over_pad.is_none() {
+                            edge_obstructions = obstructions
+                                .iter()
+                                .filter(|(_, _, net, raw)| {
+                                    !(net.as_deref().and_then(pad_obs_net).is_some()
+                                        && vyges_pdn::pads::is_behind_edge(conn.edge, conn.inst_rect, *raw))
+                                })
+                                .cloned()
+                                .collect();
+                            &edge_obstructions
+                        } else {
+                            &obstructions
+                        };
                         let try_pieces = cut_shapes(
                             &db,
                             &try_made
                                 .iter()
                                 .map(|(n, l, r, _)| (n.clone(), l.clone(), *r))
                                 .collect::<Vec<_>>(),
-                            &obstructions,
+                            cut_against,
                         );
                         // The over-pads half of `cutShapes`: a piece must TOUCH the pad and LEAVE
                         // it. Applied per candidate, because it is half of what decides whether
@@ -4879,6 +4961,7 @@ fn generate(args: &[String]) -> ExitCode {
                             die,
                             strap: strap_boundary,
                             ring: ring_area,
+                            pad_ring: pad_ring_area(&db, die),
                             mirror: grid_mirror,
                         },
                         per_micron,
@@ -5567,6 +5650,84 @@ fn generate(args: &[String]) -> ExitCode {
                 (placed, dropped)
             };
 
+            // ── connectUnreachedPins ────────────────────────────────────────────────────────────
+            // 🔑 **A macro pin no via reached is grown sideways to the grid beside it** (upstream
+            // 4155ac31, `InstanceGrid::connectUnreachedPins`), after the vias and before channel
+            // repair, so whatever the top-down flow already connected is left exactly as it was.
+            // If anything was grown the vias are made once more (no repair), and a grown strap no
+            // via landed on is withdrawn: its landing on the pin would otherwise hold it through
+            // trimming while it connects nothing.
+            let (placed, dropped) = if grid.instance.is_empty() {
+                (placed, dropped)
+            } else {
+                let obs: Vec<(String, Rect, Option<String>, Rect)> = blockages
+                    .iter()
+                    .cloned()
+                    .chain(made_obstructions(&db, &emitted))
+                    .collect();
+                let grown = macro_edge_connections(
+                    &db, &grid.instance, &build_nets, &placed, &emitted, grid_shapes_from, &connects, die, &obs,
+                );
+                if grown.is_empty() {
+                    (placed, dropped)
+                } else {
+                    let first = emitted.len();
+                    for g in &grown {
+                        emitted.push((g.net.clone(), g.layer.clone(), g.rect, "STRIPE"));
+                        emitted_tag.push((grid_index, EDGE_COMPONENT + g.component));
+                    }
+                    trace("MacroEdge", &format!("{} grown on {}", grown.len(), grid.instance));
+                    let via_area = {
+                        let mut a = boundary;
+                        for (_, _, r, _) in &emitted[grid_shapes_from..] {
+                            a = (a.0.min(r.0), a.1.min(r.1), a.2.max(r.2), a.3.max(r.3));
+                        }
+                        a
+                    };
+                    let via_shapes: Vec<vyges_pdn::vias::Shape> = emitted
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, (_, _, r, _))| {
+                            *i >= grid_shapes_from
+                                || (r.0 <= via_area.2 && via_area.0 <= r.2 && r.1 <= via_area.3 && via_area.1 <= r.3)
+                        })
+                        .map(|(_, (net, layer, rect, _))| vyges_pdn::vias::Shape {
+                            layer: layer.clone(),
+                            net: net.clone(),
+                            rect: *rect,
+                        })
+                        .chain(grid_pins.iter().cloned())
+                        .chain(fixed_via_shapes.iter().filter(|s| overlaps(s.rect, via_area)).cloned())
+                        .collect();
+                    let via_obstructions: Vec<(String, Rect)> = blockages
+                        .iter()
+                        .map(|(l, r, ..)| (l.clone(), *r))
+                        .chain(emitted.iter().map(|(_, l, r, _)| (l.clone(), obstruction_of(&db, l, *r))))
+                        .collect();
+                    let (placed, dropped) = vyges_pdn::vias::place(&connects, &via_shapes, &via_obstructions);
+                    // Withdraw what no via landed on, and hold what stays by its landing.
+                    let made: Vec<(String, String, Rect, &'static str)> = emitted.split_off(first);
+                    emitted_tag.truncate(first);
+                    for (g, shape) in grown.into_iter().zip(made) {
+                        let has_via = placed.iter().any(|v| {
+                            v.net == g.net
+                                && (v.lower == g.layer || v.upper == g.layer)
+                                && overlaps(v.area, g.rect)
+                        });
+                        if !has_via {
+                            trace("MacroEdge", &format!("withdrawing {} on {}", g.net, g.layer));
+                            continue;
+                        }
+                        emitted.push(shape);
+                        emitted_tag.push((grid_index, EDGE_COMPONENT + g.component));
+                        if let Some(h) = g.hold {
+                            iterm_holds.push((g.net, g.layer, h));
+                        }
+                    }
+                    (placed, dropped)
+                }
+            };
+
             stage_time("repairGridChannels");
             // ── stage 6f: repairGridChannels ────────────────────────────────────────────────────
             // 🔑 **A shape with nothing above it is a hole in the grid.** After the vias are made, the
@@ -6101,7 +6262,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // connection total above — but it is not a via, and passing it here makes an
                 // offcut look like something other than a bare via stack.
                 &vias_only,
-                db.layer_min_area(&layer).unwrap_or(0),
+                min_area(&db, &layer),
                 dir,
                 grid_mfg,
                 is_pin_layer,
@@ -6830,6 +6991,7 @@ fn generate(args: &[String]) -> ExitCode {
             loop {
             let mut merged_widths: Vec<Option<i32>> = vec![None; stack.len()];
             let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
+            let mut stack_failed = false;
             for (level, pair) in stack.windows(2).enumerate() {
                 let (lo, hi) = (pair[0].as_str(), pair[1].as_str());
                 // An explicit `--cut-<lower>-<upper>` overrides; otherwise the technology decides.
@@ -7207,12 +7369,21 @@ fn generate(args: &[String]) -> ExitCode {
                         );
                         // 🔑 **What `checkMinEnclosure` is asked against** — the cut layer's
                         // own rules, WITHOUT the generate rule's stated enclosure among them.
-                        let bot_rules = enclosure_candidates_with_swap(
+                        let mut bot_rules = enclosure_candidates_with_swap(
                             &db, cut_layer, cut, area, dir_of(lo), false, None, split.is_some(), shared_lo,
                         );
-                        let top_rules = enclosure_candidates_with_swap(
+                        let mut top_rules = enclosure_candidates_with_swap(
                             &db, cut_layer, cut, area, dir_of(hi), true, None, split.is_some(), shared_hi,
                         );
+                        // ⛔ **A side with NO cut-layer rule is checked against the VIARULE's own
+                        // enclosure** (upstream 4155ac31, `GenerateViaGenerator::
+                        // getMinimumEnclosures`). Before, an empty rule set passed anything, and a
+                        // forced single cut was built with a deficit the generate rule forbids.
+                        // Either orientation may meet it (the layer-rule `Enclosure` swaps).
+                        if let Some(r) = &rule {
+                            vyges_pdn::viagen::default_enclosure_if_unruled(&mut bot_rules, r.bottom_enclosure);
+                            vyges_pdn::viagen::default_enclosure_if_unruled(&mut top_rules, r.top_enclosure);
+                        }
 
                         // 🔑 **`PDN_VIA_TRACE=1` prints what the reference's `Via` and
                         // `ViaEnclosure` debug groups print**, in the same terms: the area, the
@@ -7476,8 +7647,8 @@ fn generate(args: &[String]) -> ExitCode {
                         // takes the overlap.
                         let overlap = match &array {
                             Some(f) => vyges_pdn::viagen::Enclosure {
-                                x: f.double_enclosure.0 / 2,
-                                y: f.double_enclosure.1 / 2,
+                                x: vyges_pdn::viagen::half_floor(f.double_enclosure.0),
+                                y: vyges_pdn::viagen::half_floor(f.double_enclosure.1),
                             },
                             None => vyges_pdn::viagen::overlap_enclosure(extent, span),
                         };
@@ -7604,8 +7775,8 @@ fn generate(args: &[String]) -> ExitCode {
                             score: vyges_pdn::viagen::Generator {
                                 name: rule.map(|r| r.name.clone()).unwrap_or_default(),
                                 cut_area: cut.0 * cut.1 * total.0 * total.1,
-                                bottom: (span.0 + 2 * bot_enc.0, span.1 + 2 * bot_enc.1),
-                                top: (span.0 + 2 * top_enc.0, span.1 + 2 * top_enc.1),
+                                bottom: vyges_pdn::viagen::generator_extent(array.as_ref(), span, cut, bot_enc),
+                                top: vyges_pdn::viagen::generator_extent(array.as_ref(), span, cut, top_enc),
                                 bottom_direction: dir_of(lo),
                                 top_direction: dir_of(hi),
                             },
@@ -8009,8 +8180,13 @@ fn generate(args: &[String]) -> ExitCode {
                 if hit.is_none() && !measuring {
                     built_levels[level] = built.clone();
                 }
+                // ⛔ **A refused level fails the WHOLE stack** (`Connect::makeVia`: on the first
+                // level with no via the stack is cleared and one dummy via stands for it). Skipping
+                // only the refused level kept the levels below it, and a metal4 -> metal7 crossing
+                // the reference reports as failed was written with its metal4 and metal5 vias.
                 let Some(built) = built else {
-                    continue; // refused level: nothing placed (the reference's dummy via)
+                    stack_failed = true;
+                    break;
                 };
                 let (rule, cut, pitch, area, rows, columns, array, bot_enc, top_enc) = match built {
                     BuiltLevel::Tech {
@@ -8162,7 +8338,7 @@ fn generate(args: &[String]) -> ExitCode {
                                     &[prev_tops[k]],
                                     &[metal_at(*spot, bot)],
                                     prev_array || needs_patch,
-                                    db.layer_min_area(lo).unwrap_or(0),
+                                    min_area(&db, lo),
                                     dir_of(lo),
                                     grid_mfg,
                                 ) {
@@ -8357,7 +8533,7 @@ fn generate(args: &[String]) -> ExitCode {
                                 &prev_tops,
                                 &bots,
                                 prev_array || needs_patch,
-                                db.layer_min_area(lo).unwrap_or(0),
+                                min_area(&db, lo),
                                 dir_of(lo),
                                 grid_mfg,
                             ) {
@@ -8377,6 +8553,16 @@ fn generate(args: &[String]) -> ExitCode {
                 previous_top = Some((hi.to_string(), tops, needs_patch));
             }
 
+            if stack_failed {
+                placements.truncate(restore.0);
+                via_faces.truncate(restore.1);
+                drcfill.truncate(restore.2);
+                via_ok.truncate(restore.3);
+                written = restore.4;
+                // Cached as a stack with no level, so a second crossing of the same size fails alike.
+                built_levels.iter_mut().for_each(|b| *b = None);
+                break;
+            }
             // That was the real pass — its `dbVia`s are in the database and its shapes are kept.
             if !measuring {
                 break;
@@ -9192,6 +9378,9 @@ fn region_domain_nets(spec: &str) -> Option<nets::Domain> {
 /// A repair-channel strap's component index: after every component the grid was planned with —
 /// `RepairChannelStraps` is added to the grid (`addStrap`) once the planned ones are built.
 const REPAIR_COMPONENT: usize = 1 << 20;
+/// The first component index of a macro's edge straps: after every strap the grid declared and
+/// before the channel repairs, which `repairGridChannels` adds after `connectUnreachedPins`.
+const EDGE_COMPONENT: usize = 1 << 19;
 
 /// A via's or patch's creation sequence, with the grid that built it in the high bits.
 fn via_seq(grid: usize, n: u64) -> u64 {
@@ -9438,7 +9627,248 @@ fn global_connect(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-pub fn main() -> ExitCode {
+/// One way out of a macro pin grown by [`macro_edge_connections`].
+struct EdgeStrap {
+    net: String,
+    layer: String,
+    rect: Rect,
+    /// The landing on the pin — what trimming may not take back.
+    hold: Option<Rect>,
+    /// Which connected pin this came from, in the order they were connected.
+    ///
+    /// 🔑 **Each pin's strap is a grid component of its OWN** (`grid->addStrap` per pin), and
+    /// components are written in the order they were added. Writing every edge strap as one
+    /// component sorted them by layer and position and swapped pins of the same layer.
+    component: usize,
+}
+
+/// Which way a pin leaves its macro: `(0, 1)` north, `(0, -1)` south, `(1, 0)` east, `(-1, 0)` west.
+type Way = (i32, i32);
+
+/// `MacroEdgeConnectionStraps::connectUnreachedPins` (upstream 4155ac31): grow each supply pin of a
+/// hard macro that no via reached, along its own layer and out of the macro, to the nearest shape it
+/// has a connect rule to. Returns the straps that survived their cuts, in the order they were made;
+/// the caller rebuilds the vias and withdraws any strap no via landed on.
+///
+/// The rules, each as the reference states them:
+///
+/// - only a `BLOCK` master, and only pins of the grid's nets on a layer some connect leaves from;
+/// - a pin a via of its net already lands on, or a same-net shape of the grid (or of an earlier
+///   grid) already overlaps, is connected and left alone;
+/// - a pin grows along its LENGTH — a square one along its layer's direction, and not at all on a
+///   layer that states none;
+/// - of its two ends, the one with LESS macro beyond it (the real outline, not the bounding box)
+///   is the way out; both when they tie;
+/// - the target is the nearest same-net shape off that end, crossing the pin and covering its whole
+///   width, on any layer the pin connects to — a shape already touching the pin is not one, nor is
+///   another pin's way out;
+/// - the strap lands one strap-width (the pin's shorter side) on the pin's end and runs to the far
+///   side of the target, capped at the layer's maximum width; it is cut against the grid's
+///   obstructions and then the macro's own metal, and only a piece joining pin and target is kept;
+/// - the nearer candidate is tried first, and the next only if the first left nothing.
+#[allow(clippy::too_many_arguments)]
+fn macro_edge_connections(
+    db: &Db,
+    inst: &str,
+    grid_nets: &[String],
+    placed: &[vyges_pdn::vias::Via],
+    emitted: &[(String, String, Rect, &'static str)],
+    // Where this grid's own shapes start in `emitted`; those before are earlier grids'.
+    own_from: usize,
+    connects: &[vyges_pdn::vias::Connect],
+    die: Rect,
+    obstructions: &[(String, Rect, Option<String>, Rect)],
+) -> Vec<EdgeStrap> {
+    let mut out: Vec<EdgeStrap> = Vec::new();
+    if !db.master_is_block(&db.inst_get_master(inst)) {
+        return out; // a pad has its own connections, and a cover cell is reached from above
+    }
+    let overlaps_open = |a: Rect, b: Rect| a.0 < b.2 && b.0 < a.2 && a.1 < b.3 && b.1 < a.3;
+    let touches = |a: Rect, b: Rect| a.0 <= b.2 && b.0 <= a.2 && a.1 <= b.3 && b.1 <= a.3;
+    let macro_obs: Vec<(String, Rect, Option<String>, Rect)> = dbio::pad_style_obstructions(db, inst)
+        .into_iter()
+        .map(|(_, l, r, n, raw)| (l, r, n, raw))
+        .collect();
+    let outline = instance_outline(db, inst);
+    let mut obstructions: Vec<(String, Rect, Option<String>, Rect)> = obstructions.to_vec();
+    let mut connected = 0;
+    for (layer, net, pin) in instance_pin_shapes(db, inst) {
+        if !grid_nets.contains(&net) {
+            continue;
+        }
+        // The layers a connect joins this one to, lowest first.
+        let mut connectable: Vec<String> = Vec::new();
+        for c in connects {
+            let other = if c.lower == layer { &c.upper } else if c.upper == layer { &c.lower } else { continue };
+            if !connectable.contains(other) {
+                connectable.push(other.clone());
+            }
+        }
+        connectable.sort_by_key(|l| routing_level(db, l));
+        if connectable.is_empty() {
+            continue;
+        }
+        let by_via = placed.iter().any(|v| {
+            v.net == net && (v.lower == layer || v.upper == layer) && overlaps_open(v.area, pin)
+        });
+        // ⚠️ Not the straps this pass has grown: another pin's way out is not a connection.
+        let by_shape = emitted
+            .iter()
+            .any(|(n, l, r, kind)| *kind != "SWITCH" && *n == net && *l == layer && overlaps_open(*r, pin));
+        if by_via || by_shape {
+            continue;
+        }
+        let (w, h) = (pin.2 - pin.0, pin.3 - pin.1);
+        let vertical = if h != w {
+            h > w
+        } else {
+            match direction_of(db, &layer) {
+                Direction::Vertical => true,
+                // A square pin on a layer with no direction leaves sideways.
+                Direction::Horizontal | Direction::None => false,
+            }
+        };
+        let ends: [Way; 2] = if vertical { [(0, 1), (0, -1)] } else { [(1, 0), (-1, 0)] };
+        let margins = ends.map(|e| vyges_pdn::region::margin_beyond_exact(&outline, pin, e));
+        let way_out = margins[0].min(margins[1]);
+        let mut candidates: Vec<(Way, i32, Rect, String)> = Vec::new();
+        for (k, end) in ends.iter().enumerate() {
+            if margins[k] != way_out {
+                continue;
+            }
+            let mut best: Option<(i32, Rect, String)> = None;
+            for target_layer in &connectable {
+                // The grid's own shapes, then those of the grids before it; the first found
+                // wins a tie.
+                for (n, l, r, kind) in emitted[own_from..].iter().chain(emitted[..own_from].iter()) {
+                    if *kind == "SWITCH" || n != &net || l != target_layer {
+                        continue;
+                    }
+                    let Some(d) = lateral_distance(pin, *end, die, *r, touches) else { continue };
+                    if best.as_ref().is_none_or(|(bd, ..)| d < *bd) {
+                        best = Some((d, *r, l.clone()));
+                    }
+                }
+            }
+            if let Some((d, r, l)) = best {
+                candidates.push((*end, d, r, l));
+            }
+        }
+        candidates.sort_by_key(|c| c.1);
+        for (end, _, target, _) in candidates {
+            let landing = w.min(h);
+            let mut rect = pin;
+            match end {
+                (0, 1) => { rect.1 = pin.3 - landing; rect.3 = target.3; }
+                (0, -1) => { rect.3 = pin.1 + landing; rect.1 = target.1; }
+                (1, 0) => { rect.0 = pin.2 - landing; rect.2 = target.2; }
+                _ => { rect.2 = pin.0 + landing; rect.0 = target.0; }
+            }
+            let max_w = db.layer_get_max_width(&layer);
+            if max_w < i32::MAX as u32 {
+                let max_w = max_w as i32;
+                if end.1 == 0 && rect.3 - rect.1 > max_w {
+                    rect.3 = rect.1 + max_w;
+                } else if end.0 == 0 && rect.2 - rect.0 > max_w {
+                    rect.2 = rect.0 + max_w;
+                }
+            }
+            // `Shape::isValid`: a shape smaller than the layer's AREA is never added.
+            let min_area = db.layer_get_area(&layer).unwrap_or(0);
+            if ((rect.2 - rect.0) as i64) * ((rect.3 - rect.1) as i64) < min_area {
+                continue;
+            }
+            let pieces = cut_shapes(db, &[(net.clone(), layer.clone(), rect)], &obstructions);
+            let pieces = cut_shapes(db, &pieces, &macro_obs);
+            let kept: Vec<(String, String, Rect)> = pieces
+                .into_iter()
+                .filter(|(_, _, r)| overlaps_open(*r, pin) && overlaps_open(*r, target))
+                .collect();
+            if kept.is_empty() {
+                continue; // nothing survived; the other end, if it is a way out too
+            }
+            for (n, l, r) in kept {
+                // Later pins are cut against what this one made (`GridComponent::make`).
+                obstructions.extend(made_obstructions(db, &[(n.clone(), l.clone(), r, "STRIPE")]));
+                out.push(EdgeStrap { net: n, layer: l, rect: r, hold: intersect_rect(pin, r), component: connected });
+            }
+            connected += 1;
+            break;
+        }
+    }
+    out
+}
+
+/// `findLateralTarget`'s test of one shape: its distance off the `end` face of `pin`, if it lies in
+/// the band from that face to the die edge, crosses the band and covers its whole width. `None`
+/// for a shape that touches the pin already (distance 0) or lies behind it.
+fn lateral_distance(pin: Rect, end: Way, die: Rect, r: Rect, touches: impl Fn(Rect, Rect) -> bool) -> Option<i32> {
+    let mut band = pin;
+    match end {
+        (0, 1) => band.3 = die.3,
+        (0, -1) => band.1 = die.1,
+        (1, 0) => band.2 = die.2,
+        _ => band.0 = die.0,
+    }
+    if !touches(r, band) {
+        return None;
+    }
+    let overlap = (r.0.max(band.0), r.1.max(band.1), r.2.min(band.2), r.3.min(band.3));
+    if end.0 == 0 {
+        if (r.2 - r.0) < (r.3 - r.1) || overlap.2 - overlap.0 != band.2 - band.0 {
+            return None;
+        }
+    } else if (r.3 - r.1) < (r.2 - r.0) || overlap.3 - overlap.1 != band.3 - band.1 {
+        return None;
+    }
+    let d = match end {
+        (0, 1) => r.1 - pin.3,
+        (0, -1) => pin.1 - r.3,
+        (1, 0) => r.0 - pin.2,
+        _ => pin.0 - r.2,
+    };
+    (d > 0).then_some(d)
+}
+
+/// `Straps::setExtend` (upstream 4155ac31): `-extend_to_pad_ring` with no placed pad to reach is
+/// PDN-0242, raised as the strap is declared — before any of its own dimensions are checked.
+fn pad_ring_refusal(db: &Db, layer: &str, pad_ring: bool) -> Option<validate::Diag> {
+    if !pad_ring {
+        return None;
+    }
+    let (core, die) = (area(db, true), area(db, false));
+    if dbio::pad_ring_inner_area(db, core, die).is_some() {
+        return None;
+    }
+    Some(validate::Diag {
+        code: 242,
+        message: format!("Unable to find any placed pads to extend straps on {layer} to."),
+    })
+}
+
+/// `Grid::getPadRingArea`: the grid boundary intersected with the pads' inner edge
+/// (`VoltageDomain::getPadRingInnerArea`), or the boundary when no pad is placed.
+fn pad_ring_area(db: &Db, boundary: Rect) -> Rect {
+    let core = area(db, true);
+    let die = area(db, false);
+    match dbio::pad_ring_inner_area(db, core, die) {
+        Some(i) => (boundary.0.max(i.0), boundary.1.max(i.1), boundary.2.min(i.2), boundary.3.min(i.3)),
+        None => boundary,
+    }
+}
+
+/// The minimum area a trimmed shape on `layer` must keep (`TechLayer::adjustToMinArea`).
+///
+/// 🔑 The LEF58 AREA rules ADD TO the layer's own AREA; they do not replace it: the larger of the
+/// two governs. Until upstream 4155ac31 the rules replaced it, and a layer whose AREA exceeded its
+/// rules was trimmed short.
+fn min_area(db: &vyges_opendb::Db, layer: &str) -> i64 {
+    let rules = db.layer_min_area(layer).unwrap_or(0);
+    let own = db.layer_get_area(layer).unwrap_or(0);
+    rules.max(own)
+}
+
+fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
     // stdout carries nothing but the report a caller parses.

@@ -39,6 +39,117 @@ pub struct Spec {
     pub allow_out_of_core: bool,
 }
 
+/// Where a strap set's `-offset` is measured to (`add_pdn_stripe -offset_type`, upstream 4155ac31).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OffsetType {
+    /// To the low EDGE of the first strap.
+    Start,
+    /// To the CENTRE of the first strap — the historical meaning, and the default.
+    #[default]
+    First,
+    /// To the centre of the whole group.
+    Center,
+    /// To the centre of the last strap.
+    Last,
+    /// To the high edge of the last strap.
+    End,
+}
+
+impl OffsetType {
+    /// The Tcl spelling, case-insensitive; `None` for anything else (PDN-1198).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "START" => Some(Self::Start),
+            "FIRST" => Some(Self::First),
+            "CENTER" => Some(Self::Center),
+            "LAST" => Some(Self::Last),
+            "END" => Some(Self::End),
+            _ => None,
+        }
+    }
+}
+
+/// `Straps::setOffset` — the offset the strap set is BUILT with, from the one stated and its type.
+///
+/// 🔑 Internally an offset always places the CENTRE of the first strap, so every other type is
+/// translated to that: START adds half a width, CENTER moves back by half the group less half a
+/// width, LAST by the group less one width, END by the group less half a width. The halves are
+/// integer halves, truncated, as the reference computes them.
+pub fn offset_for_type(offset: i32, ty: OffsetType, width: i32, group_width: i32) -> i32 {
+    let half = width / 2;
+    match ty {
+        OffsetType::Start => offset + half,
+        OffsetType::First => offset,
+        OffsetType::Center => offset + half - group_width / 2,
+        OffsetType::Last => offset + width - group_width,
+        OffsetType::End => offset + half - group_width,
+    }
+}
+
+/// `-extend_by`, on a strap set's BOUNDARY (`Straps::makeShapes`, upstream 4155ac31).
+///
+/// 🔑 The set runs on past the target its mode names, ALONG ITS OWN LENGTH only, by `dist` — but
+/// never past the grid boundary, and never short of where it would have stopped: the boundary is
+/// grown, clipped to the grid boundary, and merged back with itself.
+pub fn grow_bound(bound: Rect, grid_boundary: Rect, dist: i32, horizontal: bool) -> Rect {
+    if dist <= 0 {
+        return bound;
+    }
+    let grown = if horizontal {
+        (bound.0 - dist, bound.1, bound.2 + dist, bound.3)
+    } else {
+        (bound.0, bound.1 - dist, bound.2, bound.3 + dist)
+    };
+    let clipped = (
+        grown.0.max(grid_boundary.0),
+        grown.1.max(grid_boundary.1),
+        grown.2.min(grid_boundary.2),
+        grown.3.min(grid_boundary.3),
+    );
+    (
+        clipped.0.min(bound.0),
+        clipped.1.min(bound.1),
+        clipped.2.max(bound.2),
+        clipped.3.max(bound.3),
+    )
+}
+
+/// `-extend_by`, on the EXTENT a strap is clipped to: the extent grown the same way along the
+/// strap's length, intersected with the grid boundary region, united with the extent itself.
+///
+/// The result may hold overlapping rectangles; [`clip_to_extent`] merges touching runs, so a union
+/// need not be made disjoint first.
+pub fn grow_extent(extent: &[Rect], grid_region: &[Rect], dist: i32, horizontal: bool) -> Vec<Rect> {
+    if dist <= 0 {
+        return extent.to_vec();
+    }
+    let m = if horizontal { [dist, 0, dist, 0] } else { [0, dist, 0, dist] };
+    let mut out: Vec<Rect> = Vec::new();
+    for g in crate::region::bloat(extent, m) {
+        for r in grid_region {
+            let c = (g.0.max(r.0), g.1.max(r.1), g.2.min(r.2), g.3.min(r.3));
+            if c.0 < c.2 && c.1 < c.3 {
+                out.push(c);
+            }
+        }
+    }
+    out.extend_from_slice(extent);
+    out
+}
+
+/// `FollowPins::makeShapes`' reach with `-extend_by`: run on past `target` by `dist`, but not
+/// past the `boundary` edge — unless the target already was past it, in which case it stays put.
+pub fn extend_reach(target: i32, boundary: i32, dist: i32, high: bool) -> i32 {
+    if dist <= 0 {
+        return target;
+    }
+    if high {
+        target.max((target + dist).min(boundary))
+    } else {
+        target.min((target - dist).max(boundary))
+    }
+}
+
 /// One stripe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stripe {
@@ -354,6 +465,36 @@ fn intersects(a: Rect, b: Rect) -> bool {
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`Straps::makeShapes` / `FollowPins::makeShapes`, 4155ac31): `-extend_by`
+    /// grows only along the strap's length, stops at the grid boundary, and never pulls a target
+    /// back that was already beyond it.
+    #[test]
+    fn extend_by_runs_on_along_the_length_up_to_the_boundary() {
+        let die = (0, 0, 1000, 1000);
+        assert_eq!(grow_bound((100, 100, 900, 900), die, 50, true), (50, 100, 950, 900));
+        assert_eq!(grow_bound((100, 100, 900, 900), die, 500, false), (100, 0, 900, 1000));
+        assert_eq!(grow_extent(&[(100, 100, 900, 900)], &[die], 50, false).len(), 2);
+        assert_eq!(extend_reach(900, 1000, 50, true), 950);
+        assert_eq!(extend_reach(900, 1000, 500, true), 1000);
+        assert_eq!(extend_reach(1100, 1000, 50, true), 1100, "already past: unchanged");
+        assert_eq!(extend_reach(100, 0, 50, false), 50);
+    }
+
+    /// Upstream rule (`Straps::setOffset`, 4155ac31): with 1.0 straps 2.0 apart for two nets (a
+    /// 4.0 group) at offset 10.0, the first strap's centre lands at 10.5 for START, 10 for FIRST,
+    /// 8.5 for CENTER, 7 for LAST and 6.5 for END.
+    #[test]
+    fn offset_types_translate_to_the_first_centre() {
+        let (w, g) = (1000, 4000);
+        assert_eq!(offset_for_type(10000, OffsetType::Start, w, g), 10500);
+        assert_eq!(offset_for_type(10000, OffsetType::First, w, g), 10000);
+        assert_eq!(offset_for_type(10000, OffsetType::Center, w, g), 8500);
+        assert_eq!(offset_for_type(10000, OffsetType::Last, w, g), 7000);
+        assert_eq!(offset_for_type(10000, OffsetType::End, w, g), 6500);
+        assert_eq!(OffsetType::parse("center"), Some(OffsetType::Center));
+        assert_eq!(OffsetType::parse("MIDDLE"), None);
+    }
 
     #[test]
     fn a_pitch_of_zero_builds_nothing_rather_than_looping_for_ever() {

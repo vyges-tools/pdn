@@ -644,7 +644,24 @@ fn may_run_over(
 /// ⚠️ **A design with no pads at all answers the core**, and the reference treats that as a
 /// failure rather than a zero offset: `PDN-0105`, and the die is used instead.
 pub(crate) fn pad_ring_inner(db: &Db, core: Rect, die: Rect) -> Rect {
-    let mut inner = die;
+    let inner = pad_ring_inner_area(db, core, die).unwrap_or(die);
+    if inner == core {
+        eprintln!(
+            "vyges-pdn: unable to determine the location of the pad offset, \
+             using the die boundary instead"
+        );
+        return die;
+    }
+    inner
+}
+
+/// `VoltageDomain::populatePadRingInnerArea` (upstream 4155ac31): the die pulled in to the inner
+/// edge of the placed pads on each side that has them — or `None` when no pad set any side.
+///
+/// ⚠️ **`None` is not the die.** A design with no placed pads answers nothing, and
+/// `-extend_to_pad_ring` refuses it (PDN-0242) where `-pad_offsets` falls back to the die.
+pub(crate) fn pad_ring_inner_area(db: &Db, core: Rect, die: Rect) -> Option<Rect> {
+    let mut pads = Vec::new();
     for inst in db.block_get_insts() {
         if !db.inst_is_placed(&inst) {
             continue;
@@ -662,30 +679,11 @@ pub(crate) fn pad_ring_inner(db: &Db, core: Rect, die: Rect) -> Rect {
             continue;
         }
         let b = db.inst_bbox(&inst).unwrap_or_default();
-        if b.len() != 4 {
-            continue;
-        }
-        let (x0, y0, x1, y1) = (b[0], b[1], b[2], b[3]);
-        let within_x = x0 >= core.0 && x1 <= core.2;
-        let within_y = y0 >= core.1 && y1 <= core.3;
-        if y0 > core.3 && within_x {
-            inner.3 = inner.3.min(y0);
-        } else if y1 < core.1 && within_x {
-            inner.1 = inner.1.max(y1);
-        } else if x1 < core.0 && within_y {
-            inner.0 = inner.0.max(x1);
-        } else if x0 > core.2 && within_y {
-            inner.2 = inner.2.min(x0);
+        if b.len() == 4 {
+            pads.push((b[0], b[1], b[2], b[3]));
         }
     }
-    if inner == core {
-        eprintln!(
-            "vyges-pdn: unable to determine the location of the pad offset, \
-             using the die boundary instead"
-        );
-        return die;
-    }
-    inner
+    vyges_pdn::pads::ring_inner_area(&pads, core, die)
 }
 
 
@@ -1379,9 +1377,25 @@ pub(crate) fn is_padframe(db: &Db, master: &str) -> bool {
             ))
 }
 
+/// `InstanceGrid::getPadObstructions` for ONE instance, whatever its class: its OBS split by its own
+/// pin metal, the pinned part attributed to the pin's net, and its pins — all pad metal (`kPadObs`).
+/// The macro edge pass cuts a pin's way out against its own macro's metal this way (upstream
+/// 4155ac31), so a pin does not block itself.
+pub(crate) fn pad_style_obstructions(db: &Db, inst: &str) -> Vec<(String, String, Rect, Option<String>, Rect)> {
+    obstructions_of(db, &[], Some(inst))
+}
+
 pub(crate) fn instance_obstructions(
     db: &Db,
     halos: &[(String, [i32; 4])],
+) -> Vec<(String, String, Rect, Option<String>, Rect)> {
+    obstructions_of(db, halos, None)
+}
+
+fn obstructions_of(
+    db: &Db,
+    halos: &[(String, [i32; 4])],
+    only: Option<&str>,
     // `(instance, layer, bloated rect, net, RAW rect)`.
     //
     // ⚠️ **The raw rect is carried for INSPECTION, not yet used.** `Shape::cut` measures its extent
@@ -1392,14 +1406,17 @@ pub(crate) fn instance_obstructions(
 ) -> Vec<(String, String, Rect, Option<String>, Rect)> {
     let mut out = Vec::new();
     for inst in db.block_get_insts() {
+        if only.is_some_and(|o| o != inst) {
+            continue;
+        }
         let master = db.inst_get_master(&inst);
-        if db.master_is_core(&master) {
+        if only.is_none() && db.master_is_core(&master) {
             continue;
         }
         // 🔑 **A PADFRAME cell — a pad, or a pad-corner endcap — obstructs as soon as it is
         // PLACED; anything else only when FIXED** (upstream a49dde4, `makeInitialObstructions`).
         // A padring is routinely handed over PLACED and the core grid connects to it anyway.
-        let padframe = is_padframe(db, &master);
+        let padframe = only.is_some() || is_padframe(db, &master);
         let positioned = if padframe { db.inst_is_placed(&inst) } else { db.inst_is_fixed(&inst) };
         if !positioned {
             continue;
@@ -1489,6 +1506,11 @@ pub(crate) fn instance_obstructions(
                     px1 + s.max(halo[2]),
                     py1 + s.max(halo[3]),
                 );
+                // 🔑 **Every piece of a padframe cell is PAD metal (`kPadObs`)**, the unpinned
+                // ones too — they are marked with an EMPTY pad net, which belongs to no strap and
+                // so blocks every net exactly as a netless obstruction does. The marker is what
+                // lets an edge connection leave the pads' own metal out (upstream 4155ac31).
+                let net = if padframe { Some(net.unwrap_or_else(|| PAD_OBS.to_string())) } else { net };
                 out.push((
                     inst.clone(),
                     name.clone(),
@@ -1567,9 +1589,12 @@ pub(crate) fn instance_obstructions(
                     // ⚠️ An unconnected terminal answers with an empty name, which must not be
                     // read as a net — every such pin would then share one and exempt each other.
                     // A padframe cell's pin is PAD metal (`kPadObs`) — see [`PAD_OBS`].
-                    Some(db.iterm_get_net(&inst, &term))
-                        .filter(|n| !n.is_empty())
-                        .map(|n| if padframe { format!("{PAD_OBS}{n}") } else { n }),
+                    // An unconnected padframe pin is still pad metal, of no net.
+                    match Some(db.iterm_get_net(&inst, &term)).filter(|n| !n.is_empty()) {
+                        Some(n) if padframe => Some(format!("{PAD_OBS}{n}")),
+                        None if padframe => Some(PAD_OBS.to_string()),
+                        other => other,
+                    },
                     vyges_pdn::orient::transform_rect(raw, &orient, offset),
                 ));
             }
