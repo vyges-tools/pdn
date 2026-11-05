@@ -54,6 +54,10 @@ jobs:
         run: cargo build --release --verbose
       - name: Test
         run: cargo test --release --verbose
+      # The suite binaries link this crate with `--features suite` and call `cli_main::main`;
+      # a `main` that loses its `pub` breaks only them unless this feature is built here too.
+      - name: Suite entry
+        run: cargo build --release --lib --features suite --verbose
 
       # 🔑 The descriptor is the contract this engine publishes, and it is assembled by hand
       # rather than serialised — a stray comma makes it unparseable to the consumer it exists for.

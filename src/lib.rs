@@ -204,3 +204,9 @@ mod global_connect_tests {
 #[doc(hidden)]
 #[path = "main.rs"]
 pub mod cli_main;
+
+// The suite's `engine!` macro calls `cli_main::main` from outside this crate, so it must stay
+// `pub`. Naming it here makes a private `main` fail THIS crate's `--features suite` build
+// (E0603), not only the suite's release build that links every engine.
+#[cfg(feature = "suite")]
+const _: fn() -> std::process::ExitCode = cli_main::main;
