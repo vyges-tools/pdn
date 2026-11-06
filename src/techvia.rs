@@ -299,7 +299,8 @@ pub struct SpacingTableRule {
     pub same_net: bool,
     pub centre_and_edge: bool,
     pub centre_to_centre: bool,
-    /// `getMaxSpacing(class, class, MIN)` — used when the cut is square.
+    /// `getMaxSpacing(class, class, MAX)` — used when the cut is square: the larger of the pair
+    /// (upstream b68d654714, in the pin; `MIN` at 27288f5). The lookup is opendb-lib's.
     pub max_spacing: i32,
     /// `getSpacing(class, side, class, side)` for the two axes, already crossed: `.0` is what the
     /// **x** pitch asks for and `.1` what the **y** pitch asks for.
@@ -315,7 +316,7 @@ pub struct SpacingTableRule {
 /// `ViaGenerator::determineCutSpacing`, second branch, in order:
 ///
 /// - a rule naming a **second layer** is skipped;
-/// - a **square** cut takes `getMaxSpacing(class, class, MIN)` on both axes; a non-square one
+/// - a **square** cut takes `getMaxSpacing(class, class, MAX)` on both axes; a non-square one
 ///   takes `getSpacing` per axis — ⚠️ **with the side flags CROSSED**, because a cut's `dx` is its
 ///   *side* when `dx > dy`, so the x pitch is asked with the y flag;
 /// - **centre-to-centre** values have a cut subtracted; centre-and-edge and plain ones are already
