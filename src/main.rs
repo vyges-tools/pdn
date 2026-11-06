@@ -6449,10 +6449,10 @@ fn generate(args: &[String]) -> ExitCode {
         // shapes (enclosures, spare, cut counts, the shared-width rebuild); every later crossing of
         // that size reuses the definitions and only PLACES them (`DbGenerateStackedVia::generate`:
         // per-level snap, split spots, metal at the point). Not cached when either end is
-        // unmodifiable or carries terminal connections (`skip_caching`). ⚠️ `can_cache_` never
-        // stops it: a stack has no generator, so `canCache()` is true (observed: 2,409 hits on
-        // spare-enclosure stacks). Witness: `asap7_repair_channel_macro_gap`, whose 48 M5–M6 vias
-        // are one stack built for the first 120x204 crossing and ripped at write for the rest.
+        // unmodifiable or carries terminal connections (`skip_caching`), nor when any level's
+        // generator applied spare enclosure — `viagen::stack_can_cache`, the pin's rule
+        // (9ffbcd2a98). ⚠️ At 27288f5 `canCache` was not virtual and the stack always answered
+        // true (observed then: 2,409 hits on spare-enclosure stacks).
         #[derive(Clone)]
         enum BuiltLevel {
             Gen {
@@ -6988,6 +6988,8 @@ fn generate(args: &[String]) -> ExitCode {
             // A cache hit places the stored definitions once; only a build measures.
             let mut measuring = hit.is_none() && stack.len() > 2;
             let mut built_levels: Vec<Option<BuiltLevel>> = vec![None; stack.len().saturating_sub(1)];
+            // Per level of the real pass: its via applied spare enclosure (`!canCache()`).
+            let mut level_spares: Vec<bool> = vec![false; stack.len().saturating_sub(1)];
             loop {
             let mut merged_widths: Vec<Option<i32>> = vec![None; stack.len()];
             let mut previous_top: Option<(String, Vec<Rect>, bool)> = None;
@@ -7158,6 +7160,8 @@ fn generate(args: &[String]) -> ExitCode {
                 let abs = |r: Rect| (r.0 + place_at.0, r.1 + place_at.1, r.2 + place_at.0, r.3 + place_at.1);
 
                 // ════ BUILD — only on a cache miss (`Connect::makeVia`'s `if (via == nullptr)`) ════
+                // Whether the level's chosen generator applied spare (`!canCache()`).
+                let mut level_spare = false;
                 let built: Option<BuiltLevel> = if let Some(h) = &hit {
                     h.get(level).cloned().flatten()
                 } else { 'build: {
@@ -7259,6 +7263,9 @@ fn generate(args: &[String]) -> ExitCode {
                     bot_enc: (i32, i32),
                     top_enc: (i32, i32),
                     score: vyges_pdn::viagen::Generator,
+                    /// Spare enclosure was applied in this generator's `build()`: its
+                    /// `canCache()` is false.
+                    spare: bool,
                 }
                 let mut best: Option<LevelVia> = None;
                 for &lower_rect in &rect_set[level] {
@@ -7328,20 +7335,13 @@ fn generate(args: &[String]) -> ExitCode {
                         let area = vyges_pdn::vias::via_area(lower_rect, upper_rect);
                         // The metal each shape has outside that intersection — see `E30`.
                         //
-                        // ⚠️ **Upstream sets `can_cache_ = false` on a via admitted this way, and
-                        // it has NO EFFECT on the stack cache.** `Connect::makeVia` caches the
-                        // `DbGenerateStackedVia`, whose `generator_` is never set (`setGenerator`
-                        // is called on the single-level via only), so `DbVia::canCache()` is true
-                        // for every stack. OBSERVED at `da9f29f` with the reference's own
-                        // `PDN Via`/`ViaEnclosure` debug over the whole suite: 2,409 cache HITS on
-                        // a stack whose build applied spare — `asap7_M1_M2_followpin_enclosure`
-                        // builds its one stack and reuses it for all 52 later crossings
+                        // ⚠️ **Upstream sets `can_cache_ = false` on a via admitted this way**, and
+                        // at the pin (9ffbcd2a98) a stack holding such a via is not cached
+                        // (`viagen::stack_can_cache`): `spare_seen` below carries it to the stack.
+                        // At 27288f5/`da9f29f` it had NO effect — `DbGenerateStackedVia` has no
+                        // generator and `canCache` was not virtual — and the reference's own
+                        // `PDN Via` debug showed 2,409 cache HITS on such stacks
                         // (`correlation/instruments/pdn-via-cache.py`).
-                        //
-                        // 🔑 **So neither does ours.** `stack_cache` stores the built stack whatever
-                        // enclosure it took, and a later crossing of the same snapped size reuses
-                        // it — spare included. Witness: `asap7_repair_channel_macro_gap`, one
-                        // 120x204 stack with M6 spare reused 47 times and ripped at write.
                         let (spare_b, spare_t) =
                             vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
 
@@ -7431,6 +7431,10 @@ fn generate(args: &[String]) -> ExitCode {
                                 .max(1);
                                 c * r
                             };
+                        // `can_cache_`, this candidate generator's: cleared by the spare tail of
+                        // EVERY `determineRowsAndColumns` its `build()` runs — each pair tried
+                        // and the rebuild of the best — and never set back.
+                        let spare_seen = std::cell::Cell::new(false);
                         let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
                             &bottoms,
                             &tops,
@@ -7482,6 +7486,19 @@ fn generate(args: &[String]) -> ExitCode {
                                     overlap,
                                     top_c,
                                 );
+                                // The spare tail of THIS pair's `determineRowsAndColumns`, asked
+                                // before its snap — tried pairs count, not only the chosen one.
+                                if vyges_pdn::viagen::spare_fires(
+                                    at_bottom_end,
+                                    spare_b,
+                                    vyges_pdn::viagen::enclosure_satisfies(built_b, &bot_rules),
+                                ) || vyges_pdn::viagen::spare_fires(
+                                    at_top_end,
+                                    spare_t,
+                                    vyges_pdn::viagen::enclosure_satisfies(built_t, &top_rules),
+                                ) {
+                                    spare_seen.set(true);
+                                }
                                 // Snapped before the rule check: `checkConstraints` runs
                                 // after `determineRowsAndColumns` has already snapped.
                                 let built_b =
@@ -7712,19 +7729,20 @@ fn generate(args: &[String]) -> ExitCode {
                         // ⚠️ **Before the snap and after the split-cut override**, which is where
                         // the reference puts it — the block sits outside `if (isSplitCutArray())`
                         // and above the two `->snap(getTech())` calls.
-                        // ℹ️ Upstream also clears `can_cache_` here, and it is dead for the stack
-                        // cache — see the spare note above (observed, 2,409 hits on such stacks).
-                        // `stack_cache` therefore caches this via like any other.
+                        // ℹ️ Upstream also clears `can_cache_` here (`spare_seen`), so the stack is
+                        // not cached — see the spare note above.
                         let spare_for = |built: vyges_pdn::viagen::Enclosure,
                                          at_end: bool,
                                          minimum: vyges_pdn::viagen::Enclosure,
                                          spare: vyges_pdn::viagen::Enclosure,
                                          rules: &[(vyges_pdn::viagen::Enclosure, bool)],
                                          c: vyges_pdn::viagen::Constraint| {
-                            if at_end
-                                && (spare.x > 0 || spare.y > 0)
-                                && !vyges_pdn::viagen::enclosure_satisfies(built, rules)
-                            {
+                            if vyges_pdn::viagen::spare_fires(
+                                at_end,
+                                spare,
+                                vyges_pdn::viagen::enclosure_satisfies(built, rules),
+                            ) {
+                                spare_seen.set(true);
                                 vyges_pdn::viagen::built_enclosure(
                                     false,
                                     minimum,
@@ -7763,6 +7781,7 @@ fn generate(args: &[String]) -> ExitCode {
                             None => (columns, rows),
                         };
                         let candidate = LevelVia {
+                            spare: spare_seen.get(),
                             rule,
                             cut,
                             pitch,
@@ -7955,13 +7974,57 @@ fn generate(args: &[String]) -> ExitCode {
                             )
                             .max(1)
                     };
+                    // `can_cache_` of the technology via's generator — `TechViaGenerator` runs the
+                    // same `ViaGenerator::build`, so every pair it tries counts, as on the
+                    // generate path.
+                    let spare_seen = std::cell::Cell::new(false);
+                    let tried_spare = |b: vyges_pdn::viagen::Enclosure, t: vyges_pdn::viagen::Enclosure| {
+                        let (at_b, at_t) = (level == 0, level + 2 == stack.len());
+                        let (cols, rws) = if split.is_some() {
+                            (1, 1)
+                        } else {
+                            (
+                                vyges_pdn::viagen::cuts_across(area.2 - area.0, cut.0, b.x, t.x, pitch.0, max_columns).max(1),
+                                vyges_pdn::viagen::cuts_across(area.3 - area.1, cut.1, b.y, t.y, pitch.1, max_rows).max(1),
+                            )
+                        };
+                        let span = ((cols - 1) * pitch.0 + cut.0, (rws - 1) * pitch.1 + cut.1);
+                        let overlap = vyges_pdn::viagen::overlap_enclosure((area.2 - area.0, area.3 - area.1), span);
+                        let (spare_b, spare_t) = vyges_pdn::viagen::spare_enclosure(lower_rect, upper_rect);
+                        let rules_of = |layer: &str, above: bool, shared: Option<i32>| {
+                            enclosure_candidates_with_swap(
+                                &db, &g.cut_layer, cut, area, dir_of(layer), above, None,
+                                split.is_some(), shared,
+                            )
+                        };
+                        let c_b = if at_b { ends.0 } else { Default::default() };
+                        let c_t = if at_t { ends.1 } else { Default::default() };
+                        let built_b = vyges_pdn::viagen::built_enclosure(!at_b, b, overlap, c_b);
+                        let built_t = vyges_pdn::viagen::built_enclosure(!at_t, t, overlap, c_t);
+                        let fires_b = vyges_pdn::viagen::spare_fires(
+                            at_b,
+                            spare_b,
+                            vyges_pdn::viagen::enclosure_satisfies(built_b, &rules_of(lo, false, shared_widths[level])),
+                        );
+                        let fires_t = vyges_pdn::viagen::spare_fires(
+                            at_t,
+                            spare_t,
+                            vyges_pdn::viagen::enclosure_satisfies(built_t, &rules_of(hi, true, shared_widths[level + 1])),
+                        );
+                        fires_b || fires_t
+                    };
                     let Some(chosen) = vyges_pdn::viagen::best_enclosure_pair(
                         &bottoms,
                         &tops,
                         dir_of(lo),
                         dir_of(hi),
                         &fit,
-                        &|_, _, cuts| cuts > 0,
+                        &|b, t, cuts| {
+                            if tried_spare(b, t) {
+                                spare_seen.set(true);
+                            }
+                            cuts > 0
+                        },
                     ) else {
                         break 'build None; // nothing buildable at this level
                     };
@@ -8051,10 +8114,12 @@ fn generate(args: &[String]) -> ExitCode {
                                          spare: vyges_pdn::viagen::Enclosure,
                                          rules: &[(vyges_pdn::viagen::Enclosure, bool)],
                                          c: vyges_pdn::viagen::Constraint| {
-                            if at_end
-                                && (spare.x > 0 || spare.y > 0)
-                                && !vyges_pdn::viagen::enclosure_satisfies(built, rules)
-                            {
+                            if vyges_pdn::viagen::spare_fires(
+                                at_end,
+                                spare,
+                                vyges_pdn::viagen::enclosure_satisfies(built, rules),
+                            ) {
+                                spare_seen.set(true);
                                 vyges_pdn::viagen::built_enclosure(
                                     false,
                                     minimum,
@@ -8145,6 +8210,7 @@ fn generate(args: &[String]) -> ExitCode {
                     let spacing =
                         vyges_pdn::techvia::cut_spacing(g.single_cut, built_pitch.1, built_pitch.0);
                     let origin = vyges_pdn::techvia::centre(g.cut_extent);
+                    level_spare = spare_seen.get();
                     break 'build Some(BuiltLevel::Tech {
                         name,
                         cut_layer: g.cut_layer.clone(),
@@ -8164,6 +8230,7 @@ fn generate(args: &[String]) -> ExitCode {
                 let Some(best) = best else {
                     break 'build None; // nothing buildable at this level, on any pair
                 };
+                level_spare = best.spare;
                 Some(BuiltLevel::Gen {
                     rule: best.rule.map(|r| r.name.clone()),
                     cut: best.cut,
@@ -8179,6 +8246,7 @@ fn generate(args: &[String]) -> ExitCode {
                 // ════ PLACE — every crossing (`via->generate(block, wire, type, x, y, ongrid)`) ════
                 if hit.is_none() && !measuring {
                     built_levels[level] = built.clone();
+                    level_spares[level] = level_spare;
                 }
                 // ⛔ **A refused level fails the WHOLE stack** (`Connect::makeVia`: on the first
                 // level with no via the stack is cleared and one dummy via stands for it). Skipping
@@ -8561,6 +8629,8 @@ fn generate(args: &[String]) -> ExitCode {
                 written = restore.4;
                 // Cached as a stack with no level, so a second crossing of the same size fails alike.
                 built_levels.iter_mut().for_each(|b| *b = None);
+                // The reference's failed stack is one `DbGenerateDummyVia`: no generator, cacheable.
+                level_spares.fill(false);
                 break;
             }
             // That was the real pass — its `dbVia`s are in the database and its shapes are kept.
@@ -8592,7 +8662,7 @@ fn generate(args: &[String]) -> ExitCode {
                 measuring = false;
             }
             }
-            if hit.is_none() && !skip_caching {
+            if hit.is_none() && !skip_caching && vyges_pdn::viagen::stack_can_cache(&level_spares) {
                 stack_cache.insert(cache_key.clone(), built_levels);
             }
 

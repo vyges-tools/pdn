@@ -465,6 +465,24 @@ pub fn spare_applied(built: Enclosure, required: Enclosure, spare: Enclosure) ->
     }
 }
 
+/// Whether the spare tail of `ViaGenerator::determineRowsAndColumns` fires for one side: an END
+/// of the stack (`!use_min_enclosure`), with spare metal beside the intersection, whose built
+/// enclosure fails its rules (`!checkMinEnclosure`). Where it fires the generator sets
+/// `can_cache_ = false`, and the flag is never set back.
+#[must_use]
+pub fn spare_fires(at_end: bool, spare: Enclosure, satisfied: bool) -> bool {
+    at_end && (spare.x > 0 || spare.y > 0) && !satisfied
+}
+
+/// `DbGenerateStackedVia::canCache`, the pin's rule (upstream 9ffbcd2a98, in 4155ac31; unchanged
+/// 4155ac31..a6e7f507): a stack is cacheable only when EVERY via in it is, and a level's via is
+/// not when its generator applied spare enclosure. At 27288f5 `canCache` was not virtual, the
+/// stack (which has no generator) always answered true, and every stack was cached.
+#[must_use]
+pub fn stack_can_cache(level_applied_spare: &[bool]) -> bool {
+    !level_applied_spare.iter().any(|&s| s)
+}
+
 ///
 /// ⛔ **Halved with FLOOR, not truncation** (upstream 4155ac31: `std::floor(double_enc / 2.0)`).
 /// The two differ only on an odd negative remainder, where truncation rounded the deficit toward
@@ -1535,6 +1553,28 @@ pub fn array_placements(fit: &ArrayFit, cut: (i32, i32)) -> Vec<ArrayPlacement> 
 #[allow(non_snake_case)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`determineRowsAndColumns`' spare tail, which clears `can_cache_`): it fires
+    /// only at an END of the stack, only with spare beside the intersection, and only for a side
+    /// whose built enclosure fails its rules.
+    #[test]
+    fn the_spare_tail_fires_only_for_a_failing_end_with_spare() {
+        let spare = Enclosure { x: 0, y: 4 };
+        assert!(spare_fires(true, spare, false));
+        assert!(!spare_fires(false, spare, false), "an internal layer takes its minimum");
+        assert!(!spare_fires(true, Enclosure { x: 0, y: 0 }, false), "no spare metal");
+        assert!(!spare_fires(true, spare, true), "the side already passes");
+    }
+
+    /// Upstream rule (`DbGenerateStackedVia::canCache`, 9ffbcd2a98, in the pin): a stack is
+    /// cached only when every level's via is cacheable; one level that applied spare is enough to
+    /// rebuild the stack at the next crossing. (At 27288f5 every stack was cached.)
+    #[test]
+    fn a_stack_with_one_spare_level_is_not_cached() {
+        assert!(stack_can_cache(&[false, false, false]));
+        assert!(!stack_can_cache(&[false, true, false]));
+        assert!(stack_can_cache(&[]), "a failed stack is one dummy via, which caches");
+    }
 
     /// Upstream rule (`Enclosure::snap` and `determineRowsAndColumns`, 4155ac31): a deficit keeps
     /// its sign and grows to the grid; the half of an odd negative remainder is floored.
