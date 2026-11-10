@@ -1,5 +1,7 @@
 # vyges-pdn
 
+**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
+
 Power distribution network generation over an OpenDB database.
 
 A design needs power everywhere, delivered as a mesh of wide metal laid over the whole die and
