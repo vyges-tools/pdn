@@ -558,23 +558,29 @@ impl LayerBuckets {
             oversized: Vec::new(),
         };
         for (id, r) in rects {
-            let (cx0, cy0, cx1, cy1) = b.span(r);
-            if (cx1 - cx0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
-                || (cy1 - cy0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
-            {
-                b.oversized.push((id, r));
-                continue;
-            }
-            let at = b.rects.len() as u32;
-            b.rects.push(r);
-            b.ids.push(id);
-            for cy in cy0..=cy1 {
-                for cx in cx0..=cx1 {
-                    b.cells[(cy * b.nx + cx) as usize].push(at);
-                }
-            }
+            b.insert(id, r);
         }
         b
+    }
+
+    /// Add one rect under `id`. ⚠️ Outside the indexed area it is CLAMPED into the edge cells, and
+    /// so is any query, which keeps it findable: clamping preserves "these two spans meet".
+    fn insert(&mut self, id: u32, r: Rect) {
+        let (cx0, cy0, cx1, cy1) = self.span(r);
+        if (cx1 - cx0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
+            || (cy1 - cy0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
+        {
+            self.oversized.push((id, r));
+            return;
+        }
+        let at = self.rects.len() as u32;
+        self.rects.push(r);
+        self.ids.push(id);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                self.cells[(cy * self.nx + cx) as usize].push(at);
+            }
+        }
     }
 
     /// The cell range a rect covers, clamped into the grid.
@@ -653,6 +659,56 @@ impl RectIndex {
         out.sort_unstable();
         out.dedup();
         out
+    }
+}
+
+/// Shapes by net, then layer, then position; ids are positions in the caller's shape list.
+///
+/// 🔑 **Rects may MOVE.** A shape grown in place is recorded again with [`ShapeIndex::moved`]; its
+/// old position stays listed too. So [`ShapeIndex::near`] returns a SUPERSET: every id whose
+/// current rect closed-intersects the query, plus some whose old one did. The caller re-applies
+/// its own predicate to the CURRENT rect, which makes the extra ids harmless. Ids come back
+/// ascending, i.e. in list order, so `position`, `any` and `max_by_key` over the hits answer what
+/// they answer over the whole list.
+pub struct ShapeIndex {
+    by: std::collections::HashMap<String, std::collections::HashMap<String, LayerBuckets>>,
+}
+
+impl ShapeIndex {
+    pub fn build<'a>(shapes: impl Iterator<Item = (&'a str, &'a str, Rect)>) -> Self {
+        let mut items: std::collections::HashMap<(&str, &str), Vec<(u32, Rect)>> = Default::default();
+        for (k, (net, layer, r)) in shapes.enumerate() {
+            items.entry((net, layer)).or_default().push((k as u32, r));
+        }
+        let mut by: std::collections::HashMap<String, std::collections::HashMap<String, LayerBuckets>> =
+            Default::default();
+        for ((net, layer), list) in items {
+            by.entry(net.to_string()).or_default().insert(layer.to_string(), LayerBuckets::build(list));
+        }
+        ShapeIndex { by }
+    }
+
+    /// Ids, ascending and each once, of shapes on `net`/`layer` whose recorded rect closed-intersects
+    /// `area`.
+    pub fn near(&self, net: &str, layer: &str, area: Rect) -> Vec<u32> {
+        let mut out = Vec::new();
+        if let Some(b) = self.by.get(net).and_then(|m| m.get(layer)) {
+            b.hits(area, &mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Shape `id` now also occupies `r` (it was grown in place).
+    pub fn moved(&mut self, id: u32, net: &str, layer: &str, r: Rect) {
+        let m = self.by.entry(net.to_string()).or_default();
+        match m.get_mut(layer) {
+            Some(b) => b.insert(id, r),
+            None => {
+                m.insert(layer.to_string(), LayerBuckets::build(vec![(id, r)]));
+            }
+        }
     }
 }
 
@@ -1447,6 +1503,26 @@ mod tests {
             nonempty += usize::from(!want.is_empty());
         }
         assert!(nonempty > 100, "most queries must hit something, or this proves little");
+    }
+
+    /// `ShapeIndex::near` finds every shape a scan finds, per net and layer, in list order; and a
+    /// shape grown with `moved` is found at its new extent.
+    #[test]
+    fn shape_index_follows_grown_shapes_and_keeps_list_order() {
+        let shapes = [
+            ("VDD", "m4", (0, 0, 100, 10)),
+            ("VSS", "m4", (0, 0, 100, 10)),
+            ("VDD", "m5", (0, 0, 100, 10)),
+            ("VDD", "m4", (50, 0, 60, 500)),
+            ("VDD", "m4", (5_000, 5_000, 5_010, 5_010)),
+        ];
+        let mut ix = ShapeIndex::build(shapes.iter().map(|(n, l, r)| (*n, *l, *r)));
+        assert_eq!(ix.near("VDD", "m4", (55, 5, 56, 6)), vec![0, 3], "net and layer separate, ascending");
+        assert!(ix.near("VDD", "m4", (900, 900, 901, 901)).is_empty());
+        // Shape 0 grows far out of the indexed area; it must be found there.
+        ix.moved(0, "VDD", "m4", (0, 0, 9_000, 10));
+        assert_eq!(ix.near("VDD", "m4", (8_000, 5, 8_001, 6)), vec![0]);
+        assert!(ix.near("GND", "m4", (0, 0, 10, 10)).is_empty(), "an unknown net has nothing");
     }
 
     /// The scan `remove_overlapping` replaced, kept as its oracle: every candidate against every

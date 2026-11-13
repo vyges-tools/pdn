@@ -6658,6 +6658,13 @@ fn generate(args: &[String]) -> ExitCode {
                 .clone()
         };
         let via_loop_start = std::time::Instant::now();
+        // ⛔ **`emitted` by net, layer and position** for the per-via lookups below: each scanned
+        // every shape for every via (vias x shapes), ~2 minutes on a 1.5 M-instance block. Hits are
+        // in list order and every predicate below is unchanged; a shape grown in this loop is
+        // re-recorded (`moved`), so the index never misses its current rect.
+        let mut shape_index = vyges_pdn::vias::ShapeIndex::build(
+            emitted.iter().map(|(n, l, r, _)| (n.as_str(), l.as_str(), *r)),
+        );
         for v in &placed {
             // The two shapes AS THEY STAND, which is not as they started.
             //
@@ -6692,8 +6699,10 @@ fn generate(args: &[String]) -> ExitCode {
                     let h = (r.3.min(was.3) - r.1.max(was.1)).max(0) as i64;
                     w * h
                 };
-                emitted
-                    .iter()
+                shape_index
+                    .near(net, layer, v.area)
+                    .into_iter()
+                    .map(|k| &emitted[k as usize])
                     .filter(|(n, l, r, _)| {
                         n == net && l == layer && overlaps(*r, v.area) && overlaps(*r, was)
                     })
@@ -6713,7 +6722,7 @@ fn generate(args: &[String]) -> ExitCode {
             // the pins rather than among the straps, and their absence from `emitted` means
             // nothing.
             let still_there = |net: &str, layer: &str, was: Rect| -> bool {
-                emitted.iter().any(|(n, l, r, _)| {
+                shape_index.near(net, layer, v.area).into_iter().map(|k| &emitted[k as usize]).any(|(n, l, r, _)| {
                     n == net && l == layer && overlaps(*r, v.area) && overlaps(*r, was)
                 }) || connectable_pins
                     .iter()
@@ -6801,11 +6810,11 @@ fn generate(args: &[String]) -> ExitCode {
                     // stack is never cached (`skip_caching`). Seen by diffing the via-cache
                     // sequence on `power_switch_daisy`: the reference misses on every 1590x280
                     // met1-switch-pin crossing, ours reused one stack.
-                    || emitted.iter().any(|(n, l, r, k)| {
+                    || shape_index.near(&v.net, layer, rect).into_iter().map(|k| &emitted[k as usize]).any(|(n, l, r, k)| {
                         *k == "SWITCH" && n == &v.net && l == layer && *r == rect
                     });
                 let locked_ring = locked_layers.iter().any(|l| l == layer)
-                    && emitted.iter().any(|(n, l, r, k)| {
+                    && shape_index.near(&v.net, layer, rect).into_iter().map(|k| &emitted[k as usize]).any(|(n, l, r, k)| {
                         n == &v.net && l == layer && *r == rect && *k == "RING"
                     });
                 let has_iterms = iterm_holds.iter().any(|(n, l, h)| {
@@ -8703,9 +8712,10 @@ fn generate(args: &[String]) -> ExitCode {
                 if metals.is_empty() {
                     continue;
                 }
-                let Some(si) = emitted.iter().position(|(n, l, r, _)| {
+                let Some(si) = shape_index.near(&v.net, layer, key.2).into_iter().find(|k| {
+                    let (n, l, r, _) = &emitted[*k as usize];
                     n == &v.net && l == layer && overlaps(*r, key.2)
-                }) else {
+                }).map(|k| k as usize) else {
                     continue;
                 };
                 // ⚠️ **Measured against the shape being MODIFIED, not against the rect the stack
@@ -8749,6 +8759,7 @@ fn generate(args: &[String]) -> ExitCode {
                     )
                 {
                     emitted[si].2 = g;
+                    shape_index.moved(si as u32, &v.net, layer, g);
                 }
             }
         }
