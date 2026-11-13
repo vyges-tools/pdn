@@ -2059,10 +2059,27 @@ fn repairable_shape(
     locked_layers: &[String],
     own_from: usize,
 ) -> Option<usize> {
+    let all: Vec<u32> = (0..emitted.len() as u32).collect();
+    repairable_shape_among(emitted, &all, net, layer, own, locked_layers, own_from)
+}
+
+/// [`repairable_shape`] over `candidates` only: ids into `emitted`, ASCENDING, that must include
+/// every shape containing `own` (an index hit list does: containment implies intersection). The
+/// first match in list order is the same one a scan of the whole list finds.
+fn repairable_shape_among(
+    emitted: &[(String, String, Rect, &'static str)],
+    candidates: &[u32],
+    net: &str,
+    layer: &str,
+    own: Rect,
+    locked_layers: &[String],
+    own_from: usize,
+) -> Option<usize> {
     let contains = |outer: Rect, inner: Rect| {
         outer.0 <= inner.0 && outer.1 <= inner.1 && outer.2 >= inner.2 && outer.3 >= inner.3
     };
-    let i = emitted.iter().position(|(n, l, r, shape)| {
+    let i = candidates.iter().map(|k| *k as usize).find(|&k| {
+        let (n, l, r, shape) = &emitted[k];
         n == net
             && l == layer
             && !(*shape == "RING" && locked_layers.iter().any(|x| x == l))
@@ -2130,6 +2147,26 @@ fn repair_vias(
             .or_default()
             .push((j, obstruction_of(db, l, *r)));
     }
+    // ⛔ **Indexed, because every via scanned every shape** (to find its own, and to list the
+    // layer's obstructions and other shapes): about a minute and a half on a 1.5 M-instance block.
+    // `extend_to` asks two existence questions about rects meeting `extension_reach(grown)`, so
+    // passing only the rects that meet that box gives the same answer; and with no growth there
+    // is nothing to ask. The obstruction snapshot above stays a snapshot; the shapes themselves
+    // are followed as they grow (`moved`).
+    let blockage_index: std::collections::HashMap<&str, vyges_pdn::vias::RectIndex> = obstructions_by_layer
+        .iter()
+        .map(|(l, rs)| (*l, vyges_pdn::vias::RectIndex::build(rs.iter().enumerate().map(|(k, r)| (k as u32, *r)).collect())))
+        .collect();
+    let shape_obstruction_index: std::collections::HashMap<&str, vyges_pdn::vias::RectIndex> = shape_obstructions
+        .iter()
+        .map(|(l, rs)| (l.as_str(), vyges_pdn::vias::RectIndex::build(rs.iter().map(|(j, r)| (*j as u32, *r)).collect())))
+        .collect();
+    let shape_obstruction_rect: std::collections::HashMap<&str, std::collections::HashMap<usize, Rect>> = shape_obstructions
+        .iter()
+        .map(|(l, rs)| (l.as_str(), rs.iter().copied().collect()))
+        .collect();
+    // Every shape by layer alone (net ""), for `others` and for finding the via's own shape.
+    let mut layer_index = vyges_pdn::vias::ShapeIndex::build(emitted.iter().map(|(_, l, r, _)| ("", l.as_str(), *r)));
     for v in placed {
         // Either end unowned and the via is not repairable at all — not merely at that end.
         if is_fixed(&v.lower, v.lower_rect) || is_fixed(&v.upper, v.upper_rect) {
@@ -2139,33 +2176,41 @@ fn repair_vias(
             (&v.lower, v.lower_rect, v.upper_rect),
             (&v.upper, v.upper_rect, v.lower_rect),
         ] {
-            let Some(i) = repairable_shape(emitted, &v.net, layer, own, locked_layers, own_from)
+            let near_own = layer_index.near("", layer, own);
+            let Some(i) =
+                repairable_shape_among(emitted, &near_own, &v.net, layer, own, locked_layers, own_from)
             else {
                 continue;
             };
-            let obstructions: Vec<Rect> = obstructions_by_layer
+            let halo = db.layer_get_spacing(layer).max(1);
+            // No growth: `extend_to` answers None without looking at anything.
+            let Some(grown_box) = vyges_pdn::shapes::grown_toward(emitted[i].2, toward) else {
+                continue;
+            };
+            let reach = vyges_pdn::shapes::extension_reach(grown_box, halo);
+            let obstructions: Vec<Rect> = blockage_index
                 .get(layer.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-                .iter()
-                .copied()
+                .map(|ix| ix.hits(reach))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|k| obstructions_by_layer[layer.as_str()][k as usize])
                 .chain(
-                    shape_obstructions
+                    shape_obstruction_index
                         .get(layer.as_str())
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[])
-                        .iter()
-                        .filter(|(j, _)| *j != i)
-                        .map(|(_, r)| *r),
+                        .map(|ix| ix.hits(reach))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|j| *j as usize != i)
+                        .map(|j| shape_obstruction_rect[layer.as_str()][&(j as usize)]),
                 )
                 .collect();
-            let others: Vec<Rect> = emitted
-                .iter()
-                .enumerate()
-                .filter(|(j, (_, l, _, _))| *j != i && l == layer)
-                .map(|(_, (_, _, r, _))| *r)
+            let others: Vec<Rect> = layer_index
+                .near("", layer, reach)
+                .into_iter()
+                .map(|k| k as usize)
+                .filter(|j| *j != i && emitted[*j].1 == *layer)
+                .map(|j| emitted[j].2)
                 .collect();
-            let halo = db.layer_get_spacing(layer).max(1);
             if let Some(grown) =
                 vyges_pdn::shapes::extend_to(emitted[i].2, toward, &obstructions, &others, halo)
             {
@@ -2176,6 +2221,7 @@ fn repair_vias(
                     );
                 }
                 emitted[i].2 = grown;
+                layer_index.moved(i as u32, "", layer, grown);
                 moved = true;
             }
         }

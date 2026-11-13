@@ -308,6 +308,20 @@ pub fn extend_to(
     others: &[Rect],
     halo: i32,
 ) -> Option<Rect> {
+    let grown = grown_toward(shape, toward)?;
+    if obstructions.iter().any(|o| intersects(grown, *o)) {
+        return None;
+    }
+    let checked = extension_reach(grown, halo);
+    if others.iter().any(|o| intersects(checked, *o)) {
+        return None;
+    }
+    Some(grown)
+}
+
+/// The shape [`extend_to`] would try: `shape` stretched along its own direction to cover `toward`,
+/// or `None` when it has no direction or would not change.
+pub fn grown_toward(shape: Rect, toward: Rect) -> Option<Rect> {
     let grown = match crate::viagen::rect_direction(shape) {
         crate::Direction::Horizontal => (
             shape.0.min(toward.0),
@@ -323,23 +337,15 @@ pub fn extend_to(
         ),
         crate::Direction::None => return None,
     };
-    if grown == shape {
-        return None;
-    }
-    if obstructions.iter().any(|o| intersects(grown, *o)) {
-        return None;
-    }
+    (grown != shape).then_some(grown)
+}
+
+/// The box [`extend_to`] tests the other shapes against: `grown` widened by `halo - 1`. It
+/// contains `grown` (a halo is at least 1), so a rect that misses it can change neither of
+/// `extend_to`'s two tests, which is what lets a caller pass only the rects that meet it.
+pub fn extension_reach(grown: Rect, halo: i32) -> Rect {
     let reach = halo - 1;
-    let checked = (
-        grown.0 - reach,
-        grown.1 - reach,
-        grown.2 + reach,
-        grown.3 + reach,
-    );
-    if others.iter().any(|o| intersects(checked, *o)) {
-        return None;
-    }
-    Some(grown)
+    (grown.0 - reach, grown.1 - reach, grown.2 + reach, grown.3 + reach)
 }
 
 /// What becomes of a shape and the via metal landing on it — see [`check_via_shapes`].
