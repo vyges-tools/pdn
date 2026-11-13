@@ -590,6 +590,25 @@ impl LayerBuckets {
         self.any_hit_where(area, |_| true)
     }
 
+    /// The ids of every indexed rect that closed-intersects `area`, unsorted, possibly repeated.
+    fn hits(&self, area: Rect, out: &mut Vec<u32>) {
+        for (id, r) in &self.oversized {
+            if intersects(area, *r) {
+                out.push(*id);
+            }
+        }
+        let (cx0, cy0, cx1, cy1) = self.span(area);
+        for cy in cy0..=cy1 {
+            for cx in cx0..=cx1 {
+                for &at in &self.cells[(cy * self.nx + cx) as usize] {
+                    if intersects(area, self.rects[at as usize]) {
+                        out.push(self.ids[at as usize]);
+                    }
+                }
+            }
+        }
+    }
+
     /// Whether any indexed rect closed-intersects `area` and its id passes `keep`.
     fn any_hit_where(&self, area: Rect, keep: impl Fn(u32) -> bool) -> bool {
         if self.oversized.iter().any(|(id, r)| intersects(area, *r) && keep(*id)) {
@@ -610,6 +629,30 @@ impl LayerBuckets {
             }
         }
         false
+    }
+}
+
+/// Rects by caller id in the same uniform grid, for a caller that needs EVERY hit rather than
+/// whether there is one.
+///
+/// 🔑 **[`RectIndex::hits`] returns ids SORTED ascending and de-duplicated**, i.e. in the order of
+/// the caller's own list. A caller that filters the hits with its original predicate therefore gets
+/// the same items in the same order as a scan of the whole list: the index only skips rects that
+/// cannot closed-intersect the query, and interior overlap implies closed intersection.
+pub struct RectIndex(LayerBuckets);
+
+impl RectIndex {
+    pub fn build(items: Vec<(u32, Rect)>) -> Self {
+        RectIndex(LayerBuckets::build(items))
+    }
+
+    /// Ids of every indexed rect that closed-intersects `area`, ascending, each once.
+    pub fn hits(&self, area: Rect) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.0.hits(area, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 }
 
@@ -1374,6 +1417,36 @@ mod tests {
         fn in_range(&mut self, lo: i32, hi: i32) -> i32 {
             lo + (self.next() % ((hi - lo) as u64 + 1)) as i32
         }
+    }
+
+    /// `RectIndex::hits` is exactly the ascending list of ids a scan with closed intersection
+    /// finds, including oversized rects, shared edges and queries outside the indexed area.
+    #[test]
+    fn rect_index_hits_are_the_scan_in_input_order() {
+        let mut rng = Lcg(0x7219);
+        let mut rects = Vec::new();
+        for k in 0..3_000u32 {
+            let x = rng.in_range(0, 50_000);
+            let y = rng.in_range(0, 50_000);
+            let r = if k % 500 == 0 {
+                (x, y, x + 40_000, y + 300)
+            } else {
+                (x, y, x + rng.in_range(0, 400), y + rng.in_range(0, 400))
+            };
+            rects.push(r);
+        }
+        let index = RectIndex::build(rects.iter().enumerate().map(|(k, r)| (k as u32, *r)).collect());
+        let mut nonempty = 0;
+        for q in 0..2_000 {
+            let x = rng.in_range(-5_000, 55_000);
+            let y = rng.in_range(-5_000, 55_000);
+            let area = if q % 50 == 0 { (x, y, x + 20_000, y + 20_000) } else { (x, y, x + 500, y + 30) };
+            let want: Vec<u32> = (0..rects.len() as u32).filter(|k| intersects(area, rects[*k as usize])).collect();
+            let got = index.hits(area);
+            assert_eq!(got, want, "query {q} {area:?}");
+            nonempty += usize::from(!want.is_empty());
+        }
+        assert!(nonempty > 100, "most queries must hit something, or this proves little");
     }
 
     /// The scan `remove_overlapping` replaced, kept as its oracle: every candidate against every

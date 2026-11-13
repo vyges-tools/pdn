@@ -6127,6 +6127,21 @@ fn generate(args: &[String]) -> ExitCode {
         let mut held_any = 0;
         // The die as rectangles, for the notch-wall pins (`isOnInteriorWall`).
         let die_trim_rects = vyges_pdn::region::polygon_rects(&db.die_area_polygon().unwrap_or_default());
+        // ⛔ **The via areas, indexed by (net, layer face) and position.** Asking every via about
+        // every shape is shapes x vias: on a 1.5 M-instance block that was the whole of a
+        // 154-second trim. Hits come back in `via_areas` order and go through the same predicate
+        // below, so `held` is the same list, in the same order, as the scan gave.
+        let mut by_face: std::collections::HashMap<(&str, &str), Vec<(u32, Rect)>> = Default::default();
+        for (k, (n, l, a)) in via_areas.iter().enumerate() {
+            by_face.entry((n.as_str(), l.0.as_str())).or_default().push((k as u32, *a));
+            if l.1 != l.0 {
+                by_face.entry((n.as_str(), l.1.as_str())).or_default().push((k as u32, *a));
+            }
+        }
+        let via_index: std::collections::HashMap<(&str, &str), vyges_pdn::vias::RectIndex> = by_face
+            .into_iter()
+            .map(|(face, items)| (face, vyges_pdn::vias::RectIndex::build(items)))
+            .collect();
         let mut kept = Vec::with_capacity(emitted.len());
         let mut kept_tag = Vec::with_capacity(emitted.len());
         for ((net, layer, rect, shape), tag) in emitted.into_iter().zip(std::mem::take(&mut emitted_tag)) {
@@ -6148,8 +6163,13 @@ fn generate(args: &[String]) -> ExitCode {
                 Direction::Vertical => a.0 >= rect.0 && a.2 <= rect.2,
                 Direction::None => true,
             };
-            let held: Vec<Rect> = via_areas
+            let near: Vec<u32> = via_index
+                .get(&(net.as_str(), layer.as_str()))
+                .map(|ix| ix.hits(rect))
+                .unwrap_or_default();
+            let held: Vec<Rect> = near
                 .iter()
+                .map(|k| &via_areas[*k as usize])
                 .filter(|(n, l, a)| {
                     n == &net && (l.0 == layer || l.1 == layer) && overlaps(*a, rect) && across_ok(a)
                 })
