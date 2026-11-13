@@ -491,8 +491,10 @@ struct LayerBuckets {
     ny: i64,
     cells: Vec<Vec<u32>>,
     rects: Vec<Rect>,
-    /// Rects spanning too many cells to list, scanned linearly.
-    oversized: Vec<Rect>,
+    /// The caller's id for each entry of `rects` (its position in the input by default).
+    ids: Vec<u32>,
+    /// Rects spanning too many cells to list, scanned linearly, with their ids.
+    oversized: Vec<(u32, Rect)>,
 }
 
 impl ObstructionIndex {
@@ -506,7 +508,8 @@ impl ObstructionIndex {
         }
         let mut layers = std::collections::HashMap::new();
         for (l, rects) in by_layer {
-            layers.insert(l.to_string(), LayerBuckets::build(rects));
+            let items: Vec<(u32, Rect)> = rects.into_iter().enumerate().map(|(k, r)| (k as u32, r)).collect();
+            layers.insert(l.to_string(), LayerBuckets::build(items));
         }
         ObstructionIndex { layers }
     }
@@ -520,12 +523,12 @@ impl ObstructionIndex {
 }
 
 impl LayerBuckets {
-    fn build(rects: Vec<Rect>) -> Self {
+    fn build(rects: Vec<(u32, Rect)>) -> Self {
         // The bounding box of everything on the layer, and a cell size that puts roughly one rect
         // in each cell. ⚠️ Guarded at 1: a layer whose shapes are all one point would divide by
         // zero, and a single-cell grid is still correct, only slow.
         let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
-        for r in &rects {
+        for (_, r) in &rects {
             x0 = x0.min(r.0);
             y0 = y0.min(r.1);
             x1 = x1.max(r.2);
@@ -551,18 +554,20 @@ impl LayerBuckets {
             ny,
             cells: vec![Vec::new(); (nx * ny) as usize],
             rects: Vec::with_capacity(rects.len()),
+            ids: Vec::with_capacity(rects.len()),
             oversized: Vec::new(),
         };
-        for r in rects {
+        for (id, r) in rects {
             let (cx0, cy0, cx1, cy1) = b.span(r);
             if (cx1 - cx0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
                 || (cy1 - cy0 + 1) > ObstructionIndex::MAX_CELLS_PER_RECT
             {
-                b.oversized.push(r);
+                b.oversized.push((id, r));
                 continue;
             }
             let at = b.rects.len() as u32;
             b.rects.push(r);
+            b.ids.push(id);
             for cy in cy0..=cy1 {
                 for cx in cx0..=cx1 {
                     b.cells[(cy * b.nx + cx) as usize].push(at);
@@ -582,7 +587,12 @@ impl LayerBuckets {
     }
 
     fn any_hit(&self, area: Rect) -> bool {
-        if self.oversized.iter().any(|r| intersects(area, *r)) {
+        self.any_hit_where(area, |_| true)
+    }
+
+    /// Whether any indexed rect closed-intersects `area` and its id passes `keep`.
+    fn any_hit_where(&self, area: Rect, keep: impl Fn(u32) -> bool) -> bool {
+        if self.oversized.iter().any(|(id, r)| intersects(area, *r) && keep(*id)) {
             return true;
         }
         // ⚠️ **Clamping the query into the grid is not enough on its own** — a query wholly outside
@@ -593,7 +603,7 @@ impl LayerBuckets {
         for cy in cy0..=cy1 {
             for cx in cx0..=cx1 {
                 for &at in &self.cells[(cy * self.nx + cx) as usize] {
-                    if intersects(area, self.rects[at as usize]) {
+                    if intersects(area, self.rects[at as usize]) && keep(self.ids[at as usize]) {
                         return true;
                     }
                 }
@@ -615,19 +625,33 @@ impl LayerBuckets {
 ///   applying them removes all three.
 /// - **Only candidates on the same layer pair compete.** A via between metal1 and metal4 does not
 ///   thin one between metal4 and metal5 that happens to sit under it.
+///
+/// ⛔ **Indexed, because the plain scan is quadratic in VIAS.** Every candidate was tested against
+/// every other one, with two String compares per pair. A 1.5 M-instance block has hundreds of
+/// thousands of candidates, and that scan was the whole of a 54-minute pdn run (8 of 8 gdb samples
+/// at this line; the reference does the stage in seconds). The candidates are now bucketed per
+/// layer pair in a uniform grid ([`LayerBuckets`]) and each query sees only the ones near it.
+/// The predicate is unchanged and is still an existence test against the CURRENT `failed` state,
+/// so the visiting order inside the index cannot change the answer: the output must be IDENTICAL
+/// to the scan's (`the_index_agrees_with_the_plain_scan`).
 pub fn remove_overlapping(vias: Vec<Via>) -> (Vec<Via>, Vec<(Via, Failed)>) {
     let mut failed = vec![false; vias.len()];
+    // One index per layer pair: only candidates on the same pair compete.
+    let mut by_pair: std::collections::HashMap<(&str, &str), Vec<(u32, Rect)>> = Default::default();
+    for (k, v) in vias.iter().enumerate() {
+        by_pair.entry((v.lower.as_str(), v.upper.as_str())).or_default().push((k as u32, v.area));
+    }
+    let index: std::collections::HashMap<(&str, &str), LayerBuckets> =
+        by_pair.into_iter().map(|(pair, items)| (pair, LayerBuckets::build(items))).collect();
     for i in 0..vias.len() {
         if failed[i] {
             continue;
         }
-        let beaten = (0..vias.len()).any(|j| {
-            j != i
-                && !failed[j]
-                && vias[j].lower == vias[i].lower
-                && vias[j].upper == vias[i].upper
-                && intersects(vias[i].area, vias[j].area)
-                && area(vias[i].area) <= area(vias[j].area)
+        let pair = (vias[i].lower.as_str(), vias[i].upper.as_str());
+        let own = area(vias[i].area);
+        let beaten = index[&pair].any_hit_where(vias[i].area, |j| {
+            let j = j as usize;
+            j != i && !failed[j] && own <= area(vias[j].area)
         });
         if beaten {
             failed[i] = true;
@@ -1349,6 +1373,67 @@ mod tests {
         }
         fn in_range(&mut self, lo: i32, hi: i32) -> i32 {
             lo + (self.next() % ((hi - lo) as u64 + 1)) as i32
+        }
+    }
+
+    /// The scan `remove_overlapping` replaced, kept as its oracle: every candidate against every
+    /// other, sequential marking, `<=` on area, same layer pair, closed intersection.
+    fn remove_overlapping_by_scan(vias: &[Via]) -> Vec<bool> {
+        let mut failed = vec![false; vias.len()];
+        for i in 0..vias.len() {
+            if failed[i] {
+                continue;
+            }
+            let beaten = (0..vias.len()).any(|j| {
+                j != i
+                    && !failed[j]
+                    && vias[j].lower == vias[i].lower
+                    && vias[j].upper == vias[i].upper
+                    && intersects(vias[i].area, vias[j].area)
+                    && area(vias[i].area) <= area(vias[j].area)
+            });
+            if beaten {
+                failed[i] = true;
+            }
+        }
+        failed
+    }
+
+    /// 🔑 The index must change the speed and nothing else: the SAME candidates kept and dropped,
+    /// in the same order, as the scan. Dense random sets on two layer pairs, with equal sizes
+    /// (ties), chains, shared edges (closed intersection) and a few large candidates that take the
+    /// oversized path.
+    #[test]
+    fn the_index_agrees_with_the_plain_scan() {
+        let mut rng = Lcg(0x0E1A);
+        for round in 0..40 {
+            let n = 50 + (round * 37) % 600;
+            let span = 200 + (round as i32 * 53) % 3_000;
+            let mut vias = Vec::new();
+            for k in 0..n {
+                let (lower, upper) = if k % 3 == 0 { ("m4", "m5") } else { ("m1", "m2") };
+                let x = rng.in_range(0, span);
+                let y = rng.in_range(0, span);
+                // Sizes drawn from a short list so equal areas (ties) are common.
+                let w = [10, 10, 20, 24, 40][rng.in_range(0, 4) as usize];
+                let h = [10, 10, 20, 24, 40][rng.in_range(0, 4) as usize];
+                let big = k % 97 == 0;
+                let r = if big { (x, y, x + span, y + span / 2) } else { (x, y, x + w, y + h) };
+                vias.push(candidate("VDD", r, lower, upper, 0));
+            }
+            // Exact shared edges and a chain of equal ones.
+            for c in 0..5 {
+                let x = 10 * c;
+                vias.push(candidate("VDD", (x, 0, x + 10, 10), "m1", "m2", 0));
+            }
+            let want = remove_overlapping_by_scan(&vias);
+            let (kept, dropped) = remove_overlapping(vias.clone());
+            let kept_areas: Vec<Rect> = kept.iter().map(|v| v.area).collect();
+            let want_kept: Vec<Rect> =
+                vias.iter().zip(&want).filter(|(_, f)| !**f).map(|(v, _)| v.area).collect();
+            assert_eq!(kept_areas, want_kept, "round {round}: kept differs from the scan");
+            assert_eq!(dropped.len(), want.iter().filter(|f| **f).count(), "round {round}");
+            assert!(dropped.len() > 0 && !kept.is_empty(), "round {round}: a vacuous case");
         }
     }
 
