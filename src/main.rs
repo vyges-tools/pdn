@@ -5540,6 +5540,38 @@ fn generate(args: &[String]) -> ExitCode {
                     c
                 })
                 .collect();
+            // `Connect::setSplitCuts` (OpenROAD #12317, in the f11b4276 pin): each intermediate
+            // layer's split pitch must cover one track of the layer — see `split::check_pitch`.
+            // ⚠️ Raised as `add_pdn_connect` runs, connect by connect; within one connect the
+            // reference walks a map keyed by layer pointer, here the order the layers were given.
+            let vertical_layers: std::collections::HashSet<String> = db
+                .layers_with_direction()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, d)| d == "VERTICAL")
+                .map(|(l, _)| l)
+                .collect();
+            for (_, splits) in &split_by_connect {
+                for (layer, pitch, _) in splits {
+                    let layer_pitch = if vertical_layers.contains(layer) {
+                        db.layer_get_pitch_x(layer)
+                    } else {
+                        db.layer_get_pitch_y(layer)
+                    };
+                    if let Some(d) = vyges_pdn::split::check_pitch(layer, *pitch, layer_pitch, db.dbu_per_micron()) {
+                        vyges_events::emit(
+                            &vyges_events::Event::new(
+                                "vyges-pdn",
+                                vyges_events::Severity::Error,
+                                format!("PDN-{:04} {}", d.code, d.message),
+                            )
+                            .with_code(format!("PDN-{:04}", d.code)),
+                        );
+                        eprintln!("{d}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
             // 🔑 **The grid's OWN shapes obstruct its vias.** `Grid::makeVias` copies the block
             // obstructions and then inserts every shape it can see — its own and the global ones —
             // as an obstruction on that shape's layer. A stack may not pass through a strap sitting
@@ -7155,6 +7187,25 @@ fn generate(args: &[String]) -> ExitCode {
                     let other = split_for(if split_for(lo).is_some() { hi } else { lo });
                     (p.max(other.map(|(q, _)| q).unwrap_or(0)), s || other.is_some_and(|(_, t)| t))
                 });
+                // 🔑 **On an -ongrid layer the split pitch is whole tracks, per axis** (OpenROAD
+                // #12317, in the f11b4276 pin) — see `split::ongrid_pitch`. x is set by the via's
+                // vertical layer and y by its horizontal one; a layer the connect does not name
+                // keeps the requested pitch on its axis.
+                let (split_horizontal, split_vertical) =
+                    if dir_of(lo) == Direction::Horizontal { (lo, hi) } else { (hi, lo) };
+                let named = |layer: &str| ongrid.iter().any(|l| l == layer);
+                let first_step = |layer: &str| -> Option<i32> {
+                    let (x, y) = db.track_patterns(layer).unwrap_or_default();
+                    let pats = if dir_of(layer) == Direction::Vertical { x } else { y };
+                    pats.first().map(|p| p.2)
+                };
+                let split_pitch = split.map(|(sp, _)| {
+                    vyges_pdn::split::ongrid_pitch(
+                        sp,
+                        named(split_vertical).then(|| first_step(split_vertical)),
+                        named(split_horizontal).then(|| first_step(split_horizontal)),
+                    )
+                });
 
                 // 🔑 **The widths a generate rule is checked against, and they are the SHAPES'.**
                 // `getLowerWidth`/`getUpperWidth` read `lower_rect_`/`upper_rect_` — the straps the
@@ -7210,23 +7261,39 @@ fn generate(args: &[String]) -> ExitCode {
                 // the winner's area is what its array has to fill.
                 let spots_in = |area: vyges_pdn::Rect| match split {
                     None => vec![place_at],
-                    Some((sp, stagger)) => {
+                    Some((_, stagger)) => {
+                        let sp = split_pitch.unwrap_or_default();
                         // ⚠️ **The stagger offset is applied to the GROUND net only**, so the two
                         // nets' arrays interleave by half a pitch rather than both shifting.
                         let off = if stagger && v.net == ground {
-                            (sp / 2, sp / 2)
+                            (sp.0 / 2, sp.1 / 2)
                         } else {
                             (0, 0)
                         };
                         let n = vyges_pdn::split::counts(
                             (area.2 - area.0, area.3 - area.1),
-                            (sp, sp),
+                            sp,
                             max_columns,
                             max_rows,
                         );
-                        // ℹ️ Identity snapping: both call sites in the reference pass `false` for
-                        // the snap flags, so the layer grids are never populated.
-                        vyges_pdn::split::positions(place_at, n, (sp, sp), off, &|v| v, &|v| v)
+                        // `DbSplitCutVia::generate` populates the grid of each of the via's layers
+                        // the connect names -ongrid (#12317): x snaps on the vertical layer's X
+                        // tracks, y on the horizontal layer's Y tracks; any other layer snaps
+                        // nothing.
+                        let grid_x = named(split_vertical).then(|| track_grids.get(split_vertical)).flatten().map(|g| g.0.as_slice());
+                        let grid_y = named(split_horizontal).then(|| track_grids.get(split_horizontal)).flatten().map(|g| g.1.as_slice());
+                        let snap = |grid: Option<&[i32]>, v: i32, above: i32| match grid {
+                            Some(g) => vyges_pdn::straps::snap_to_grid(v, above, g),
+                            None => v,
+                        };
+                        vyges_pdn::split::positions(
+                            place_at,
+                            n,
+                            sp,
+                            off,
+                            &|v, above| snap(grid_x, v, above),
+                            &|v, above| snap(grid_y, v, above),
+                        )
                     }
                 };
                 // Relative to / back from the level's placement point — how a cached definition's
@@ -7388,7 +7455,7 @@ fn generate(args: &[String]) -> ExitCode {
                         // shows only where the oversized metal has to be absorbed by a shape
                         // too narrow to hide it.
                         let pitch = match (split, connect_cut_pitch) {
-                            (Some((sp, _)), _) => (sp, sp),
+                            (Some(_), _) => split_pitch.unwrap_or_default(),
                             (None, Some(p)) => p,
                             (None, None) => {
                                 let cut_rect = (0, 0, cut.0, cut.1);
@@ -7995,7 +8062,7 @@ fn generate(args: &[String]) -> ExitCode {
                     // 🔑 The split pitch overrides the technology's, exactly as on the generate
                     // path — `generateDbVia` sets it on every generator before any is built.
                     let pitch = match split {
-                        Some((sp, _)) => (sp, sp),
+                        Some(_) => split_pitch.unwrap_or_default(),
                         None => pitch,
                     };
                     // 🔑 **A tech via is NOT built with its own metal margins.** Those are only a
